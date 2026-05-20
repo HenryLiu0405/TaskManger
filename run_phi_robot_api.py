@@ -9,6 +9,9 @@
   # 分离模式（sim 独立运行在另一个端口）
   python -m phi_robot.adapters.unitree_sim --port 8080 &
   python run_phi_robot_api.py --sim-url http://127.0.0.1:8080
+
+  # 验收模式（只转发 move_to 到真机，跳过其它工具，不需要 sim）
+  python run_phi_robot_api.py --acceptance --move-to-url http://192.168.50.141:5000
 """
 
 import sys
@@ -45,11 +48,26 @@ if __name__ == "__main__":
         default=None,
         help="move_to 独立服务器地址（联调时指向同事的端口）",
     )
+    parser.add_argument(
+        "--acceptance",
+        action="store_true",
+        default=False,
+        help="验收模式：只转发九宫格 move_to 到 --move-to-url，其他工具跳过",
+    )
 
     args = parser.parse_args()
 
+    if args.acceptance and not args.move_to_url:
+        print("错误: --acceptance 模式需要同时提供 --move-to-url")
+        sys.exit(1)
+
     adapter = None
-    if args.sim_url:
+    if args.acceptance:
+        from phi_robot.adapters.move_to_passthrough import MoveToPassthroughAdapter
+
+        adapter = MoveToPassthroughAdapter(move_to_url=args.move_to_url)
+        print(f"验收模式: move_to → {args.move_to_url}  (pick/place/get_pose 跳过)")
+    elif args.sim_url:
         from phi_robot.adapters.remote_unitree import RemoteUnitreeAdapter
         verbose = args.verbose if args.verbose else True  # --sim-url 默认开启 verbose
         adapter = RemoteUnitreeAdapter(
