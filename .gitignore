@@ -5,3 +5,27 @@ dist/
 *.pyo
 .env
 .DS_Store
+
+# Build & install artifacts
+build/
+install/
+
+# Logs
+log/
+
+# Debug/test scratch
+color/
+locomotion_mode_/
+locomotion_mode_client_test/
+robot_ws_true/
+
+# Doc & debug notes (keep README.md)
+1.md
+2.md
+3.md
+API_GUIDE.md
+ARCHITECTURE.md
+DEVELOPMENT.md
+DOCS_INDEX.md
+PROJECT_OVERVIEW.md
+TROUBLESHOOTING.md

@@ -152,6 +152,9 @@ class MissionRunner:
                 if self._hook:
                     await self._hook.before_execute_tools(context)
 
+                # 标记步骤为执行中
+                self._service.mark_step_running(mission_id)
+
                 # 执行工具
                 try:
                     args = dict(step.args)  # shallow copy — don't mutate frozen PlanStep

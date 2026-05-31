@@ -78,7 +78,7 @@ class APIHook(MissionExecutionHook):
                 "message": "Safety alert triggered, aborting mission"
             })
             return ("abort", None)
-        elif error_code in ("GRIP_FAIL", "TIMEOUT"):
+        elif error_code in ("GRIP_FAIL", "TIMEOUT", "PATH_PLAN_FAILED"):
             return ("retry", None)
         elif error_code in ("NOT_REACHABLE", "OBSTRUCTED"):
             return ("replan", None)
@@ -442,5 +442,5 @@ def create_app() -> Flask:
 
 
 if __name__ == "__main__":
-    server = PhiRobotAPIServer(host="127.0.0.1", port=5000)
+    server = PhiRobotAPIServer(host="0.0.0.0", port=5000)
     server.run()

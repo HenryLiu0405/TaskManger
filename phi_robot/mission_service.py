@@ -250,7 +250,7 @@ class MissionService:
         # 更新计划中的步骤状态（创建新的 PlanStep 以支持 frozen）
         if record.current_step_index >= 0 and record.current_step_index < len(record.plan):
             old_step = record.plan[record.current_step_index]
-            new_step = replace(old_step, status="succeeded")
+            new_step = replace(old_step, status="completed")
             new_plan = list(record.plan)
             new_plan[record.current_step_index] = new_step
             record = replace(record, plan=new_plan)
@@ -263,6 +263,19 @@ class MissionService:
             record = replace(record, state=new_state)
         
         self._store.update(mission_id, record)
+
+    def mark_step_running(self, mission_id: str) -> None:
+        """标记当前步骤为执行中"""
+        record = self._store.get(mission_id)
+        if not record:
+            raise KeyError(f"mission_id {mission_id} 不存在")
+        if record.current_step_index >= 0 and record.current_step_index < len(record.plan):
+            old_step = record.plan[record.current_step_index]
+            new_step = replace(old_step, status="running")
+            new_plan = list(record.plan)
+            new_plan[record.current_step_index] = new_step
+            record = replace(record, plan=new_plan)
+            self._store.update(mission_id, record)
 
     def mark_step_failed(
         self, mission_id: str, error_code: str, error_message: str

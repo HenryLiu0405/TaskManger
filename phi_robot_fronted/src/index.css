@@ -1,0 +1,577 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-neo-white text-neo-black font-mono antialiased;
+    margin: 0;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  button {
+    cursor: pointer;
+  }
+}
+
+@layer utilities {
+  .hover-invert {
+    transition: all 0.2s ease;
+  }
+  .hover-invert:hover {
+    background-color: #000;
+    color: #fff;
+  }
+  .neo-border {
+    border: 2px solid #000;
+  }
+  .neo-border-thick {
+    border: 4px solid #000;
+  }
+}
+
+/* Decorative background image */
+#bg-image {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.7;
+}
+
+/* Ensure React app renders above the decorative background */
+#app {
+  position: relative;
+  z-index: 10;
+  min-height: 100dvh;
+}
+
+/* ====== Page Layout ====== */
+.terminal-stage {
+  width: 100%;
+  min-height: 100dvh;
+  display: flex;
+  justify-content: center;
+}
+
+.terminal-modal {
+  width: 100%;
+  max-width: 900px;
+  padding: 20px 16px 40px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 36px;
+  animation: modal-fade-in 0.3s ease-out forwards;
+}
+
+@keyframes modal-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* ====== Brand Header ====== */
+.waic-brand {
+  display: flex;
+  flex-direction: row;
+  align-items: baseline;
+  gap: 12px;
+  user-select: none;
+  pointer-events: none;
+}
+
+.waic-brand__main {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 2.8rem;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+  color: #00CC00;
+  text-transform: lowercase;
+  opacity: 0.9;
+}
+
+.waic-brand__sub {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 2.8rem;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+  color: #00CC00;
+  text-transform: lowercase;
+  opacity: 0.9;
+}
+
+/* ====== Lock Board (2D SVG grid) ====== */
+.lock-board {
+  width: min(780px, 98vw);
+  height: min(780px, 98vw);
+  border: 3px solid #4682B4;
+  background: #ffffff;
+  box-shadow: 6px 6px 0px 0px #000;
+  position: relative;
+  overflow: hidden;
+  border-radius: 4px;
+  transition: all 0.5s cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.lock-board--drawing {
+  cursor: crosshair;
+  box-shadow: 6px 6px 0px 0px #4682B4;
+  border-color: #87CEEB;
+}
+
+.lock-board--running {
+  width: min(440px, 60vw);
+  height: min(440px, 60vw);
+  opacity: 0.85;
+  pointer-events: none;
+  border-color: #00CC00;
+  box-shadow: 4px 4px 0px 0px #00CC00;
+}
+
+.lock-board__node--latest {
+  animation: lock-node-pulse 0.8s infinite alternate;
+}
+
+@keyframes lock-node-pulse {
+  from { opacity: 0.25; }
+  to { opacity: 0.6; }
+}
+
+/* ====== Unified Console ====== */
+.unified-console {
+  width: 100%;
+  max-width: 600px;
+  border: 3px solid #000;
+  background: rgba(255, 255, 255, 0.88);
+  backdrop-filter: blur(10px);
+  box-shadow: 6px 6px 0px 0px #000;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: neo-pop-in 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+  transform-origin: center center;
+}
+
+@keyframes neo-pop-in {
+  0% { transform: scale(0.8); opacity: 0; }
+  50% { transform: scale(1.03); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+/* ── Progress dots ── */
+.unified-console__progress {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  padding: 14px 20px;
+  border-bottom: 2px solid #000;
+  background: rgba(70, 130, 180, 0.08);
+  overflow-x: auto;
+}
+
+.unified-console__progress-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.unified-console__progress-item + .unified-console__progress-item {
+  margin-left: 12px;
+}
+
+.unified-console__dot {
+  width: 32px;
+  height: 32px;
+  border: 2px solid #999;
+  background: #fff;
+  display: grid;
+  place-items: center;
+  font-size: 14px;
+  font-weight: 800;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  color: #999;
+  box-shadow: 2px 2px 0 0 #ccc;
+  transition: all 0.3s ease;
+}
+
+.unified-console__dot--done {
+  background: #00CC00;
+  border-color: #00CC00;
+  color: #fff;
+  box-shadow: 2px 2px 0 0 #008800;
+}
+
+.unified-console__dot--active {
+  border-color: #4682B4;
+  color: #4682B4;
+  box-shadow: 3px 3px 0 0 #4682B4;
+  animation: dot-active-pulse 1s infinite alternate;
+}
+
+@keyframes dot-active-pulse {
+  from { box-shadow: 2px 2px 0 0 #4682B4; }
+  to { box-shadow: 4px 4px 0 0 #4682B4; }
+}
+
+.unified-console__dot-label {
+  font-size: 0.7rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  color: #999;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* ── Terminal log area ── */
+.unified-console__terminal {
+  max-height: 400px;
+  overflow-y: auto;
+  padding: 14px 18px;
+}
+
+.unified-console__placeholder {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 1rem;
+  color: #999;
+  padding: 16px 0;
+  text-align: center;
+}
+
+/* ── Action buttons ── */
+.unified-console__actions {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  padding: 14px 20px;
+  border-top: 2px solid #000;
+  background: rgba(70, 130, 180, 0.06);
+}
+
+/* ====== Lock Button (shared) ====== */
+.lock-button {
+  min-height: 52px;
+  padding: 0 28px;
+  border: 3px solid #000000;
+  background: rgba(255, 255, 255, 0.75);
+  backdrop-filter: blur(6px);
+  color: #2F4F4F;
+  font-size: 1rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  box-shadow: 4px 4px 0px 0px #000000;
+  transition: all 0.1s ease;
+}
+.lock-button:hover {
+  transform: translate(-1px, -1px);
+  box-shadow: 6px 6px 0px 0px #4682B4;
+}
+.lock-button:active {
+  transform: translate(2px, 2px);
+  box-shadow: none;
+}
+
+.lock-button--run {
+  background: #4682B4;
+  color: #FFFFFF;
+  border-color: #000000;
+}
+.lock-button--run:hover {
+  background: #2F4F4F;
+}
+
+.lock-button--run.is-running {
+  background: #00CC00;
+  color: #FFFFFF;
+  animation: pulse-running 1.2s infinite alternate;
+}
+
+@keyframes pulse-running {
+  0% { box-shadow: 4px 4px 0px 0px #2F4F4F; }
+  100% { box-shadow: 6px 6px 0px 0px #00CC00; }
+}
+
+.lock-button--abort {
+  color: #2F4F4F;
+  background: rgba(255, 255, 255, 0.75);
+  backdrop-filter: blur(6px);
+  border: 3px solid #000000;
+}
+.lock-button--abort:not(:disabled):hover {
+  background: #CC0000;
+  color: #FFFFFF;
+  border-color: #CC0000;
+}
+.lock-button--abort:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+/* ====== Error Bar ====== */
+.error-bar {
+  width: 100%;
+  max-width: 600px;
+  padding: 12px 18px;
+  border: 3px solid #4682B4;
+  box-shadow: 4px 4px 0px 0px #4682B4;
+  background: rgba(135, 206, 235, 0.3);
+  backdrop-filter: blur(8px);
+  color: #2F4F4F;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.92rem;
+  text-align: center;
+}
+
+/* ====== Step Detail Panel (embedded in UnifiedConsole) ====== */
+.step-detail-panel {
+  width: 100%;
+}
+
+.step-detail-panel__inner {
+  padding: 0;
+}
+
+/* ── Thinking phase ── */
+.step-detail-panel__thinking {
+  margin-bottom: 10px;
+}
+
+.step-detail-panel__think-line {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 1rem;
+  color: #666;
+  padding: 2px 0;
+}
+
+.step-detail-panel__think-done {
+  color: #2F4F4F;
+}
+
+.text-done {
+  color: #00CC00;
+  font-weight: 800;
+}
+
+.step-detail-panel__think-result {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.95rem;
+  color: #999;
+  padding: 2px 0;
+}
+
+.step-detail-panel__think-done-line {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.95rem;
+  color: #00CC00;
+  font-weight: 700;
+  padding: 2px 0;
+}
+
+/* ── Block separator ── */
+.step-detail-panel__block-sep {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.82rem;
+  color: #999;
+  letter-spacing: 0.06em;
+  padding: 6px 0 3px;
+  user-select: none;
+}
+
+.step-detail-panel__block-sep--done {
+  color: #00CC00;
+}
+
+/* ── Block ── */
+.step-detail-panel__block {
+  margin-bottom: 3px;
+}
+
+.step-detail-panel__block + .step-detail-panel__block {
+  margin-top: 2px;
+}
+
+/* ── Block completion line ── */
+.step-detail-panel__block-done {
+  padding: 3px 0 3px 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #00CC00;
+  animation: block-done-pop 0.35s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+}
+
+@keyframes block-done-pop {
+  0% { transform: scale(0.85); opacity: 0; }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+/* ── Step row (call + result) ── */
+.step-detail-panel__step {
+  padding: 1px 0;
+}
+
+.step-detail-panel__step--active {
+  border-left: 2px solid #4682B4;
+  margin-left: -2px;
+  padding-left: 2px;
+}
+
+.step-detail-panel__call {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.92rem;
+  line-height: 1.7;
+  color: #2F4F4F;
+  white-space: pre-wrap;
+  padding: 1px 0;
+}
+
+.step-detail-panel__call--pending {
+  color: #bbb;
+}
+
+.step-detail-panel__call--failed {
+  color: #CC0000;
+}
+
+.step-detail-panel__result {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.92rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  padding: 0 0 1px 0;
+}
+
+.step-detail-panel__result--completed {
+  color: #00CC00;
+  font-weight: 600;
+}
+
+.step-detail-panel__result--running {
+  color: #4682B4;
+}
+
+.step-detail-panel__result--pending {
+  color: #bbb;
+}
+
+.step-detail-panel__result--failed {
+  color: #CC0000;
+}
+
+/* Blinking cursor during typewriter */
+.step-detail-panel__cursor {
+  display: inline-block;
+  width: 1px;
+  height: 1.1em;
+  background: #4682B4;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: cursor-blink 0.8s infinite;
+}
+
+@keyframes cursor-blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+/* ====== Responsive (portrait-first, mobile) ====== */
+@media (max-width: 640px) {
+  .terminal-modal {
+    padding: 12px 10px 32px;
+    gap: 16px;
+  }
+
+  .waic-brand__main,
+  .waic-brand__sub {
+    font-size: 1.8rem;
+  }
+
+  .lock-board {
+    width: 96vw;
+    height: 96vw;
+    max-width: 780px;
+    max-height: 780px;
+  }
+
+  .lock-board--running {
+    width: 58vw;
+    height: 58vw;
+    max-width: 420px;
+    max-height: 420px;
+  }
+
+  .unified-console {
+    max-width: 100%;
+    box-shadow: 4px 4px 0px 0px #000;
+  }
+
+  .unified-console__progress {
+    padding: 10px 12px;
+  }
+
+  .unified-console__dot {
+    width: 28px;
+    height: 28px;
+    font-size: 12px;
+  }
+
+  .unified-console__dot-label {
+    font-size: 0.6rem;
+  }
+
+  .unified-console__terminal {
+    max-height: 320px;
+    padding: 10px 12px;
+    font-size: 0.85rem;
+  }
+
+  .unified-console__actions {
+    padding: 10px 14px;
+  }
+
+  .lock-button {
+    min-height: 48px;
+    padding: 0 20px;
+    font-size: 0.9rem;
+  }
+
+  .step-detail-panel__call,
+  .step-detail-panel__result {
+    font-size: 0.82rem;
+  }
+}
+
+@media (max-width: 380px) {
+  .lock-board {
+    width: 97vw;
+    height: 97vw;
+    max-width: none;
+    max-height: none;
+  }
+
+  .lock-board--running {
+    width: 60vw;
+    height: 60vw;
+  }
+
+  .unified-console__dot {
+    width: 24px;
+    height: 24px;
+    font-size: 11px;
+  }
+
+  .step-detail-panel__call,
+  .step-detail-panel__result {
+    font-size: 0.75rem;
+  }
+}
