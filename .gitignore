@@ -18,6 +18,7 @@ phi_robot_fronted/Ruben Marcus _ AI Fullstack & Web3 Engineer_files/
 
 # All markdown docs
 *.md
+!README.md
 
 # Debug/test scratch
 color/
