@@ -13,6 +13,9 @@ install/
 # Logs
 log/
 
+# Auto-generated / downloaded files
+phi_robot_fronted/Ruben Marcus _ AI Fullstack & Web3 Engineer_files/
+
 # Debug/test scratch
 color/
 locomotion_mode_/
