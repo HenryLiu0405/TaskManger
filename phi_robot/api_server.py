@@ -19,6 +19,7 @@ from .mission_service import MissionService
 from .mission_runner import MissionRunner, MissionExecutionHook
 from .mission_event_hub import SyncEventHub
 from .adapters.unitree_sim import UnitreeSimBackend
+from .dev_console import DevConsoleController
 
 
 logger = logging.getLogger("phi_robot.api")
@@ -110,6 +111,7 @@ class PhiRobotAPIServer:
         self.mission_hooks: Dict[str, APIHook] = {}
         self._cancel_events: Dict[str, threading.Event] = {}
         self.event_hub = SyncEventHub(self.service.store)
+        self.dev_console = DevConsoleController(self.adapter, mission_service=self.service)
 
         self._setup_routes()
     
@@ -403,7 +405,113 @@ class PhiRobotAPIServer:
             except Exception as e:
                 logger.exception("Error getting snapshot")
                 return jsonify({"error": str(e)}), 500
-    
+
+        # ── 调试控制台 API ────────────────────────────────
+
+        @self.app.route("/api/dev/mode", methods=["POST"])
+        def dev_switch_mode():
+            """切换自动/手动模式"""
+            data = request.json or {}
+            new_mode = data.get("mode", "manual")
+            result = self.dev_console.switch_mode(new_mode)
+            return jsonify(result)
+
+        @self.app.route("/api/dev/state", methods=["GET"])
+        def dev_get_state():
+            """获取完整状态（含日志）"""
+            state = self.dev_console.get_state()
+            state["logs"] = self.dev_console.get_logs()
+            return jsonify(state)
+
+        @self.app.route("/api/dev/stream", methods=["GET"])
+        def dev_stream():
+            """SSE 实时状态推送"""
+            import time as _time
+            def generate():
+                while True:
+                    state = self.dev_console.get_state()
+                    state["logs"] = self.dev_console.get_logs()
+                    yield f"data: {json.dumps(state, default=str)}\n\n"
+                    _time.sleep(1)
+            return Response(generate(), mimetype="text/event-stream")
+
+        @self.app.route("/api/dev/logs", methods=["GET"])
+        def dev_get_logs():
+            """获取日志"""
+            return jsonify({"logs": self.dev_console.get_logs()})
+
+        @self.app.route("/api/dev/logs/export", methods=["GET"])
+        def dev_export_logs():
+            """导出日志 JSON 文件"""
+            from flask import make_response
+            content = self.dev_console.export_logs()
+            resp = make_response(content)
+            resp.headers["Content-Type"] = "application/json"
+            resp.headers["Content-Disposition"] = (
+                f"attachment; filename=robot_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            )
+            return resp
+
+        # 手动模式
+
+        @self.app.route("/api/dev/manual/next", methods=["POST"])
+        def dev_manual_next():
+            data = request.json or {}
+            target = data.get("target")
+            result = self.dev_console.manual_next(target)
+            return jsonify(result)
+
+        @self.app.route("/api/dev/manual/prev", methods=["POST"])
+        def dev_manual_prev():
+            result = self.dev_console.manual_prev()
+            return jsonify(result)
+
+        @self.app.route("/api/dev/manual/pick", methods=["POST"])
+        def dev_manual_pick():
+            result = self.dev_console.manual_pick()
+            return jsonify(result)
+
+        @self.app.route("/api/dev/manual/place", methods=["POST"])
+        def dev_manual_place():
+            result = self.dev_console.manual_place()
+            return jsonify(result)
+
+        @self.app.route("/api/dev/manual/pause", methods=["POST"])
+        def dev_manual_pause():
+            result = self.dev_console.manual_pause()
+            return jsonify(result)
+
+        @self.app.route("/api/dev/manual/stop", methods=["POST"])
+        def dev_manual_stop():
+            result = self.dev_console.manual_stop()
+            return jsonify(result)
+
+        # 自动模式
+
+        @self.app.route("/api/dev/auto/start", methods=["POST"])
+        def dev_auto_start():
+            data = request.json or {}
+            destinations = data.get("destinations", [])
+            if not destinations:
+                return jsonify({"ok": False, "message": "destinations 不能为空"})
+            result = self.dev_console.auto_start(destinations)
+            return jsonify(result)
+
+        @self.app.route("/api/dev/auto/pause", methods=["POST"])
+        def dev_auto_pause():
+            result = self.dev_console.auto_pause()
+            return jsonify(result)
+
+        @self.app.route("/api/dev/auto/resume", methods=["POST"])
+        def dev_auto_resume():
+            result = self.dev_console.auto_resume()
+            return jsonify(result)
+
+        @self.app.route("/api/dev/auto/stop", methods=["POST"])
+        def dev_auto_stop():
+            result = self.dev_console.auto_stop()
+            return jsonify(result)
+
     async def _run_mission_async(self, mission_id: str, runner: MissionRunner) -> None:
         """异步执行任务"""
         try:

@@ -10,28 +10,28 @@ from .models import PlanStep, GridCell, StockSlot
 
 # 九宫格编号到坐标的映射（单位：米）
 GRID_CELLS: Dict[str, GridCell] = {
-    "nw": GridCell("nw", 0.5, 2.5, 0.0, 0.0),
-    "n": GridCell("n", 1.5, 2.5, 0.0, 0.0),
-    "ne": GridCell("ne", 2.5, 2.5, 0.0, 0.0),
-    "w": GridCell("w", 0.5, 1.5, 0.0, 0.0),
-    "c": GridCell("c", 1.5, 1.5, 0.0, 0.0),
-    "e": GridCell("e", 2.5, 1.5, 0.0, 0.0),
-    "sw": GridCell("sw", 0.5, 0.5, 0.0, 0.0),
-    "s": GridCell("s", 1.5, 0.5, 0.0, 0.0),
-    "se": GridCell("se", 2.5, 0.5, 0.0, 0.0),
+    "nw": GridCell("nw", 2.7, 2.5, 0.0, 0.0),
+    "n": GridCell("n", 3.5, 2.5, 0.0, 0.0),
+    "ne": GridCell("ne", 4.3, 2.5, 0.0, 0.0),
+    "w": GridCell("w", 2.7, 1.5, 0.0, 0.0),
+    "c": GridCell("c", 3.5, 1.5, 0.0, 0.0),
+    "e": GridCell("e", 4.3, 1.5, 0.0, 0.0),
+    "sw": GridCell("sw", 2.7, 0.5, 0.0, 0.0),
+    "s": GridCell("s", 3.5, 0.5, 0.0, 0.0),
+    "se": GridCell("se", 4.3, 0.5, 0.0, 0.0),
 }
 
 # 备货槽位坐标表（后端固定维护）
 STOCK_SLOTS: List[StockSlot] = [
-    StockSlot(0, 0.5, 3.5, 0.0, order_index=0, consumed=False),
-    StockSlot(1, 1.0, 3.5, 0.0, order_index=1, consumed=False),
-    StockSlot(2, 1.5, 3.5, 0.0, order_index=2, consumed=False),
-    StockSlot(3, 2.0, 3.5, 0.0, order_index=3, consumed=False),
-    StockSlot(4, 2.5, 3.5, 0.0, order_index=4, consumed=False),
-    StockSlot(5, 3.0, 3.5, 0.0, order_index=5, consumed=False),
-    StockSlot(6, 3.5, 3.5, 0.0, order_index=6, consumed=False),
-    StockSlot(7, 4.0, 3.5, 0.0, order_index=7, consumed=False),
-    StockSlot(8, 4.5, 3.5, 0.0, order_index=8, consumed=False),
+    StockSlot(0, 1.6, 2.6, 0.0, order_index=0, consumed=False),   # 顶排左
+    StockSlot(1, 0.9, 2.6, 0.0, order_index=1, consumed=False),   # 顶排中
+    StockSlot(2, 0.2, 2.6, 0.0, order_index=2, consumed=False),   # 顶排右
+    StockSlot(3, 1.6, 2.1, 0.0, order_index=3, consumed=False),   # 中排左
+    StockSlot(4, 0.9, 2.1, 0.0, order_index=4, consumed=False),   # 中排中
+    StockSlot(5, 0.2, 2.1, 0.0, order_index=5, consumed=False),   # 中排右
+    StockSlot(6, 1.6, 1.6, 0.0, order_index=6, consumed=False),   # 底排左
+    StockSlot(7, 0.9, 1.6, 0.0, order_index=7, consumed=False),   # 底排中
+    StockSlot(8, 0.2, 1.6, 0.0, order_index=8, consumed=False),   # 底排右
 ]
 
 

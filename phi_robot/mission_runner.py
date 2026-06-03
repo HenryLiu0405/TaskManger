@@ -71,6 +71,7 @@ class MissionRunner:
         adapter: RobotAdapter,
         hook: Optional[MissionExecutionHook] = None,
         cancel_event: Optional[threading.Event] = None,
+        step_callback: Optional[Callable] = None,
     ):
         """
         初始化执行引擎
@@ -80,11 +81,13 @@ class MissionRunner:
             adapter: RobotAdapter 实例（仿真或真机）
             hook: 执行钩子（可选）
             cancel_event: 取消事件，set 时中断执行
+            step_callback: 每步完成回调，签名为 (PlanStep, ToolResult) -> None
         """
         self._service = service
         self._adapter = adapter
         self._hook = hook
         self._cancel_event = cancel_event
+        self._step_callback = step_callback
         self._replan_counts: dict[int, int] = {}
         self._max_replans_per_task = 2
 
@@ -111,6 +114,11 @@ class MissionRunner:
             while record.status == "running":
                 # === 检查取消/暂停/中止标志 ===
                 if self._cancel_event and self._cancel_event.is_set():
+                    record = self._service.get_mission(mission_id)
+                    if record.pause_requested:
+                        record = replace(record, status="paused")
+                        self._service.store.update(mission_id, record)
+                        break
                     self._service.mark_aborted(mission_id, "cancelled via cancel_event")
                     break
 
@@ -202,6 +210,8 @@ class MissionRunner:
                     )
 
                     context.tool_results.append(tool_result)
+                    if self._step_callback:
+                        self._step_callback(step, tool_result)
 
                     if tool_result.status == "ok":
                         self._service.mark_step_succeeded(mission_id, result_dict)
@@ -245,6 +255,11 @@ class MissionRunner:
                             )
 
                 except Exception as e:
+                    if self._step_callback:
+                        self._step_callback(step, ToolResult(
+                            status="error", error_code="INTERNAL_ERROR",
+                            message=str(e), step_id=step.step_id,
+                        ))
                     self._service.mark_step_failed(
                         mission_id, "INTERNAL_ERROR", str(e)
                     )

@@ -575,3 +575,16 @@
     font-size: 0.75rem;
   }
 }
+
+/* ====== Debug Console Dark Theme (Industrial Amber) ====== */
+:root {
+  --debug-bg: #0b0b10;
+  --debug-card-bg: #111118;
+  --debug-border: #2a2a2a;
+  --debug-text: #c8c8c8;
+  --debug-text-secondary: #8a8a8a;
+  --debug-primary: #d4a853;
+  --debug-success: #7fb87c;
+  --debug-warning: #d4a853;
+  --debug-error: #d44a4a;
+}
