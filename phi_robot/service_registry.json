@@ -1,0 +1,209 @@
+{
+  "compose_file": "/home/hairo/waic/docker-compose.yml",
+  "compose_profile": "test",
+  "services": [
+    {
+      "id": "navigation",
+      "group": "server",
+      "label": "导航仿真",
+      "description": "A* 规划 + Pure Pursuit + 仿真机器人",
+      "compose_service": null,
+      "check": {
+        "method": "ros2_service",
+        "target": "/start_navigation",
+        "timeout_sec": 0.1
+      },
+      "manage": {
+        "method": "systemd",
+        "unit": "waic-navigation"
+      },
+      "depends_on": []
+    },
+    {
+      "id": "robot-gateway",
+      "group": "server",
+      "label": "G1 运动网关",
+      "description": "接收 /cmd_vel，提供 lift/lay_down 等服务（真机 Orin）",
+      "compose_service": null,
+      "check": {
+        "method": "ros2_service",
+        "target": "/get_locomotion_mode",
+        "timeout_sec": 0.1
+      },
+      "manage": {
+        "method": "systemd",
+        "unit": "waic-gateway",
+        "ssh_host": "unitree@192.168.50.79"
+      },
+      "depends_on": ["navigation"]
+    },
+    {
+      "id": "sonic",
+      "group": "server",
+      "label": "SONIC (仿真测试)",
+      "description": "TensorRT 推理 → MuJoCo 仿真，Orin 上运行",
+      "compose_service": null,
+      "check": {
+        "method": "ros2_service",
+        "target": "/g1_deploy_ros2_manager/describe_parameters",
+        "timeout_sec": 0.1
+      },
+      "manage": {
+        "method": "systemd",
+        "unit": "waic-sonic",
+        "ssh_host": "unitree@192.168.50.79"
+      },
+      "depends_on": ["robot-gateway"]
+    },
+    {
+      "id": "sonic-real",
+      "group": "server",
+      "label": "SONIC (真机物理)",
+      "description": "TensorRT 推理 → 真实 G1 关节电机，Orin 上运行",
+      "compose_service": null,
+      "check": {
+        "method": "systemd",
+        "target": "waic-sonic-real"
+      },
+      "manage": {
+        "method": "systemd",
+        "unit": "waic-sonic-real",
+        "ssh_host": "unitree@192.168.50.79"
+      },
+      "depends_on": ["robot-gateway"]
+    },
+    {
+      "id": "fastlio",
+      "group": "server",
+      "label": "FAST-LIO 导航 (真机)",
+      "description": "激光SLAM + Nav2 路径规划，G1 Orin 上运行",
+      "compose_service": null,
+      "check": {
+        "method": "systemd",
+        "target": "waic-fastlio"
+      },
+      "manage": {
+        "method": "systemd",
+        "unit": "waic-fastlio",
+        "ssh_host": "unitree@192.168.50.79"
+      },
+      "depends_on": []
+    },
+    {
+      "id": "bridge",
+      "group": "server",
+      "label": "ZMQ 桥接 (真机)",
+      "description": "CycloneDDS(0) ↔ Fast-DDS(66) ZMQ 转发，Orin 上运行",
+      "compose_service": null,
+      "check": {
+        "method": "systemd",
+        "target": "waic-zmq-bridge"
+      },
+      "manage": {
+        "method": "systemd",
+        "unit": "waic-zmq-bridge",
+        "ssh_host": "unitree@192.168.50.79"
+      },
+      "depends_on": []
+    },
+    {
+      "id": "action-bridge",
+      "group": "server",
+      "label": "Action 桥接 (真机)",
+      "description": "/goal_pose topic → /navigate_to_pose Action，Orin 上运行",
+      "compose_service": null,
+      "check": {
+        "method": "systemd",
+        "target": "waic-action-bridge"
+      },
+      "manage": {
+        "method": "systemd",
+        "unit": "waic-action-bridge",
+        "ssh_host": "unitree@192.168.50.79"
+      },
+      "depends_on": ["fastlio"]
+    },
+    {
+      "id": "goal-bridge",
+      "group": "server",
+      "label": "导航接口桥接 (本地)",
+      "description": "/start_navigation → /goal_pose 服务转话题",
+      "compose_service": null,
+      "check": {
+        "method": "systemd",
+        "target": "waic-goal-bridge"
+      },
+      "manage": {
+        "method": "systemd",
+        "unit": "waic-goal-bridge"
+      },
+      "depends_on": ["bridge"]
+    },
+    {
+      "id": "set_lift",
+      "group": "robot",
+      "label": "搬起",
+      "description": "G1 搬起动作服务",
+      "compose_service": null,
+      "check": {
+        "method": "ros2_service",
+        "target": "/set_lift",
+        "timeout_sec": 0.1
+      },
+      "depends_on": ["robot-gateway"]
+    },
+    {
+      "id": "set_lay_down",
+      "group": "robot",
+      "label": "放下",
+      "description": "G1 放下动作服务",
+      "compose_service": null,
+      "check": {
+        "method": "ros2_service",
+        "target": "/set_lay_down",
+        "timeout_sec": 0.1
+      },
+      "depends_on": ["robot-gateway"]
+    },
+    {
+      "id": "set_stand",
+      "group": "robot",
+      "label": "站立",
+      "description": "G1 站立动作服务",
+      "compose_service": null,
+      "check": {
+        "method": "ros2_service",
+        "target": "/set_stand",
+        "timeout_sec": 0.1
+      },
+      "depends_on": ["robot-gateway"]
+    },
+    {
+      "id": "foundationpose",
+      "group": "server",
+      "label": "FoundationPose",
+      "description": "6DoF 物体位姿估计（RGB-D + AI）",
+      "compose_service": null,
+      "check": {
+        "method": "ros2_service",
+        "target": "/foundationpose/activate",
+        "timeout_sec": 0.1
+      },
+      "manage": {
+        "method": "systemd",
+        "unit": "waic-foundationpose",
+        "user": true,
+        "post_start": {
+          "method": "ros2_service",
+          "service": "/foundationpose/activate",
+          "type": "foundationpose_ros2/srv/Activate",
+          "data": "{activate: true}",
+          "setup_bash": "/home/hairo/fp_ws/install/setup.bash",
+          "retries": 15,
+          "delay": 2.0
+        }
+      },
+      "depends_on": []
+    }
+  ]
+}

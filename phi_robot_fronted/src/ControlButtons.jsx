@@ -38,6 +38,7 @@ function ConfirmModal({ open, title, message, onConfirm, onCancel, danger }) {
 export default function ControlButtons({
   mode,
   manualState,
+  robotState,
   autoRunning,
   autoPaused,
   onPause,
@@ -63,6 +64,11 @@ export default function ControlButtons({
     const isStopped = manualState === 'stopped';
     const isPaused = manualState === 'paused';
     const isMoving = manualState === 'moving' || manualState === 'picking' || manualState === 'placing';
+
+    // 使用后端安全状态机 — can_walk/can_pick/can_place 优先于本地状态判断
+    const canWalk = robotState?.can_walk !== false && !isStopped;
+    const canPick = robotState?.can_pick === true && !isStopped && !isMoving && !isPaused;
+    const canPlace = robotState?.can_place === true && !isStopped && !isMoving && !isPaused;
 
     return (
       <>
@@ -92,22 +98,26 @@ export default function ControlButtons({
 
           {/* 搬箱子 / 放箱子 */}
           <div className="flex flex-wrap gap-4">
-            <Button
-              size="middle"
-              icon={<ArrowUpOutlined />}
-              onClick={() => setPickOpen(true)}
-              disabled={isStopped || isMoving || isPaused}
-            >
-              搬箱子
-            </Button>
-            <Button
-              size="middle"
-              icon={<ArrowDownOutlined />}
-              onClick={() => setPlaceOpen(true)}
-              disabled={isStopped || isMoving || isPaused}
-            >
-              放箱子
-            </Button>
+            <Tooltip title={!canPick ? `安全状态: ${robotState?.state || 'unknown'}，不可搬起` : undefined}>
+              <Button
+                size="middle"
+                icon={<ArrowUpOutlined />}
+                onClick={() => setPickOpen(true)}
+                disabled={!canPick}
+              >
+                搬箱子
+              </Button>
+            </Tooltip>
+            <Tooltip title={!canPlace ? `安全状态: ${robotState?.state || 'unknown'}，不可放下` : undefined}>
+              <Button
+                size="middle"
+                icon={<ArrowDownOutlined />}
+                onClick={() => setPlaceOpen(true)}
+                disabled={!canPlace}
+              >
+                放箱子
+              </Button>
+            </Tooltip>
           </div>
 
           {/* 占位按钮 */}

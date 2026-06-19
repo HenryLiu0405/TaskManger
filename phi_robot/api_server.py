@@ -5,6 +5,7 @@ phi_robot HTTP API 服务
 
 from __future__ import annotations
 import json
+import os
 import uuid
 import asyncio
 import threading
@@ -20,7 +21,8 @@ from .mission_runner import MissionRunner, MissionExecutionHook
 from .mission_event_hub import SyncEventHub
 from .adapters.unitree_sim import UnitreeSimBackend
 from .dev_console import DevConsoleController
-
+from .robot_state import safety_fsm, RobotState
+from .audit import audit_logger
 
 logger = logging.getLogger("phi_robot.api")
 
@@ -67,7 +69,7 @@ class APIHook(MissionExecutionHook):
             payload={"status": context.mission_record.status},
         )
         self._event_hub.publish(self.mission_id, event)
-    
+
     def apply_replan_policy(self, record: Any, result: dict, events: Any = None) -> tuple:
         """重规划策略 — 根据错误代码分类处理"""
         error_code = result.get("error_code", "")
@@ -99,6 +101,7 @@ class PhiRobotAPIServer:
         host: str = "127.0.0.1",
         port: int = 5000,
         adapter=None,
+        service_manager=None,
     ):
         self.app = Flask(__name__)
         CORS(self.app)  # 启用跨域请求
@@ -112,12 +115,15 @@ class PhiRobotAPIServer:
         self._cancel_events: Dict[str, threading.Event] = {}
         self.event_hub = SyncEventHub(self.service.store)
         self.dev_console = DevConsoleController(self.adapter, mission_service=self.service)
+        self.service_manager = service_manager
 
         self._setup_routes()
-    
+        if self.service_manager is not None:
+            self._setup_service_routes()
+
     def _setup_routes(self) -> None:
         """注册 API 路由"""
-        
+
         @self.app.route("/api/health", methods=["GET"])
         def health():
             """健康检查"""
@@ -125,13 +131,13 @@ class PhiRobotAPIServer:
                 "status": "ok",
                 "timestamp": datetime.now().isoformat()
             })
-        
+
         @self.app.route("/api/missions", methods=["POST"])
         def submit_mission():
             """提交任务"""
             try:
                 data = request.json or {}
-                
+
                 # 提取参数
                 request_id = data.get("request_id")
                 if not request_id:
@@ -144,13 +150,13 @@ class PhiRobotAPIServer:
 
                 if not destination_order:
                     return jsonify({"error": "destination_order is required"}), 400
-                
+
                 # 验证目标是否为九宫格位置
                 valid_positions = ["nw", "n", "ne", "w", "c", "e", "sw", "s", "se"]
                 for pos in destination_order:
                     if pos not in valid_positions:
                         return jsonify({"error": f"Invalid position: {pos}"}), 400
-                
+
                 # 提交任务
                 mission_id = self.service.submit(
                     request_id=request_id,
@@ -161,7 +167,7 @@ class PhiRobotAPIServer:
                     destination_order=destination_order,
                     options=data.get("options", {})
                 )
-                
+
                 return jsonify({
                     "mission_id": mission_id,
                     "request_id": request_id,
@@ -169,11 +175,11 @@ class PhiRobotAPIServer:
                     "status": "pending",
                     "timestamp": datetime.now().isoformat()
                 }), 201
-            
+
             except Exception as e:
                 logger.exception("Error submitting mission")
                 return jsonify({"error": str(e)}), 500
-        
+
         @self.app.route("/api/missions/<mission_id>", methods=["GET"])
         def get_mission(mission_id: str):
             """查询任务状态"""
@@ -181,7 +187,7 @@ class PhiRobotAPIServer:
                 record = self.service.get_mission(mission_id)
                 if not record:
                     return jsonify({"error": "Mission not found"}), 404
-                
+
                 # 序列化返回
                 return jsonify({
                     "mission_id": mission_id,
@@ -201,11 +207,11 @@ class PhiRobotAPIServer:
                         for step in record.plan
                     ]
                 })
-            
+
             except Exception as e:
                 logger.exception("Error querying mission")
                 return jsonify({"error": str(e)}), 500
-        
+
         @self.app.route("/api/missions/<mission_id>/run", methods=["POST"])
         def run_mission(mission_id: str):
             """启动任务执行"""
@@ -253,7 +259,7 @@ class PhiRobotAPIServer:
             except Exception as e:
                 logger.exception("Error running mission")
                 return jsonify({"error": str(e)}), 500
-        
+
         @self.app.route("/api/missions/<mission_id>/pause", methods=["POST"])
         def pause_mission(mission_id: str):
             """暂停任务 — 设置 pause_requested 标志，runner 在步骤边界执行暂停"""
@@ -272,7 +278,7 @@ class PhiRobotAPIServer:
             except Exception as e:
                 logger.exception("Error pausing mission")
                 return jsonify({"error": str(e)}), 500
-        
+
         @self.app.route("/api/missions/<mission_id>/abort", methods=["POST"])
         def abort_mission(mission_id: str):
             """中止任务 — 设置 abort_requested 标志 + 触发 cancel_event"""
@@ -297,7 +303,7 @@ class PhiRobotAPIServer:
             except Exception as e:
                 logger.exception("Error aborting mission")
                 return jsonify({"error": str(e)}), 500
-        
+
         @self.app.route("/api/missions/<mission_id>/resume", methods=["POST"])
         def resume_mission(mission_id: str):
             """恢复任务 — 清除暂停标志，重新创建 runner 继续执行"""
@@ -394,17 +400,29 @@ class PhiRobotAPIServer:
                     self.event_hub.unsubscribe(mission_id, q)
 
             return Response(event_stream(), mimetype="text/event-stream")
-        
+
         @self.app.route("/api/snapshot", methods=["GET"])
         def get_snapshot():
             """获取仿真环境快照"""
             try:
                 snapshot = self.adapter.snapshot()
                 return jsonify(snapshot)
-            
+
             except Exception as e:
                 logger.exception("Error getting snapshot")
                 return jsonify({"error": str(e)}), 500
+
+        # ── 机器人安全状态查询 ────────────────────────────
+
+        @self.app.route("/api/robot/state", methods=["GET"])
+        def get_robot_state():
+            """查询安全状态机 + 机器人实时状态"""
+            return jsonify({
+                "state": safety_fsm.state_value,
+                "can_walk": safety_fsm.can_walk(),
+                "can_pick": safety_fsm.can_pick(),
+                "can_place": safety_fsm.can_place(),
+            })
 
         # ── 调试控制台 API ────────────────────────────────
 
@@ -452,10 +470,12 @@ class PhiRobotAPIServer:
             )
             return resp
 
-        # 手动模式
+        # 手动模式 — 含安全状态检查
 
         @self.app.route("/api/dev/manual/next", methods=["POST"])
         def dev_manual_next():
+            if not safety_fsm.can_walk():
+                return jsonify({"ok": False, "message": f"当前 {safety_fsm.state_value}, 不可导航"}), 409
             data = request.json or {}
             target = data.get("target")
             result = self.dev_console.manual_next(target)
@@ -468,11 +488,15 @@ class PhiRobotAPIServer:
 
         @self.app.route("/api/dev/manual/pick", methods=["POST"])
         def dev_manual_pick():
+            if not safety_fsm.can_pick():
+                return jsonify({"ok": False, "message": f"当前 {safety_fsm.state_value}, 不可搬起"}), 409
             result = self.dev_console.manual_pick()
             return jsonify(result)
 
         @self.app.route("/api/dev/manual/place", methods=["POST"])
         def dev_manual_place():
+            if not safety_fsm.can_place():
+                return jsonify({"ok": False, "message": f"当前 {safety_fsm.state_value}, 不可放下"}), 409
             result = self.dev_console.manual_place()
             return jsonify(result)
 
@@ -483,6 +507,7 @@ class PhiRobotAPIServer:
 
         @self.app.route("/api/dev/manual/stop", methods=["POST"])
         def dev_manual_stop():
+            safety_fsm.reset()
             result = self.dev_console.manual_stop()
             return jsonify(result)
 
@@ -512,6 +537,107 @@ class PhiRobotAPIServer:
             result = self.dev_console.auto_stop()
             return jsonify(result)
 
+        # ── 审计日志 API ──────────────────────────────────
+
+        @self.app.route("/api/dev/audit/today", methods=["GET"])
+        def dev_audit_today():
+            """返回当天审计日志文件信息"""
+            info = audit_logger.today_info()
+            lines = []
+            if info.get("path") and os.path.exists(info["path"]):
+                try:
+                    with open(info["path"], "r", encoding="utf-8") as f:
+                        lines = [line.rstrip("\n") for line in f.readlines()[-200:]]
+                except Exception:
+                    pass
+            info["lines"] = lines
+            info["line_count"] = len(lines)
+            return jsonify(info)
+
+        @self.app.route("/api/dev/audit/download", methods=["GET"])
+        def dev_audit_download():
+            """下载当天审计日志文件"""
+            from flask import send_file
+            info = audit_logger.today_info()
+            path = info.get("path", "")
+            if not path or not os.path.exists(path):
+                return jsonify({"error": "no audit log for today"}), 404
+            return send_file(
+                path,
+                mimetype="application/x-ndjson",
+                as_attachment=True,
+                download_name=f"audit_{info.get('date', 'unknown')}.jsonl",
+            )
+
+        # ── FoundationPose 视频帧 ─────────────────────────
+
+        @self.app.route("/api/dev/fp/frame", methods=["GET"])
+        def dev_fp_frame():
+            """返回 FoundationPose 最新视频帧 (JPEG)"""
+            try:
+                fp_frame = getattr(self.adapter, "get_fp_frame", None)
+                if callable(fp_frame):
+                    data = fp_frame()
+                    if data:
+                        return Response(data, mimetype="image/jpeg")
+            except Exception:
+                pass
+            return Response(status=204)
+
+    def _setup_service_routes(self) -> None:
+        """注册 ServiceManager 相关路由"""
+
+        @self.app.route("/api/services", methods=["GET"])
+        def get_services():
+            """获取所有服务状态"""
+            if not self.service_manager:
+                return jsonify({"error": "ServiceManager not configured"}), 503
+            return jsonify(self.service_manager.get_frontend_data())
+
+        @self.app.route("/api/services/registry", methods=["GET"])
+        def get_registry():
+            """获取服务注册表"""
+            if not self.service_manager:
+                return jsonify({"error": "ServiceManager not configured"}), 503
+            return jsonify({
+                "compose_file": self.service_manager.registry.compose_file,
+                "compose_profile": self.service_manager.registry.compose_profile,
+                "services": [
+                    {
+                        "id": s.id,
+                        "group": s.group,
+                        "label": s.label,
+                        "description": s.description,
+                        "compose_service": s.compose_service,
+                        "check": s.check,
+                        "manage": s.manage,
+                        "depends_on": s.depends_on,
+                    }
+                    for s in self.service_manager.registry.services
+                ],
+            })
+
+        @self.app.route("/api/services/<svc_id>/start", methods=["POST"])
+        def start_service(svc_id: str):
+            if not self.service_manager:
+                return jsonify({"error": "ServiceManager not configured"}), 503
+            result = self.service_manager.start(svc_id)
+            return jsonify(result)
+
+        @self.app.route("/api/services/<svc_id>/stop", methods=["POST"])
+        def stop_service(svc_id: str):
+            if not self.service_manager:
+                return jsonify({"error": "ServiceManager not configured"}), 503
+            result = self.service_manager.stop(svc_id)
+            return jsonify(result)
+
+        @self.app.route("/api/services/<svc_id>/restart", methods=["POST"])
+        def restart_service(svc_id: str):
+            if not self.service_manager:
+                return jsonify({"error": "ServiceManager not configured"}), 503
+            result = self.service_manager.restart(svc_id)
+            return jsonify(result)
+
     async def _run_mission_async(self, mission_id: str, runner: MissionRunner) -> None:
         """异步执行任务"""
         try:
@@ -521,7 +647,7 @@ class PhiRobotAPIServer:
             logger.exception(f"Error executing mission {mission_id}")
         finally:
             self.active_runners.pop(mission_id, None)
-    
+
     def _run_mission_sync(self, mission_id: str, runner: MissionRunner) -> None:
         """同步执行任务（在线程中）"""
         try:
@@ -536,7 +662,7 @@ class PhiRobotAPIServer:
             self.active_runners.pop(mission_id, None)
             self._cancel_events.pop(mission_id, None)
             loop.close()
-    
+
     def run(self) -> None:
         """启动服务器"""
         logger.info(f"Starting phi_robot API server on {self.host}:{self.port}")

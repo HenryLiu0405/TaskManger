@@ -91,6 +91,16 @@ if __name__ == "__main__":
         default="/notify_goal_reached",
         help="ROS2 目标到达通知服务名 (默认 /notify_goal_reached)",
     )
+    parser.add_argument(
+        "--compose-file",
+        default=None,
+        help="docker-compose.yml 路径 (启用 ServiceManager)",
+    )
+    parser.add_argument(
+        "--service-registry",
+        default=None,
+        help="服务注册表 JSON 路径 (启用 ServiceManager)",
+    )
 
     args = parser.parse_args()
 
@@ -139,5 +149,21 @@ if __name__ == "__main__":
     print(f"健康检查: http://{args.host}:{args.port}/api/health")
     print()
 
-    server = PhiRobotAPIServer(host=args.host, port=args.port, adapter=adapter)
+    # ServiceManager（可选）
+    service_manager = None
+    if args.compose_file and args.service_registry:
+        from phi_robot.service_manager import ServiceManager
+
+        service_manager = ServiceManager(
+            registry_path=args.service_registry,
+            compose_file=args.compose_file,
+            profile="test",
+        )
+        print(f"ServiceManager: compose={args.compose_file}")
+        print(f"  registry={args.service_registry}")
+
+    server = PhiRobotAPIServer(
+        host=args.host, port=args.port, adapter=adapter,
+        service_manager=service_manager,
+    )
     server.run()

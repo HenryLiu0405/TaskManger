@@ -3,31 +3,32 @@ import { InputNumber, Button, Space, Tag, Card, Segmented } from 'antd';
 import { SendOutlined, PushpinOutlined } from '@ant-design/icons';
 import RobotPanel from './RobotPanel.jsx';
 import BoxPanel from './BoxPanel.jsx';
+import ServicePanel from './ServicePanel.jsx';
 import ControlButtons from './ControlButtons.jsx';
 import LogPanel from './LogPanel.jsx';
 
 const API = '/api/dev';
 
 const PRESETS = [
-  { label: 'nw', x: 2.7, y: 2.5 },
+  { label: 'nw', x: 2.5, y: 2.5 },
   { label: 'n',  x: 3.5, y: 2.5 },
-  { label: 'ne', x: 4.3, y: 2.5 },
-  { label: 'w',  x: 2.7, y: 1.5 },
+  { label: 'ne', x: 4.5, y: 2.5 },
+  { label: 'w',  x: 2.5, y: 1.5 },
   { label: 'c',  x: 3.5, y: 1.5 },
-  { label: 'e',  x: 4.3, y: 1.5 },
-  { label: 'sw', x: 2.7, y: 0.5 },
+  { label: 'e',  x: 4.5, y: 1.5 },
+  { label: 'sw', x: 2.5, y: 0.5 },
   { label: 's',  x: 3.5, y: 0.5 },
-  { label: 'se', x: 4.3, y: 0.5 },
-  { label: '顶左', x: 1.6, y: 2.6 },
-  { label: '顶中', x: 0.9, y: 2.6 },
-  { label: '顶右', x: 0.2, y: 2.6 },
-  { label: '中左', x: 1.6, y: 2.1 },
-  { label: '中中', x: 0.9, y: 2.1 },
-  { label: '中右', x: 0.2, y: 2.1 },
-  { label: '底左', x: 1.6, y: 1.6 },
-  { label: '底中', x: 0.9, y: 1.6 },
-  { label: '底右', x: 0.2, y: 1.6 },
-  { label: '原点', x: 0.5, y: 0.5 },
+  { label: 'se', x: 4.5, y: 0.5 },
+  { label: '顶右', x: 2.0, y: 1.5 },
+  { label: '顶中', x: 1.25, y: 1.5 },
+  { label: '顶左', x: 0.5, y: 1.5 },
+  { label: '中右', x: 2.0, y: 1.0 },
+  { label: '中中', x: 1.25, y: 1.0 },
+  { label: '中左', x: 0.5, y: 1.0 },
+  { label: '底右', x: 2.0, y: 0.5 },
+  { label: '底中', x: 1.25, y: 0.5 },
+  { label: '底左', x: 0.5, y: 0.5 },
+  { label: '原点', x: 0.5, y: 2.5 },
 ];
 
 const GRID_PRESETS = PRESETS.filter((p) => /^[a-z]+$/.test(p.label));
@@ -45,6 +46,22 @@ export default function DeveloperConsole() {
   const [autoDests, setAutoDests] = useState([]);
   const [loading, setLoading] = useState(false);
   const [connected, setConnected] = useState(false);
+  const [robotState, setRobotState] = useState({ state: 'standing', can_walk: true, can_pick: false, can_place: false });
+
+  // ── 机器人安全状态轮询 ──────────────────────────
+  useEffect(() => {
+    let active = true;
+    async function poll() {
+      try {
+        const res = await fetch('/api/robot/state');
+        const data = await res.json();
+        if (active) setRobotState(data);
+      } catch (_) {}
+    }
+    poll();
+    const timer = setInterval(poll, 500);
+    return () => { active = false; clearInterval(timer); };
+  }, []);
 
   // ── SSE ────────────────────────────────────────────
   useEffect(() => {
@@ -176,6 +193,18 @@ export default function DeveloperConsole() {
               ? (manual?.state || 'idle')
               : (auto?.mission_status || 'idle')}
           </Tag>
+          <Tag
+            color={
+              robotState?.state === 'emergency' ? 'error'
+              : robotState?.state === 'error' ? 'warning'
+              : robotState?.state === 'moving' ? 'processing'
+              : robotState?.state === 'picking' || robotState?.state === 'placing' ? 'processing'
+              : robotState?.state === 'holding' ? 'success'
+              : 'default'
+            }
+          >
+            🤖 {robotState?.state || 'standing'}
+          </Tag>
         </div>
       </header>
 
@@ -185,6 +214,7 @@ export default function DeveloperConsole() {
         <aside className="w-72 shrink-0 border-r border-[#2a2a2a] overflow-y-auto p-3 flex flex-col gap-3" style={{ background: '#0b0b10' }}>
           <RobotPanel manual={manual} robot={robot} services={services} />
           <BoxPanel box={box} holdingBox={manual?.holding_box} />
+          <ServicePanel />
         </aside>
 
         {/* 右侧主区域 */}
@@ -294,7 +324,7 @@ export default function DeveloperConsole() {
                   <InputNumber size="small" style={{ width: 80 }} placeholder="0.5" step={0.5} value={targetX} onChange={setTargetX} />
                   <span className="text-sm text-[#8a8a8a]">Y</span>
                   <InputNumber size="small" style={{ width: 80 }} placeholder="3.5" step={0.5} value={targetY} onChange={setTargetY} />
-                  <Button size="small" type="primary" icon={<SendOutlined />} onClick={handleNext} disabled={targetX == null || targetY == null} loading={loading}>
+                  <Button size="small" type="primary" icon={<SendOutlined />} onClick={handleNext} disabled={targetX == null || targetY == null || robotState?.can_walk === false} loading={loading}>
                     导航
                   </Button>
                 </div>
@@ -313,6 +343,7 @@ export default function DeveloperConsole() {
             <ControlButtons
               mode={mode}
               manualState={manual?.state}
+              robotState={robotState}
               autoRunning={autoRunning}
               autoPaused={autoPaused}
               onPause={mode === 'manual' ? handlePause : handleAutoPause}

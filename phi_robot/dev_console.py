@@ -15,6 +15,8 @@ from datetime import datetime
 from typing import Any, Callable, Optional
 
 from .adapters.adapter_base import RobotAdapter
+from .audit import audit_logger
+from .robot_state import safety_fsm
 
 logger = logging.getLogger("phi_robot.dev_console")
 
@@ -121,11 +123,13 @@ class DevConsoleController:
             self._mode = "manual"
             self._reset_manual_state()
             self._add_log("info", "mode", "切换到手动模式")
+            audit_logger.log_system("切换到手动模式", mode="manual")
             return {"ok": True, "message": "已切换到手动模式"}
         if new_mode == "auto":
             self._mode = "auto"
             self._reset_manual_state()
             self._add_log("info", "mode", "切换到自动模式")
+            audit_logger.log_system("切换到自动模式", mode="auto")
             return {"ok": True, "message": "已切换到自动模式"}
         return {"ok": False, "message": f"未知模式: {new_mode}"}
 
@@ -371,6 +375,7 @@ class DevConsoleController:
         if self._mode != "manual":
             return {"ok": False, "message": "当前不在手动模式"}
 
+        safety_fsm.reset()
         self._stop_flag.set()
         self._pause_flag.clear()
         self._manual_state = STOPPED
@@ -378,6 +383,7 @@ class DevConsoleController:
         self._holding_box = False
         self._target_position = None
         self._add_log("warn", "stop", "已终止，所有状态已重置（不可恢复）")
+        audit_logger.log_system("manual_stop: 已终止，所有状态已重置")
         return {"ok": True, "message": "已终止", "stopped": True}
 
     # ── 自动模式 ──────────────────────────────────────────
@@ -637,34 +643,49 @@ class DevConsoleController:
             if self._stop_flag.is_set():
                 return
 
+            request_id = f"dev-{uuid.uuid4().hex[:8]}"
+            goal_id = "dev-manual"
+            step_id = f"dev-{uuid.uuid4().hex[:8]}"
+
             with self._lock:
                 self._manual_state = action.transitional_state
                 self._target_position = action.args.get("target") if action.tool == "move_to" else self._target_position
 
             self._add_log("info", action.tool, f"开始: {action.log_label}")
+            audit_logger.log_action_start(tool=action.tool, request_id=request_id,
+                                          goal_id=goal_id, step_id=step_id,
+                                          args=action.args)
 
             # 检查暂停标志（阻塞式等待继续）
             if self._pause_flag.is_set():
                 self._add_log("info", "wait", "等待继续...")
                 self._pause_flag.wait()
 
+            t0 = time.time()
             result = self._adapter.execute(
                 action.tool,
                 action.args,
-                request_id=f"dev-{uuid.uuid4().hex[:8]}",
-                goal_id="dev-manual",
-                step_id=f"dev-{uuid.uuid4().hex[:8]}",
+                request_id=request_id,
+                goal_id=goal_id,
+                step_id=step_id,
             )
+            elapsed_ms = (time.time() - t0) * 1000
 
             with self._lock:
                 if self._stop_flag.is_set():
                     self._add_log("warn", action.tool, "终止信号，丢弃结果")
+                    audit_logger.log_action_end(tool=action.tool, request_id=request_id,
+                                                goal_id=goal_id, step_id=step_id,
+                                                status="cancelled", elapsed_ms=elapsed_ms)
                     return
 
                 if self._pause_flag.is_set():
                     self._add_log("info", action.tool, "暂停中，等待继续...")
                     self._pause_flag.wait()
                     if self._stop_flag.is_set():
+                        audit_logger.log_action_end(tool=action.tool, request_id=request_id,
+                                                    goal_id=goal_id, step_id=step_id,
+                                                    status="cancelled", elapsed_ms=elapsed_ms)
                         return
                     self._add_log("info", action.tool, "继续执行")
 
@@ -688,14 +709,47 @@ class DevConsoleController:
                     else:
                         self._manual_state = action.on_success_state
                         self._add_log("ok", action.tool, f"完成: {action.log_label}")
+                    audit_logger.log_action_end(tool=action.tool, request_id=request_id,
+                                                goal_id=goal_id, step_id=step_id,
+                                                status="ok", elapsed_ms=elapsed_ms)
                 else:
                     self._defer_pause = False
+                    error_code = result.get("error_code", "UNKNOWN")
+
+                    # place 失败时检查 _box_released: Gateway 内部可能已完成放置
+                    if action.tool == "place":
+                        try:
+                            robot_state = self._get_robot_state()
+                            if robot_state.get("box_released"):
+                                self._holding_box = False
+                                self._add_log("warn", action.tool,
+                                              f"Gateway 显示箱子已释放, 清除 _holding_box "
+                                              f"(error_code={error_code})")
+                        except Exception:
+                            pass
+
+                    # pick 失败时检查 robot state 是否仍显示 holding
+                    if action.tool == "pick":
+                        try:
+                            robot_state = self._get_robot_state()
+                            if robot_state.get("carry_state") == "carry_wait_walk" or robot_state.get("hold_pose_active"):
+                                self._holding_box = True
+                                self._add_log("warn", action.tool,
+                                              f"Gateway 显示已持有箱子, 设置 _holding_box=True "
+                                              f"(error_code={error_code})")
+                        except Exception:
+                            pass
+
                     self._manual_state = action.resume_state or self._manual_state
                     self._add_log(
                         "error",
                         action.tool,
-                        f"失败: {result.get('error_code', 'UNKNOWN')} — {result.get('message', '')}",
+                        f"失败: {error_code} — {result.get('message', '')}",
                     )
+                    audit_logger.log_action_end(tool=action.tool, request_id=request_id,
+                                                goal_id=goal_id, step_id=step_id,
+                                                status="error", error_code=error_code,
+                                                elapsed_ms=elapsed_ms)
 
         self._exec_thread = threading.Thread(target=run, daemon=True)
         self._exec_thread.start()
