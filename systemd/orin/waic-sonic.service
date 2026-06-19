@@ -1,0 +1,25 @@
+[Unit]
+Description=WAIC SONIC Policy (仿真测试)
+After=network.target
+
+[Service]
+Type=simple
+StandardInput=null
+WorkingDirectory=/home/unitree/GR00T-WholeBodyControl-phi/gear_sonic_deploy
+ExecStartPre=-/usr/bin/rm -f /tmp/waic-sonic-cmd.fifo
+ExecStartPre=/usr/bin/mkfifo /tmp/waic-sonic-cmd.fifo
+ExecStart=/bin/bash -c '\
+  source scripts/setup_env.sh && \
+  export ROS_DOMAIN_ID=66 && \
+  export HAS_ROS2=1 && \
+  ./deploy.sh --input-type ros2_manager --output-type zmq sim < /tmp/waic-sonic-cmd.fifo & \
+  DEPLOY_PID=$$!; \
+  exec 3>/tmp/waic-sonic-cmd.fifo; \
+  echo Y >&3; \
+  wait $$DEPLOY_PID'
+ExecStop=/bin/bash -c 'echo o > /tmp/waic-sonic-cmd.fifo 2>/dev/null; true'
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

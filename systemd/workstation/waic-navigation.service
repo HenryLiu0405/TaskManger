@@ -1,0 +1,12 @@
+[Unit]
+Description=WAIC Navigation
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c "source /opt/ros/humble/setup.bash && source /home/hairo/waic/ws/install/setup.bash && export ROS_DOMAIN_ID=66 && exec ros2 launch nav_bridge mvp_navigation.launch.py"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

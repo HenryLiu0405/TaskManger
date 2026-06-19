@@ -1,0 +1,13 @@
+[Unit]
+Description=WAIC FoundationPose (6DoF pose estimation)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/hairo/waic/start_foundationpose.sh
+Restart=on-failure
+RestartSec=5
+Environment="FP_CAMERA_HOST=192.168.50.79"
+
+[Install]
+WantedBy=default.target

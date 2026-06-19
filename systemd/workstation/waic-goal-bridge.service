@@ -1,0 +1,15 @@
+[Unit]
+Description=WAIC /start_navigation → /goal_pose Bridge
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c "source /opt/ros/humble/setup.bash && \
+  source /home/hairo/waic/ws/install/setup.bash && \
+  export ROS_DOMAIN_ID=66 && \
+  exec python3 /home/hairo/waic/waic_bridge/goal_bridge.py"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

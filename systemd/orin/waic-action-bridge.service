@@ -1,0 +1,14 @@
+[Unit]
+Description=WAIC Action Bridge (/goal_pose → /navigate_to_pose)
+After=waic-fastlio.service
+
+[Service]
+Type=simple
+Environment="RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
+Environment="CYCLONEDDS_URI=<CycloneDDS><Domain><General><NetworkInterfaceAddress>enP8p1s0</NetworkInterfaceAddress></General></Domain></CycloneDDS>"
+ExecStart=/bin/bash -c "source /opt/ros/humble/setup.bash && exec python3 /home/unitree/waic_bridge/action_bridge.py"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

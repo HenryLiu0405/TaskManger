@@ -1,0 +1,20 @@
+[Unit]
+Description=WAIC FAST-LIO Navigation Stack
+After=network.target
+
+[Service]
+Type=simple
+CPUAffinity=5 6 7
+Environment="XAUTHORITY=/home/unitree/.Xauthority"
+Environment="DISPLAY=:1"
+Environment="RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
+Environment="CYCLONEDDS_URI=<CycloneDDS><Domain><General><NetworkInterfaceAddress>enP8p1s0</NetworkInterfaceAddress></General></Domain></CycloneDDS>"
+StandardInput=null
+KillSignal=SIGINT
+ExecStartPre=/bin/bash -c 'xhost +SI:localuser:unitree 2>/dev/null || true'
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec bash /home/unitree/fastlio_ws_new/launch_full_navigation.sh'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

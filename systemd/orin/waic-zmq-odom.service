@@ -1,0 +1,11 @@
+[Unit]
+Description=ZMQ bridge: /Odometry CycloneDDS(0) → Fast-DDS(66)
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c 'python3 /home/unitree/waic_bridge/zmq_bridge.py sub rmw_cyclonedds_cpp 0 /Odometry nav_msgs/msg/Odometry 5563 & python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_fastrtps_cpp 66 /Odometry nav_msgs/msg/Odometry 5563 & trap "kill 0" EXIT; wait'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

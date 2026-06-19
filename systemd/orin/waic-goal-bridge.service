@@ -1,0 +1,14 @@
+[Unit]
+Description=WAIC /start_navigation → /goal_pose Bridge
+After=network.target
+
+[Service]
+Type=simple
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+Environment=ROS_DOMAIN_ID=66
+ExecStart=/usr/bin/python3 /home/unitree/waic_bridge/goal_bridge.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=WAIC TaskManger
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/hairo/waic/start_taskmanger.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
