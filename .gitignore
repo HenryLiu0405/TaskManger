@@ -12,6 +12,13 @@ install/
 
 # Logs
 log/
+logs/
+
+# Virtual environment
+.venv/
+
+# Backups
+backup_*/
 
 # Auto-generated / downloaded files
 phi_robot_fronted/Ruben Marcus _ AI Fullstack & Web3 Engineer_files/
