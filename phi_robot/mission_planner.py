@@ -6,6 +6,7 @@ phi_robot 任务规划生成器
 from __future__ import annotations
 from typing import List, Dict, Any, Tuple
 from .models import PlanStep, GridCell, StockSlot
+from .recovery.coordinate_transform import real_to_nav2
 
 
 # 九宫格编号到坐标的映射（单位：米）
@@ -103,13 +104,14 @@ class MissionPlanner:
             stock_slot = stock_slots[task_index]
 
             # 第 1 步: 移动到备货槽位  (current 由 runner 执行时注入)
+            nav2_x, nav2_y = real_to_nav2(stock_slot.x, stock_slot.y)
             plan.append(
                 PlanStep(
                     step_id=self._next_step_id(),
                     task_index=task_index,
                     tool="move_to",
                     args={
-                        "target": {"x": stock_slot.x, "y": stock_slot.y, "z": stock_slot.z, "theta": 0.0},
+                        "target": {"x": nav2_x, "y": nav2_y, "z": stock_slot.z, "theta": 0.0},
                         "action": "start",
                         "timeout_s": 30,
                         "request_id": request_id,
@@ -137,13 +139,14 @@ class MissionPlanner:
 
             # 第 3 步: 移动到目标放置位  (current 由 runner 执行时注入)
             goal_cell = grid_cells[destination_position]
+            nav2_gx, nav2_gy = real_to_nav2(goal_cell.x, goal_cell.y)
             plan.append(
                 PlanStep(
                     step_id=self._next_step_id(),
                     task_index=task_index,
                     tool="move_to",
                     args={
-                        "target": {"x": goal_cell.x, "y": goal_cell.y, "z": goal_cell.z, "theta": 0.0},
+                        "target": {"x": nav2_gx, "y": nav2_gy, "z": goal_cell.z, "theta": 0.0},
                         "action": "start",
                         "timeout_s": 30,
                         "request_id": request_id,
