@@ -123,9 +123,14 @@ class MissionPlanner:
 
             # 第 1 步: 移动到备货槽位 approach 点
             nav2_x, nav2_y = real_to_nav2(stock_slot.x, stock_slot.y)
-            app_x, app_y, app_yaw = compute_approach(
-                (nav2_x, nav2_y, 0.0), offset=0.25
-            )
+            try:
+                app_x, app_y, app_yaw = compute_approach(
+                    (nav2_x, nav2_y, 0.0), offset=0.25
+                )
+            except ValueError as e:
+                raise ValueError(
+                    f"slot {stock_slot.slot_id} approach 点越界: {e}"
+                ) from e
             plan.append(
                 PlanStep(
                     step_id=self._next_step_id(),
@@ -161,9 +166,14 @@ class MissionPlanner:
             # 第 3 步: 移动到目标放置位 approach 点
             goal_cell = grid_cells[destination_position]
             nav2_gx, nav2_gy = real_to_nav2(goal_cell.x, goal_cell.y)
-            place_x, place_y, place_yaw = compute_approach(
-                (nav2_gx, nav2_gy, 0.0), offset=0.25
-            )
+            try:
+                place_x, place_y, place_yaw = compute_approach(
+                    (nav2_gx, nav2_gy, 0.0), offset=0.25
+                )
+            except ValueError as e:
+                raise ValueError(
+                    f"grid {goal_cell.name} approach 点越界: {e}"
+                ) from e
             plan.append(
                 PlanStep(
                     step_id=self._next_step_id(),
