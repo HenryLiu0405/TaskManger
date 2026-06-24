@@ -14,12 +14,10 @@ import math
 import time
 from typing import Callable, Optional
 
+from .coordinate_transform import torso_to_map
 from .object_selector import (
     select_target_object,
-    _torso_to_map,
-    STATE_IDLE,
     STATE_TRACKING,
-    STATE_LOST,
 )
 from .grasp_posture import match_grasp_posture
 
@@ -84,7 +82,7 @@ def wait_fp_stable(
 def scan_to_find(
     get_fp_state: Callable[[], Optional[dict]],
     get_odom: Callable[[], tuple[float, float, float]],
-    rotate_by: Callable[[float], None],
+    rotate_to_relative: Callable[[float], None],
     target_object_id: int | None = None,
 ) -> tuple[str, Optional[tuple[float, float, float]]]:
     """
@@ -93,8 +91,13 @@ def scan_to_find(
     相机 HFOV ≈ 55.6°。扫描 ±30°（7 个角度，步长 10°），
     相邻角度有重叠，总覆盖 ≈ 115° 前向半球。
 
+    扫描序列：[0°, -30°, -20°, -10°, +10°, +20°, +30°]
+    每个角度是**从扫描起始朝向算起的绝对偏移量**，不是增量。
+    即 rotate_to_relative(-30°) 表示"转到起始朝向的 -30° 位置"，
+    而非"从当前位置再转 -30°"。
+
     每步流程：
-        1. 旋转到目标角度
+        1. rotate_to_relative(angle_deg) — 转到从起始朝向算起的绝对偏移角度
         2. 等待 5 帧让 FP 稳定
         3. 读 FP state + 最新 odometry
         4. 检查是否有 TRACKING 物体
@@ -103,7 +106,10 @@ def scan_to_find(
         get_fp_state: 无参回调，返回解析后的 /fp_state JSON dict 或 None。
         get_odom: 无参回调，返回当前里程计 (x, y, yaw)，yaw 为弧度，map 系。
                   每步重新读取以保证 torso→map 变换使用最新的 yaw。
-        rotate_by: 相对旋转回调，参数为角度（度）。阻塞直到旋转完成。
+        rotate_to_relative: 回调，参数为从扫描起始朝向算起的绝对偏移角度（度）。
+                           正值 = 左转，负值 = 右转。阻塞直到旋转完成。
+                           实现方需记录扫描起始 yaw，每次传入偏移量后计算目标 yaw
+                           = start_yaw + radians(angle_deg)，再通过 /cmd_vel 旋转到位。
         target_object_id: 可选，指定要查找的物体 ID。None 时返回第一个找到的物体。
 
     Returns:
@@ -117,7 +123,7 @@ def scan_to_find(
 
     for angle_deg in scan_angles:
         if angle_deg != 0:
-            rotate_by(angle_deg)
+            rotate_to_relative(angle_deg)
 
         # 等待 FP 稳定（5 帧 @ 30fps）
         time.sleep(SCAN_WAIT_FRAMES * SCAN_FRAME_PERIOD)
@@ -140,7 +146,7 @@ def scan_to_find(
 
             obj_x = obj.get("x", 0.0)
             obj_y = obj.get("y", 0.0)
-            mx, my = _torso_to_map(obj_x, obj_y, current_odom)
+            mx, my = torso_to_map(obj_x, obj_y, current_odom)
             return ("found", (mx, my, 0.0))
 
     return ("not_found", None)
@@ -189,6 +195,7 @@ def should_replan(
     # ═══════════════════════════════════════════════════════════════
     # Gate 1: FP 数据可信？
     # ═══════════════════════════════════════════════════════════════
+    # frames 检查：取跟踪帧数最高的物体，代表 FP 整体稳定程度
     best_by_frames = max(tracking_objs, key=lambda o: o.get("tracking_frames", 0))
 
     if best_by_frames.get("tracking_frames", 0) < MIN_STABLE_FRAMES:
@@ -198,8 +205,9 @@ def should_replan(
             None,
         )
 
-    if best_by_frames.get("mask_area", 0) < MIN_MASK_AREA:
-        return (False, "object too far or occluded", None)
+    # mask 检查：个体属性——只要存在任一 TRACKING 物体 mask 达标就放行
+    if not any(o.get("mask_area", 0) >= MIN_MASK_AREA for o in tracking_objs):
+        return (False, "all objects too far or occluded", None)
 
     # ═══════════════════════════════════════════════════════════════
     # Gate 2: 选出最优物体，检查位置偏差

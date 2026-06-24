@@ -14,6 +14,8 @@ FP 最多同时跟踪 5 个物体。场景中物料区可能有多个箱子，
 import math
 from typing import Optional
 
+from .coordinate_transform import torso_to_map
+
 # FP 状态常量 — 与 state_machine.py:343 BlobTracker 一致
 #   IDLE, TRACKING, LOST = 0, 1, 2
 STATE_IDLE = 0
@@ -23,16 +25,6 @@ STATE_LOST = 2
 # 硬过滤阈值
 MIN_TRACKING_FRAMES = 30  # 稳定跟踪最少 1 秒 @ 30fps
 MIN_MASK_AREA = 200       # 640×480 下直径 0.3m 圆柱在 2m 外的投影面积
-
-
-def _torso_to_map(
-    obj_x: float, obj_y: float, odom: tuple[float, float, float],
-) -> tuple[float, float]:
-    """torso_link 系物体坐标 → map 系（2D 旋转 + 平移，忽略 torso→base 小偏移）"""
-    rx, ry, ryaw = odom
-    mx = rx + obj_x * math.cos(ryaw) - obj_y * math.sin(ryaw)
-    my = ry + obj_x * math.sin(ryaw) + obj_y * math.cos(ryaw)
-    return (mx, my)
 
 
 def select_target_object(
@@ -80,7 +72,7 @@ def select_target_object(
 
         # ── 坐标变换：torso_link → map ──
         if has_odom:
-            obj_x_map, obj_y_map = _torso_to_map(obj_x_torso, obj_y_torso, current_odom)
+            obj_x_map, obj_y_map = torso_to_map(obj_x_torso, obj_y_torso, current_odom)
         else:
             obj_x_map, obj_y_map = obj_x_torso, obj_y_torso
 
