@@ -10,30 +10,47 @@ from .recovery.coordinate_transform import real_to_nav2
 from .recovery.approach_calculator import compute_approach
 
 
-# 九宫格编号到坐标的映射（单位：米）
+# 九宫格编号到坐标的映射（单位：米，真实场地坐标系）
+#   Y=2.5 (北)
+#   ┌────┬────┬────┐
+#   │ nw │ n  │ ne │
+#   ├────┼────┼────┤
+#   │ w  │ c  │ e  │
+#   ├────┼────┼────┤
+#   │ sw │ s  │ se │
+#   └────┴────┴────┘  Y=0.5 (南)
 GRID_CELLS: Dict[str, GridCell] = {
-    "nw": GridCell("nw", 2.7, 2.5, 0.0, 0.0),
-    "n": GridCell("n", 3.5, 2.5, 0.0, 0.0),
-    "ne": GridCell("ne", 4.3, 2.5, 0.0, 0.0),
-    "w": GridCell("w", 2.7, 1.5, 0.0, 0.0),
-    "c": GridCell("c", 3.5, 1.5, 0.0, 0.0),
-    "e": GridCell("e", 4.3, 1.5, 0.0, 0.0),
-    "sw": GridCell("sw", 2.7, 0.5, 0.0, 0.0),
-    "s": GridCell("s", 3.5, 0.5, 0.0, 0.0),
-    "se": GridCell("se", 4.3, 0.5, 0.0, 0.0),
+    "nw": GridCell("nw", 2.5, 2.5, 0.0, 0.0),
+    "n":  GridCell("n",  3.5, 2.5, 0.0, 0.0),
+    "ne": GridCell("ne", 4.5, 2.5, 0.0, 0.0),
+    "w":  GridCell("w",  2.5, 1.5, 0.0, 0.0),
+    "c":  GridCell("c",  3.5, 1.5, 0.0, 0.0),
+    "e":  GridCell("e",  4.5, 1.5, 0.0, 0.0),
+    "sw": GridCell("sw", 2.5, 0.5, 0.0, 0.0),
+    "s":  GridCell("s",  3.5, 0.5, 0.0, 0.0),
+    "se": GridCell("se", 4.5, 0.5, 0.0, 0.0),
 }
 
-# 备货槽位坐标表（后端固定维护）
+# 备货槽位坐标表（真实场地坐标系）
+#   3列 × 3行 物料区，slot 按 order_index 0→8 消耗
+#   ┌─────┬──────┬─────┐  Y=1.5 (北)
+#   │ A1  │  A2  │ A3  │
+#   │ 2.0 │ 1.25 │ 0.5 │
+#   ├─────┼──────┼─────┤
+#   │ A4  │  A5  │ A6  │  Y=1.0
+#   ├─────┼──────┼─────┤
+#   │ A7  │  A8  │ A9  │  Y=0.5 (南)
+#   └─────┴──────┴─────┘
 STOCK_SLOTS: List[StockSlot] = [
-    StockSlot(0, 1.6, 2.6, 0.0, order_index=0, consumed=False),   # 顶排左
-    StockSlot(1, 0.9, 2.6, 0.0, order_index=1, consumed=False),   # 顶排中
-    StockSlot(2, 0.2, 2.6, 0.0, order_index=2, consumed=False),   # 顶排右
-    StockSlot(3, 1.6, 2.1, 0.0, order_index=3, consumed=False),   # 中排左
-    StockSlot(4, 0.9, 2.1, 0.0, order_index=4, consumed=False),   # 中排中
-    StockSlot(5, 0.2, 2.1, 0.0, order_index=5, consumed=False),   # 中排右
-    StockSlot(6, 1.6, 1.6, 0.0, order_index=6, consumed=False),   # 底排左
-    StockSlot(7, 0.9, 1.6, 0.0, order_index=7, consumed=False),   # 底排中
-    StockSlot(8, 0.2, 1.6, 0.0, order_index=8, consumed=False),   # 底排右
+    StockSlot(0, 2.0, 1.5, 0.0, order_index=0, consumed=False),   # A1
+    StockSlot(1, 1.25, 1.5, 0.0, order_index=1, consumed=False),   # A2
+    StockSlot(2, 0.5, 1.5, 0.0, order_index=2, consumed=False),    # A3
+    StockSlot(3, 2.0, 1.0, 0.0, order_index=3, consumed=False),    # A4
+    StockSlot(4, 1.25, 1.0, 0.0, order_index=4, consumed=False),   # A5
+    StockSlot(5, 0.5, 1.0, 0.0, order_index=5, consumed=False),    # A6
+    StockSlot(6, 2.0, 0.5, 0.0, order_index=6, consumed=False),    # A7
+    StockSlot(7, 1.25, 0.5, 0.0, order_index=7, consumed=False),   # A8
+    StockSlot(8, 0.5, 0.5, 0.0, order_index=8, consumed=False),    # A9
 ]
 
 
