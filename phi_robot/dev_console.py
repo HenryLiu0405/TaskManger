@@ -542,6 +542,26 @@ class DevConsoleController:
         """返回完整状态 dict，供前端轮询"""
         robot_state = self._get_robot_state()
         services_status = self._get_services_status()
+        fp_state = self._get_fp_state()
+
+        # 解析 FP 跟踪状态
+        trackers = fp_state.get("trackers", [])
+        tracking_count = sum(1 for t in trackers if t.get("state") == 1)
+        lost_count = sum(1 for t in trackers if t.get("state") == 0)
+
+        if not trackers:
+            camera_status = "无检测"
+        elif tracking_count > 0:
+            camera_status = f"跟踪中 ({tracking_count}个)"
+        else:
+            camera_status = f"丢失 ({lost_count}个)"
+
+        tracked = [t for t in trackers if t.get("state") == 1]
+        if tracked:
+            t = tracked[0]
+            box_position = f"({t['x']:.2f}, {t['y']:.2f}, {t['z']:.2f})"
+        else:
+            box_position = "--"
 
         return {
             "mode": self._mode,
@@ -560,9 +580,9 @@ class DevConsoleController:
             "robot": robot_state,
             "services": services_status,
             "box": {
-                "camera_status": "--",
+                "camera_status": camera_status,
                 "box_status": "持有箱子" if self._holding_box else "未持有",
-                "box_position": "--",
+                "box_position": box_position,
             },
         }
 
@@ -582,6 +602,16 @@ class DevConsoleController:
             "replay_active": False,
             "nav_status": "--",
         }
+
+    def _get_fp_state(self) -> dict:
+        """获取 FoundationPose 最新状态"""
+        try:
+            func = getattr(self._adapter, "get_fp_state", None)
+            if callable(func):
+                return func()
+        except Exception:
+            pass
+        return {}
 
     def _get_services_status(self) -> dict:
         """通过适配器获取各 ROS2 服务在线状态（缓存 5 秒，避免拖慢轮询）"""

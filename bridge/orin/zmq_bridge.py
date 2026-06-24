@@ -3,8 +3,10 @@
    One direction = one sub process + one pub process, connected by localhost ZMQ.
    ZMQ must be initialized BEFORE rclpy to avoid DDS interference.
    Usage:
-     zmq_bridge.py sub <rmw> <domain> <topic> <type> <port>
-     zmq_bridge.py pub <rmw> <domain> <topic> <type> <port>
+     zmq_bridge.py sub <rmw> <domain> <topic> <type> <port> [transient_local]
+     zmq_bridge.py pub <rmw> <domain> <topic> <type> <port> [transient_local]
+   The optional 'transient_local' flag enables TRANSIENT_LOCAL durability
+   (needed for latched topics like /map).
 """
 import sys, os, signal, zmq
 
@@ -23,7 +25,7 @@ def setup_env(rmw: str, domain: str):
         os.environ['CYCLONEDDS_URI'] = CDDS_URI
 
 # ── subscriber side: ROS → ZMQ ─────────────────────────────────────
-def run_sub(rmw, domain, topic, msg_type_str, port):
+def run_sub(rmw, domain, topic, msg_type_str, port, transient=False):
     setup_env(rmw, domain)
 
     # ZMQ BEFORE rclpy (critical – verified working order)
@@ -33,22 +35,36 @@ def run_sub(rmw, domain, topic, msg_type_str, port):
 
     import rclpy
     from rclpy.node import Node
+    from rclpy.qos import QoSProfile, DurabilityPolicy
     from rclpy.serialization import serialize_message
 
     rclpy.init()
     node = Node(f'zmqsub_{topic.lstrip("/").replace("/","_")}')
     Msg = import_type(msg_type_str)
 
-    def cb(msg):
-        sock.send(serialize_message(msg))
+    last_data = None   # cache last message for ZMQ late-joiner latching
 
-    node.create_subscription(Msg, topic, cb, 10)
-    node.get_logger().info(f'ROS sub [{rmw}:{domain}] {topic}  →  ZMQ tcp://127.0.0.1:{port}')
-    rclpy.spin(node)
+    def cb(msg):
+        nonlocal last_data
+        data = serialize_message(msg)
+        sock.send(data)
+        last_data = data
+
+    qos = QoSProfile(depth=10,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL if transient else DurabilityPolicy.VOLATILE)
+    node.create_subscription(Msg, topic, cb, qos)
+    node.get_logger().info(f'ROS sub [{rmw}:{domain}] {topic} ({"TL" if transient else "VOL"}) → ZMQ :{port}')
+
+    # Manual spin: re-send last message every 1s so late-joining ZMQ
+    # subscribers (pub workers) receive latched topics like /map.
+    while rclpy.ok():
+        rclpy.spin_once(node, timeout_sec=1.0)
+        if transient and last_data is not None:
+            sock.send(last_data)
 
 
 # ── publisher side: ZMQ → ROS ──────────────────────────────────────
-def run_pub(rmw, domain, topic, msg_type_str, port):
+def run_pub(rmw, domain, topic, msg_type_str, port, transient=False):
     setup_env(rmw, domain)
 
     # ZMQ BEFORE rclpy (critical)
@@ -59,14 +75,17 @@ def run_pub(rmw, domain, topic, msg_type_str, port):
 
     import rclpy
     from rclpy.node import Node
+    from rclpy.qos import QoSProfile, DurabilityPolicy
     from rclpy.serialization import deserialize_message
 
     rclpy.init()
     node = Node(f'zmqpub_{topic.lstrip("/").replace("/","_")}')
     Msg = import_type(msg_type_str)
-    pub = node.create_publisher(Msg, topic, 10)
+    qos = QoSProfile(depth=10,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL if transient else DurabilityPolicy.VOLATILE)
+    pub = node.create_publisher(Msg, topic, qos)
 
-    node.get_logger().info(f'ZMQ tcp://127.0.0.1:{port}  →  ROS pub [{rmw}:{domain}] {topic}')
+    node.get_logger().info(f'ZMQ :{port} → ROS pub [{rmw}:{domain}] {topic} ({"TL" if transient else "VOL"})')
 
     while rclpy.ok():
         try:
@@ -84,5 +103,6 @@ if __name__ == '__main__':
     topic = sys.argv[4]
     mtype = sys.argv[5]
     port  = int(sys.argv[6])
+    transient = len(sys.argv) > 7 and sys.argv[7] == 'transient_local'
 
-    {'sub': run_sub, 'pub': run_pub}[mode](rmw, dom, topic, mtype, port)
+    {'sub': run_sub, 'pub': run_pub}[mode](rmw, dom, topic, mtype, port, transient)

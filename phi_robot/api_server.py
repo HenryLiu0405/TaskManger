@@ -9,6 +9,7 @@ import os
 import uuid
 import asyncio
 import threading
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from flask import Flask, request, jsonify, Response
@@ -569,20 +570,70 @@ class PhiRobotAPIServer:
                 download_name=f"audit_{info.get('date', 'unknown')}.jsonl",
             )
 
-        # ── FoundationPose 视频帧 ─────────────────────────
+        # ── FoundationPose MJPEG 视频流 ───────────────────
 
-        @self.app.route("/api/dev/fp/frame", methods=["GET"])
-        def dev_fp_frame():
-            """返回 FoundationPose 最新视频帧 (JPEG)"""
+        # 占位帧（懒加载，内存绘制，FP 无数据时保活）
+        _placeholder_jpeg: Optional[bytes] = None
+        _placeholder_disabled: bool = False
+
+        def _get_placeholder_jpeg() -> Optional[bytes]:
+            nonlocal _placeholder_jpeg, _placeholder_disabled
+            if _placeholder_disabled:
+                return None
+            if _placeholder_jpeg is not None:
+                return _placeholder_jpeg
             try:
-                fp_frame = getattr(self.adapter, "get_fp_frame", None)
-                if callable(fp_frame):
-                    data = fp_frame()
-                    if data:
-                        return Response(data, mimetype="image/jpeg")
-            except Exception:
-                pass
-            return Response(status=204)
+                from PIL import Image, ImageDraw
+                import io as _io
+                img = Image.new('RGB', (640, 480), (20, 20, 20))
+                _draw = ImageDraw.Draw(img)
+                _draw.text((180, 225), "Waiting for FP data...", fill=(160, 160, 160))
+                _draw.text((200, 250), "Check FP node is activated", fill=(120, 120, 120))
+                _buf = _io.BytesIO()
+                img.save(_buf, format='JPEG', quality=80)
+                _placeholder_jpeg = _buf.getvalue()
+            except ImportError:
+                _placeholder_disabled = True
+                return None
+            return _placeholder_jpeg
+
+        @self.app.route("/api/fp/video/<channel>/stream", methods=["GET"])
+        def fp_video_stream(channel: str):
+            """MJPEG stream for FP video channels (rgb / depth / mask)."""
+            if channel not in ('rgb', 'depth', 'mask'):
+                return jsonify({'error': 'unknown channel, use rgb/depth/mask'}), 404
+
+            adapter = self.adapter
+            get_frame = getattr(adapter, 'get_fp_video_frame', None)
+
+            def generate():
+                last_data_time = time.time()
+                while True:
+                    frame = get_frame(channel) if callable(get_frame) else None
+                    if frame is not None:
+                        last_data_time = time.time()
+                        yield (b'--frame\r\n'
+                               b'Content-Type: image/jpeg\r\n\r\n'
+                               + frame + b'\r\n')
+                    else:
+                        # 超过 2 秒无数据 → 发送占位帧保活
+                        if time.time() - last_data_time > 2.0:
+                            placeholder = _get_placeholder_jpeg()
+                            if placeholder is not None:
+                                yield (b'--frame\r\n'
+                                       b'Content-Type: image/jpeg\r\n\r\n'
+                                       + placeholder + b'\r\n')
+                            last_data_time = time.time()
+                    time.sleep(0.033)  # ~30 fps cap
+
+            return Response(
+                generate(),
+                mimetype='multipart/x-mixed-replace; boundary=frame',
+                headers={
+                    'Cache-Control': 'no-cache, no-store, must-revalidate',
+                    'X-Accel-Buffering': 'no',
+                },
+            )
 
     def _setup_service_routes(self) -> None:
         """注册 ServiceManager 相关路由"""

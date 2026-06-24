@@ -22,8 +22,8 @@
     {
       "id": "robot-gateway",
       "group": "server",
-      "label": "G1 运动网关",
-      "description": "接收 /cmd_vel，提供 lift/lay_down 等服务（真机 Orin）",
+      "label": "G1 运动网关 (C++)",
+      "description": "ros2_manager_gateway_cpp — 接收 /cmd_vel，提供 lift/lay_down 等服务（真机 Orin）",
       "compose_service": null,
       "check": {
         "method": "ros2_service",
@@ -35,30 +35,12 @@
         "unit": "waic-gateway",
         "ssh_host": "unitree@192.168.50.79"
       },
-      "depends_on": ["navigation"]
+      "depends_on": []
     },
     {
       "id": "sonic",
       "group": "server",
-      "label": "SONIC (仿真测试)",
-      "description": "TensorRT 推理 → MuJoCo 仿真，Orin 上运行",
-      "compose_service": null,
-      "check": {
-        "method": "ros2_service",
-        "target": "/g1_deploy_ros2_manager/describe_parameters",
-        "timeout_sec": 0.1
-      },
-      "manage": {
-        "method": "systemd",
-        "unit": "waic-sonic",
-        "ssh_host": "unitree@192.168.50.79"
-      },
-      "depends_on": ["robot-gateway"]
-    },
-    {
-      "id": "sonic-real",
-      "group": "server",
-      "label": "SONIC (真机物理)",
+      "label": "SONIC (真机)",
       "description": "TensorRT 推理 → 真实 G1 关节电机，Orin 上运行",
       "compose_service": null,
       "check": {
@@ -93,7 +75,7 @@
       "id": "bridge",
       "group": "server",
       "label": "ZMQ 桥接 (真机)",
-      "description": "CycloneDDS(0) ↔ Fast-DDS(66) ZMQ 转发，Orin 上运行",
+      "description": "CycloneDDS(0) ↔ Fast-DDS(66) ZMQ 转发 6 worker，Orin 上运行",
       "compose_service": null,
       "check": {
         "method": "systemd",
@@ -137,7 +119,7 @@
         "method": "systemd",
         "unit": "waic-goal-bridge"
       },
-      "depends_on": ["bridge"]
+      "depends_on": ["bridge", "navigation"]
     },
     {
       "id": "set_lift",

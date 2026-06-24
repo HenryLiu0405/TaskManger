@@ -79,11 +79,13 @@ class RosAcceptanceAdapter:
 
         # FoundationPose 状态 + 视频帧
         self._fp_state: dict[str, Any] = {}
-        self._fp_frame: Optional[bytes] = None
-        self._fp_frame_lock = threading.Lock()
+        self._fp_rgb_jpeg: Optional[bytes] = None
+        self._fp_depth_jpeg: Optional[bytes] = None
+        self._fp_mask_jpeg: Optional[bytes] = None
+        # GIL 下 bytes 引用赋值是原子的，无需锁
 
-        from cv_bridge import CvBridge
-        self._cv_bridge = CvBridge()
+        from rclpy.qos import QoSProfile, ReliabilityPolicy
+        _fp_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
         def _on_fp_state(msg):
             try:
@@ -92,10 +94,22 @@ class RosAcceptanceAdapter:
                 pass
         self._node.create_subscription(String, "/fp_state", _on_fp_state, 10)
 
-        def _on_fp_frame(msg):
-            with self._fp_frame_lock:
-                self._fp_frame = msg.data
-        self._node.create_subscription(CompressedImage, "/fp_frame/compressed", _on_fp_frame, 10)
+        # /fp_frame/compressed (旧单帧 topic) 已废弃，改为三个独立 CompressedImage topic
+        def _on_fp_rgb(msg):
+            self._fp_rgb_jpeg = msg.data
+
+        def _on_fp_depth(msg):
+            self._fp_depth_jpeg = msg.data
+
+        def _on_fp_mask(msg):
+            self._fp_mask_jpeg = msg.data
+
+        self._node.create_subscription(
+            CompressedImage, '/fp/rgb_overlay/compressed', _on_fp_rgb, _fp_qos)
+        self._node.create_subscription(
+            CompressedImage, '/fp/depth_colormap/compressed', _on_fp_depth, _fp_qos)
+        self._node.create_subscription(
+            CompressedImage, '/fp/mask/compressed', _on_fp_mask, _fp_qos)
 
         # place 操作容错标志
         self._box_released: bool = False
@@ -223,10 +237,18 @@ class RosAcceptanceAdapter:
         """获取 FoundationPose 最新状态."""
         return dict(self._fp_state)
 
-    def get_fp_frame(self) -> Optional[bytes]:
-        """获取 FoundationPose 最新视频帧 (JPEG bytes)."""
-        with self._fp_frame_lock:
-            return self._fp_frame
+    def get_fp_video_frame(self, channel: str) -> Optional[bytes]:
+        """获取 FoundationPose 最新视频帧 (JPEG bytes).
+
+        channel: 'rgb' | 'depth' | 'mask'
+        """
+        if channel == 'rgb':
+            return self._fp_rgb_jpeg
+        elif channel == 'depth':
+            return self._fp_depth_jpeg
+        elif channel == 'mask':
+            return self._fp_mask_jpeg
+        return None
 
     def get_robot_state(self) -> dict[str, Any]:
         """单次查询机器人状态（不阻塞等待），供调试控制台轮询"""

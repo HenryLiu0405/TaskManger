@@ -5,12 +5,12 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/bin/bash -c '\
-source /opt/ros/humble/setup.bash && \
-python3 /home/unitree/waic_bridge/zmq_bridge.py sub rmw_fastrtps_cpp 66 /goal_pose geometry_msgs/msg/PoseStamped 5561 & \
-python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_cyclonedds_cpp 0 /goal_pose geometry_msgs/msg/PoseStamped 5561 & \
-python3 /home/unitree/waic_bridge/zmq_bridge.py sub rmw_cyclonedds_cpp 0 /cmd_vel geometry_msgs/msg/Twist 5562 & \
-python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_fastrtps_cpp 66 /cmd_vel geometry_msgs/msg/Twist 5562 & \
-python3 /home/unitree/waic_bridge/zmq_bridge.py sub rmw_cyclonedds_cpp 0 /Odometry nav_msgs/msg/Odometry 5563 & \
+source /opt/ros/humble/setup.bash ; \
+python3 /home/unitree/waic_bridge/zmq_bridge.py sub rmw_fastrtps_cpp 66 /goal_pose geometry_msgs/msg/PoseStamped 5561 & sleep 0.3; \
+python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_cyclonedds_cpp 0 /goal_pose geometry_msgs/msg/PoseStamped 5561 & sleep 0.3; \
+python3 /home/unitree/waic_bridge/zmq_bridge.py sub rmw_cyclonedds_cpp 0 /cmd_vel geometry_msgs/msg/Twist 5562 & sleep 0.3; \
+python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_fastrtps_cpp 66 /cmd_vel geometry_msgs/msg/Twist 5562 & sleep 0.3; \
+python3 /home/unitree/waic_bridge/zmq_bridge.py sub rmw_cyclonedds_cpp 0 /Odometry nav_msgs/msg/Odometry 5563 & sleep 0.3; \
 python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_fastrtps_cpp 66 /Odometry nav_msgs/msg/Odometry 5563 & \
 trap "kill 0" EXIT; wait'
 Restart=on-failure

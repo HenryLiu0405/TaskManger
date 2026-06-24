@@ -6,6 +6,7 @@ import BoxPanel from './BoxPanel.jsx';
 import ServicePanel from './ServicePanel.jsx';
 import ControlButtons from './ControlButtons.jsx';
 import LogPanel from './LogPanel.jsx';
+import FpVideoPanel from './FpVideoPanel.jsx';
 
 const API = '/api/dev';
 
@@ -47,6 +48,7 @@ export default function DeveloperConsole() {
   const [loading, setLoading] = useState(false);
   const [connected, setConnected] = useState(false);
   const [robotState, setRobotState] = useState({ state: 'standing', can_walk: true, can_pick: false, can_place: false });
+  const [logViewMode, setLogViewMode] = useState('log');  // 'log' | 'camera'
 
   // ── 机器人安全状态轮询 ──────────────────────────
   useEffect(() => {
@@ -357,8 +359,50 @@ export default function DeveloperConsole() {
             />
           </Card>
 
-          {/* 日志 — 撑满剩余空间 */}
-          <LogPanel logs={displayLogs} onClear={handleClearLogs} />
+          {/* 日志 / FP 视频切换 */}
+          <div style={{ display: 'flex', justifyContent: 'center', gap: 0 }}>
+            <button
+              type="button"
+              onClick={() => setLogViewMode('log')}
+              style={{
+                padding: '4px 16px',
+                border: '2px solid #d4a853',
+                borderRight: 'none',
+                background: logViewMode === 'log' ? '#d4a853' : 'transparent',
+                color: logViewMode === 'log' ? '#0b0b10' : '#d4a853',
+                fontWeight: 'bold',
+                fontFamily: 'monospace',
+                fontSize: 13,
+                borderRadius: '4px 0 0 4px',
+                cursor: 'pointer',
+              }}
+            >
+              ▶ LOG
+            </button>
+            <button
+              type="button"
+              onClick={() => setLogViewMode('camera')}
+              style={{
+                padding: '4px 16px',
+                border: '2px solid #d4a853',
+                background: logViewMode === 'camera' ? '#d4a853' : 'transparent',
+                color: logViewMode === 'camera' ? '#0b0b10' : '#d4a853',
+                fontWeight: 'bold',
+                fontFamily: 'monospace',
+                fontSize: 13,
+                borderRadius: '0 4px 4px 0',
+                cursor: 'pointer',
+              }}
+            >
+              📷 CAMERA
+            </button>
+          </div>
+
+          {logViewMode === 'log' ? (
+            <LogPanel logs={displayLogs} onClear={handleClearLogs} />
+          ) : (
+            <FpVideoPanel />
+          )}
         </main>
       </div>
     </div>

@@ -1,6 +1,19 @@
 import { Card } from 'antd';
 import { CameraOutlined } from '@ant-design/icons';
 
+const CHANNELS = [
+  { key: 'rgb', label: 'RGB + 线框' },
+  { key: 'depth', label: '深度图' },
+  { key: 'mask', label: '掩码' },
+];
+
+const STYLE_IMG = {
+  width: '100%',
+  borderRadius: 4,
+  minHeight: 120,
+  background: '#1a1a1a',
+};
+
 export default function FpVideoPanel() {
   return (
     <Card
@@ -10,18 +23,18 @@ export default function FpVideoPanel() {
       styles={{ body: { padding: 8 } }}
     >
       <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between' }}>
-        <div style={{ flex: 1, textAlign: 'center' }}>
-          <div style={{ fontSize: 12, color: '#8a8a8a', marginBottom: 4 }}>RGB + 线框</div>
-          <img src="/api/fp/video/rgb" alt="RGB" style={{ width: '100%', borderRadius: 4 }} />
-        </div>
-        <div style={{ flex: 1, textAlign: 'center' }}>
-          <div style={{ fontSize: 12, color: '#8a8a8a', marginBottom: 4 }}>深度图</div>
-          <img src="/api/fp/video/depth" alt="Depth" style={{ width: '100%', borderRadius: 4 }} />
-        </div>
-        <div style={{ flex: 1, textAlign: 'center' }}>
-          <div style={{ fontSize: 12, color: '#8a8a8a', marginBottom: 4 }}>掩码</div>
-          <img src="/api/fp/video/mask" alt="Mask" style={{ width: '100%', borderRadius: 4 }} />
-        </div>
+        {CHANNELS.map(ch => (
+          <div key={ch.key} style={{ flex: 1, textAlign: 'center' }}>
+            <div style={{ fontSize: 12, color: '#8a8a8a', marginBottom: 4 }}>
+              {ch.label}
+            </div>
+            <img
+              src={`/api/fp/video/${ch.key}/stream`}
+              alt={ch.label}
+              style={STYLE_IMG}
+            />
+          </div>
+        ))}
       </div>
     </Card>
   );
