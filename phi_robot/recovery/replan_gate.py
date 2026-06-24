@@ -37,6 +37,19 @@ SCAN_ANGLES = [-30, -20, -10, 0, 10, 20, 30]  # 相对角度（度）
 SCAN_WAIT_FRAMES = 5                            # 每步等待帧数
 SCAN_FRAME_PERIOD = 1.0 / 30.0                  # 30fps 帧周期
 
+# ── should_replan 返回 reason_code 常量 ──
+# run_arrival_check 用这些常量做路由，不依赖 reason 字符串内容
+REASON_NO_TRACKING = "NO_TRACKING"            # Gate 0: 无 TRACKING 物体
+REASON_NOT_STABLE = "NOT_STABLE"              # Gate 1: tracking_frames 不足
+REASON_OCCLUDED = "OCCLUDED"                  # Gate 1: 所有物体 mask_area 不足
+REASON_NO_QUALIFIED = "NO_QUALIFIED"          # Gate 2: select_target_object 无合格候选
+REASON_WITHIN_TOLERANCE = "WITHIN_TOLERANCE"  # Gate 2: 偏差在容差内
+REASON_GRASPABLE = "GRASPABLE"                # Gate 3: 可从当前位置搬起
+REASON_OUT_OF_BOUNDS = "OUT_OF_BOUNDS"        # Gate 3: approach 点越界
+REASON_SAME_POSITION = "SAME_POSITION"        # Gate 4: 新 approach 与当前位置几乎相同
+REASON_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"  # Gate 5: 重规划预算耗尽
+REASON_NEEDS_REPLAN = "NEEDS_REPLAN"          # 全部通过，需要重规划
+
 
 def wait_fp_stable(
     get_fp_state: Callable[[], Optional[dict]],
@@ -157,7 +170,7 @@ def should_replan(
     expected_obj_pose: tuple[float, float, float],
     current_odom: tuple[float, float, float],
     replan_count: int = 0,
-) -> tuple[bool, str, Optional[tuple[float, float, float]]]:
+) -> dict:
     """
     智能门控：判断是否需要触发重规划。
 
@@ -179,9 +192,14 @@ def should_replan(
         replan_count: 当前已重规划次数（0-based）。首次调用传 0。
 
     Returns:
-        (should, reason, new_approach)
-        - should=False → 不需要重规划，reason 说明原因，new_approach=None
-        - should=True  → 需要重规划，new_approach 为修正后的 map 系 (x, y, yaw)
+        {
+            "should": bool,
+            "reason_code": str,        # REASON_* 常量，调用方用于路由
+            "reason": str,             # 人类可读的详细原因
+            "new_approach": (x,y,yaw) | None,
+            "selected": dict | None,   # select_target_object 的返回值（含
+                                       #   object_id, score, pose_map 等）
+        }
     """
     trackers = fp_state.get("trackers", [])
 
@@ -190,7 +208,13 @@ def should_replan(
     # ═══════════════════════════════════════════════════════════════
     tracking_objs = [o for o in trackers if o.get("state") == STATE_TRACKING]
     if not tracking_objs:
-        return (False, "FP no tracking objects", None)
+        return {
+            "should": False,
+            "reason_code": REASON_NO_TRACKING,
+            "reason": "FP no tracking objects",
+            "new_approach": None,
+            "selected": None,
+        }
 
     # ═══════════════════════════════════════════════════════════════
     # Gate 1: FP 数据可信？
@@ -199,15 +223,24 @@ def should_replan(
     best_by_frames = max(tracking_objs, key=lambda o: o.get("tracking_frames", 0))
 
     if best_by_frames.get("tracking_frames", 0) < MIN_STABLE_FRAMES:
-        return (
-            False,
-            f"FP not stable yet (frames={best_by_frames.get('tracking_frames', 0)})",
-            None,
-        )
+        return {
+            "should": False,
+            "reason_code": REASON_NOT_STABLE,
+            "reason": f"FP not stable yet "
+                      f"(frames={best_by_frames.get('tracking_frames', 0)})",
+            "new_approach": None,
+            "selected": None,
+        }
 
     # mask 检查：个体属性——只要存在任一 TRACKING 物体 mask 达标就放行
     if not any(o.get("mask_area", 0) >= MIN_MASK_AREA for o in tracking_objs):
-        return (False, "all objects too far or occluded", None)
+        return {
+            "should": False,
+            "reason_code": REASON_OCCLUDED,
+            "reason": "all objects too far or occluded",
+            "new_approach": None,
+            "selected": None,
+        }
 
     # ═══════════════════════════════════════════════════════════════
     # Gate 2: 选出最优物体，检查位置偏差
@@ -216,7 +249,13 @@ def should_replan(
     selected = select_target_object(trackers, expected_slot, current_odom)
 
     if selected is None:
-        return (False, "no qualified target after scoring", None)
+        return {
+            "should": False,
+            "reason_code": REASON_NO_QUALIFIED,
+            "reason": "no qualified target after scoring",
+            "new_approach": None,
+            "selected": None,
+        }
 
     dev = math.hypot(
         selected["pose_map"][0] - expected_slot[0],
@@ -224,7 +263,13 @@ def should_replan(
     )
 
     if dev < MIN_DEVIATION:
-        return (False, f"within tolerance (dev={dev:.3f}m)", None)
+        return {
+            "should": False,
+            "reason_code": REASON_WITHIN_TOLERANCE,
+            "reason": f"within tolerance (dev={dev:.3f}m)",
+            "new_approach": None,
+            "selected": selected,
+        }
 
     # ═══════════════════════════════════════════════════════════════
     # Gate 3: SONIC 能从当前位置搬吗？
@@ -233,14 +278,22 @@ def should_replan(
     can_grasp, detail = match_grasp_posture(current_odom, obj_pose_map)
 
     if can_grasp == "ok":
-        return (
-            False,
-            f"graspable from current position (posture={detail})",
-            None,
-        )
+        return {
+            "should": False,
+            "reason_code": REASON_GRASPABLE,
+            "reason": f"graspable from current position (posture={detail})",
+            "new_approach": None,
+            "selected": selected,
+        }
 
     if can_grasp == "not_available":
-        return (False, "approach point out of map bounds", None)
+        return {
+            "should": False,
+            "reason_code": REASON_OUT_OF_BOUNDS,
+            "reason": "approach point out of map bounds",
+            "new_approach": None,
+            "selected": selected,
+        }
 
     # can_grasp == "replan" — detail 是修正后的 approach 点
     assert isinstance(detail, tuple), f"expected tuple, got {type(detail)}"
@@ -255,17 +308,32 @@ def should_replan(
     )
 
     if delta < MIN_APPROACH_DELTA:
-        return (False, f"approach same as current (delta={delta:.3f}m)", None)
+        return {
+            "should": False,
+            "reason_code": REASON_SAME_POSITION,
+            "reason": f"approach same as current (delta={delta:.3f}m)",
+            "new_approach": P_new,
+            "selected": selected,
+        }
 
     # ═══════════════════════════════════════════════════════════════
     # Gate 5: 重规划预算还有？
     # ═══════════════════════════════════════════════════════════════
     if replan_count >= MAX_REPLANS:
-        return (False, "replan budget exhausted", None)
+        return {
+            "should": False,
+            "reason_code": REASON_BUDGET_EXHAUSTED,
+            "reason": "replan budget exhausted",
+            "new_approach": None,
+            "selected": selected,
+        }
 
     # 全部通过 → 触发重规划
-    return (
-        True,
-        f"deviation {dev:.3f}m > {MIN_DEVIATION}m, replan #{replan_count + 1}",
-        P_new,
-    )
+    return {
+        "should": True,
+        "reason_code": REASON_NEEDS_REPLAN,
+        "reason": f"deviation {dev:.3f}m > {MIN_DEVIATION}m, "
+                  f"replan #{replan_count + 1}",
+        "new_approach": P_new,
+        "selected": selected,
+    }

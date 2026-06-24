@@ -31,6 +31,16 @@ from .replan_gate import (
     should_replan,
     MIN_STABLE_FRAMES,
     MAX_REPLANS,
+    REASON_NO_TRACKING,
+    REASON_NOT_STABLE,
+    REASON_OCCLUDED,
+    REASON_NO_QUALIFIED,
+    REASON_WITHIN_TOLERANCE,
+    REASON_GRASPABLE,
+    REASON_OUT_OF_BOUNDS,
+    REASON_SAME_POSITION,
+    REASON_BUDGET_EXHAUSTED,
+    REASON_NEEDS_REPLAN,
 )
 
 # 事后验证参数
@@ -124,10 +134,9 @@ def post_pick_verify(
     fp = get_fp_state()
 
     if fp is None:
-        return {"status": "PICK_FAILED",
-                "detail": "FP not available after pick — cannot verify",
-                "current_obj_pose": None,
-                "deviation": None}
+        return {"status": "FP_UNAVAILABLE",
+                "detail": "FP not available after pick — cannot verify. "
+                          "箱子可能已成功搬起，也可能是搬起失败。建议重试验证或人工判断。"}
 
     # 在预期物料点周围搜索
     nearby = []
@@ -201,8 +210,9 @@ def post_place_verify(
     fp = get_fp_state()
 
     if fp is None:
-        return {"status": "PLACE_FAILED",
-                "detail": "FP not available after place — cannot verify"}
+        return {"status": "FP_UNAVAILABLE",
+                "detail": "FP not available after place — cannot verify. "
+                          "箱子可能已成功放置，也可能是携带中掉落。建议重试验证或人工判断。"}
 
     for obj in fp.get("trackers", []):
         if obj.get("state") != STATE_TRACKING:
@@ -281,7 +291,6 @@ def run_arrival_check(
         — FP 数据暂时不可信，稍后重试。
     """
     # Step 1: 等 FP 稳定
-    current_odom = get_odom()
     stable_obj = wait_fp_stable(get_fp_state, timeout_s=wait_timeout_s)
 
     if stable_obj is None:
@@ -300,36 +309,45 @@ def run_arrival_check(
         return {"action": "scan",
                 "reason": f"FP 在 {wait_timeout_s:.0f}s 内无稳定 TRACKING 物体"}
 
-    # 拿到稳定物体 → 读最新 fp_state 传给 should_replan
+    # Step 2: 拿到稳定物体后，重新读最新 fp_state + odom
+    #   odom 必须在 wait 之后读——最长等了 3s，机器人可能还在 settling
     fp = get_fp_state()
     if fp is None:
         return {"action": "scan", "reason": "FP state unavailable after wait_fp_stable"}
 
-    # Step 2: 门控决策
-    should, reason, new_approach = should_replan(
-        fp, expected_obj_pose, current_odom, replan_count,
-    )
+    current_odom = get_odom()
 
-    if should:
-        assert new_approach is not None
+    # Step 3: 门控决策
+    result = should_replan(fp, expected_obj_pose, current_odom, replan_count)
+
+    # ── 用 reason_code 路由（不依赖 reason 字符串内容） ──
+    code = result["reason_code"]
+    reason = result["reason"]
+    selected = result["selected"]
+
+    if result["should"]:
         return {
             "action": "replan",
-            "new_approach": new_approach,
+            "new_approach": result["new_approach"],
             "reason": reason,
         }
 
-    # should=False → 分析原因，决定下一步
-    if "no tracking" in reason:
+    # should=False → 按 reason_code 决定下一步
+    if code == REASON_NO_TRACKING:
         return {"action": "scan", "reason": reason}
 
-    if "budget exhausted" in reason:
+    if code == REASON_BUDGET_EXHAUSTED:
         return {"action": "escalate", "level": "L2", "reason": reason}
 
-    if "out of map bounds" in reason:
+    if code == REASON_OUT_OF_BOUNDS:
         return {"action": "escalate", "level": "L3", "reason": reason}
 
-    if "not stable" in reason or "occluded" in reason or "no qualified" in reason:
+    if code in (REASON_NOT_STABLE, REASON_OCCLUDED, REASON_NO_QUALIFIED):
         return {"action": "wait", "reason": reason}
 
-    # 偏差在容差内 或 可从当前位置搬起 → 可以搬
-    return {"action": "pre_pick", "target": stable_obj}
+    # REASON_WITHIN_TOLERANCE / REASON_GRASPABLE / REASON_SAME_POSITION
+    # → 全部表示"当前位姿可以搬"，用 select_target_object 选出的最优物体
+    return {
+        "action": "pre_pick",
+        "target": selected if selected else stable_obj,
+    }
