@@ -5,6 +5,8 @@ FP 最多同时跟踪 5 个物体。场景中物料区可能有多个箱子，
 需要选出"最适合搬的那个"——综合考虑跟踪质量、空间位置和任务目标。
 
 依赖：/fp_state JSON（扁平结构，foundationpose_node.py:297-306）
+坐标系：FP 输出的 x, y 在 torso_link 系下，需用 current_odom 转到 map 系后
+        才能和 expected_slot（map 系）比较距离。
 注意：当前 /fp_state 不含物体朝向（无 quaternion），yaw 返回 0.0。
       未来需扩展 /fp_state 或订阅 /foundationpose/pose_result 获取完整 6DoF 位姿。
 """
@@ -23,6 +25,16 @@ MIN_TRACKING_FRAMES = 30  # 稳定跟踪最少 1 秒 @ 30fps
 MIN_MASK_AREA = 200       # 640×480 下直径 0.3m 圆柱在 2m 外的投影面积
 
 
+def _torso_to_map(
+    obj_x: float, obj_y: float, odom: tuple[float, float, float],
+) -> tuple[float, float]:
+    """torso_link 系物体坐标 → map 系（2D 旋转 + 平移，忽略 torso→base 小偏移）"""
+    rx, ry, ryaw = odom
+    mx = rx + obj_x * math.cos(ryaw) - obj_y * math.sin(ryaw)
+    my = ry + obj_x * math.sin(ryaw) + obj_y * math.cos(ryaw)
+    return (mx, my)
+
+
 def select_target_object(
     objects: list[dict],
     expected_slot: tuple[float, float],
@@ -35,14 +47,18 @@ def select_target_object(
         objects: FP /fp_state 中的 trackers 列表。每项为扁平结构:
             {"id": int, "state": int, "x": float, "y": float, "z": float,
              "mask_area": int, "tracking_frames": int}
-            注意: 不含 orientation — yaw 不可用，返回 0.0。
+            注意: x, y 在 torso_link 系下；不含 orientation。
         expected_slot: 任务目标物料点在 map 系下的 (x, y)
-        current_odom: 机器人当前 (x, y, yaw)，保留参数，当前未使用
+        current_odom: 机器人当前 (x, y, yaw) 在 map 系下（来自 Nav2 /Odometry）。
+                      用于将物体坐标从 torso_link 转到 map 系。
+                      None 时跳过空间接近度因子。
 
     Returns:
-        {"object_id", "score", "pose_map": (x, y, yaw),
+        {"object_id", "score", "pose_map": (x, y, yaw) in map 系,
          "tracking_frames", "mask_area_pixels"} 或 None
     """
+    has_odom = current_odom is not None
+
     candidates = []
 
     for obj in objects:
@@ -59,21 +75,34 @@ def select_target_object(
         if mask_area < MIN_MASK_AREA:
             continue
 
-        obj_x = obj.get("x", 0.0)
-        obj_y = obj.get("y", 0.0)
+        obj_x_torso = obj.get("x", 0.0)
+        obj_y_torso = obj.get("y", 0.0)
+
+        # ── 坐标变换：torso_link → map ──
+        if has_odom:
+            obj_x_map, obj_y_map = _torso_to_map(obj_x_torso, obj_y_torso, current_odom)
+        else:
+            obj_x_map, obj_y_map = obj_x_torso, obj_y_torso
 
         # ── 加权打分 ──
         score = 0.0
 
-        # 因子 1：空间接近度（距预期物料点的距离，权重 50%）
-        d_expected = math.hypot(obj_x - expected_slot[0], obj_y - expected_slot[1])
-        score += max(0.0, 1.0 - d_expected / 0.50) * 0.50
-
-        # 因子 2：跟踪稳定性（权重 30%）
-        score += min(tracking_frames / 100.0, 1.0) * 0.30
-
-        # 因子 3：可见性 — 掩码面积（权重 20%）
-        score += min(mask_area / 1000.0, 1.0) * 0.20
+        if has_odom:
+            # 因子 1：空间接近度（距预期物料点的距离，权重 50%）
+            d_expected = math.hypot(
+                obj_x_map - expected_slot[0], obj_y_map - expected_slot[1]
+            )
+            score += max(0.0, 1.0 - d_expected / 0.50) * 0.50
+            # 因子 2：跟踪稳定性（权重 30%）
+            score += min(tracking_frames / 100.0, 1.0) * 0.30
+            # 因子 3：可见性 — 掩码面积（权重 20%）
+            score += min(mask_area / 1000.0, 1.0) * 0.20
+        else:
+            # 无 odometry → 跳过空间接近度，权重重新分配
+            # 因子 2：跟踪稳定性（权重 60%）
+            score += min(tracking_frames / 100.0, 1.0) * 0.60
+            # 因子 3：可见性（权重 40%）
+            score += min(mask_area / 1000.0, 1.0) * 0.40
 
         # 因子 4（预留）：姿态质量 — 物体是否直立
         # /fp_state JSON 当前不含 orientation 字段，无法计算。
@@ -82,8 +111,8 @@ def select_target_object(
         candidates.append({
             "object_id": obj.get("id", -1),
             "score": score,
-            "obj_x": obj_x,
-            "obj_y": obj_y,
+            "obj_x_map": obj_x_map,
+            "obj_y_map": obj_y_map,
             "tracking_frames": tracking_frames,
             "mask_area_pixels": mask_area,
         })
@@ -98,9 +127,9 @@ def select_target_object(
     return {
         "object_id": best["object_id"],
         "score": round(best["score"], 4),
-        # yaw: /fp_state JSON 不含物体朝向，硬编码 0.0。
-        # 当前所有 slot yaw=0 不触发问题；post_pick_verify 场景需要完整 6DoF。
-        "pose_map": (best["obj_x"], best["obj_y"], 0.0),
+        # pose_map 返回 map 系坐标（如有 odom 则已转换）
+        # yaw: /fp_state JSON 不含物体朝向，硬编码 0.0
+        "pose_map": (best["obj_x_map"], best["obj_y_map"], 0.0),
         "tracking_frames": best["tracking_frames"],
         "mask_area_pixels": best["mask_area_pixels"],
     }
