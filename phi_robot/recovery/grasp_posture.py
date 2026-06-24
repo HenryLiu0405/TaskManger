@@ -11,7 +11,8 @@ match_grasp_posture() 会返回第一个匹配的姿势名。
 """
 
 import math
-from typing import Optional
+
+from .approach_calculator import compute_approach
 
 # SONIC 可用搬起姿势配置
 # 每条：姿势名 → 最小距离(m) / 最大距离(m) / 朝向容差(°)
@@ -38,7 +39,7 @@ def match_grasp_posture(
     robot_pose: tuple[float, float, float],
     obj_pose_map: tuple[float, float, float],
     postures: list[dict] | None = None,
-) -> tuple[str, Optional[tuple[float, float, float]]]:
+) -> tuple[str, str | tuple[float, float, float] | None]:
     """
     判断机器人从当前位置能否用 SONIC 搬起物体。
 
@@ -51,9 +52,10 @@ def match_grasp_posture(
         postures: 可用姿势列表，默认使用 POSTURE_CONFIG。
 
     Returns:
-        ("ok", posture_name)   — 当前距离在某个姿势的可搬起范围内
-        ("replan", P_new)      — 距离/朝向不合适，返回修正后的新 approach 点
-                                  P_new 为 Nav2 map 系 (x, y, yaw)
+        ("ok", posture_name)      — 当前距离在某个姿势的可搬起范围内
+        ("replan", P_new)         — 距离/朝向不合适，返回修正后的新 approach 点
+                                    P_new 为 Nav2 map 系 (x, y, yaw)
+        ("not_available", None)   — 物体位姿导致 approach 点越界，无法自动恢复
 
     Raises:
         ValueError: 如果 postures 为空
@@ -85,9 +87,10 @@ def match_grasp_posture(
     default = postures[0]
     ideal_offset = (default["d_min"] + default["d_max"]) / 2.0
 
-    # 计算新 approach 点：从物体位置沿物体朝向后退 ideal_offset
-    app_x = ox - ideal_offset * math.cos(oyaw)
-    app_y = oy - ideal_offset * math.sin(oyaw)
-    app_yaw = oyaw
+    try:
+        P_new = compute_approach(obj_pose_map, offset=ideal_offset)
+    except ValueError:
+        # approach 点越界 → 此物体无法从任何安全位置接近
+        return ("not_available", None)
 
-    return ("replan", (app_x, app_y, app_yaw))
+    return ("replan", P_new)
