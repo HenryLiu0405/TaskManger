@@ -82,10 +82,16 @@ class APIHook(MissionExecutionHook):
                 "message": "Safety alert triggered, aborting mission"
             })
             return ("abort", None)
-        elif error_code in ("GRIP_FAIL", "TIMEOUT", "PATH_PLAN_FAILED"):
+        elif error_code in ("GRIP_FAIL", "TIMEOUT", "PATH_PLAN_FAILED",
+                            "LIFT_FAILED", "LAY_DOWN_FAILED", "NOTIFY_GOAL_FAILED",
+                            "REPLAY_FAILED", "FP_UNAVAILABLE"):
             return ("retry", None)
-        elif error_code in ("NOT_REACHABLE", "OBSTRUCTED"):
+        elif error_code in ("NOT_REACHABLE", "OBSTRUCTED",
+                            "POSITION_DEVIATION", "GRASP_NOT_FEASIBLE",
+                            "PICK_FAILED", "PLACE_FAILED", "FP_LOST"):
             return ("replan", None)
+        elif error_code == "FP_NOT_VISIBLE":
+            return ("retry", None)       # retry with scan_to_find in ros_acceptance
         elif error_code == "INVALID_ARGS":
             return ("abort", None)       # 配置错误，不可恢复
         elif error_code == "PRECONDITION_FAILED":

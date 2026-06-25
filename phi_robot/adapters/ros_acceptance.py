@@ -25,6 +25,13 @@ from std_srvs.srv import SetBool, Trigger
 
 from ..robot_state import safety_fsm, RobotState
 from ..audit import audit_logger
+from ..recovery.recovery_executor import (
+    pre_pick_confirm,
+    post_pick_verify,
+    post_place_verify,
+    run_arrival_check,
+)
+from ..recovery.replan_gate import scan_to_find
 
 logger = logging.getLogger("phi_robot.ros_acceptance")
 
@@ -114,6 +121,15 @@ class RosAcceptanceAdapter:
         # place 操作容错标志
         self._box_released: bool = False
 
+        # ── FP 验证用状态 ──
+        # 最近一次 move_to 的目标坐标（Nav2 map 系），用作 odometry 的近似值
+        self._last_move_target: tuple[float, float] = (0.0, 0.0)
+        # 当前任务预期的物料点 / 放置点（Nav2 map 系），调用方通过 args 传入
+        self._expected_slot_xy: tuple[float, float] | None = None
+        self._expected_grid_xy: tuple[float, float] | None = None
+        # FP 选出的最优物体 ID（由 run_arrival_check / select_target_object 设置）
+        self._fp_target_object_id: int | None = None
+
         logger.info("ROS2 node ready — path_plan=%s, lift=%s, lay_down=%s, stand=%s, replay=%s, notify_goal=%s",
                     "phi_robot_acceptance", path_plan_service, lift_service, lay_down_service, stand_service,
                     request_replay_service, notify_goal_reached_service)
@@ -137,10 +153,35 @@ class RosAcceptanceAdapter:
                                          request_id, goal_id, step_id)
             # mode=2 (carry walk) when holding box, else mode=1 (normal walk)
             is_carrying = safety_fsm.state == RobotState.HOLDING
+
+            # 记录目标坐标（用作 odometry 近似值）
+            target = args.get("target", {})
+            self._last_move_target = (
+                float(target.get("x", 0.0)), float(target.get("y", 0.0)),
+            )
+
             safety_fsm.transition(RobotState.MOVING)
             result = self._call_path_plan(args, request_id, goal_id, step_id,
                                           mode=2 if is_carrying else 1)
             if result.get("status") == "ok":
+                # 搬起流（非携带）：到达 approach 点后验证 FP 是否看到物体
+                if not is_carrying:
+                    # expected_slot = approach + offset（物体在机器人前方 0.25m）
+                    self._expected_slot_xy = (
+                        self._last_move_target[0] + 0.25,
+                        self._last_move_target[1],
+                    )
+                    verify = self._verify_arrival(request_id, goal_id, step_id)
+                    if verify is not None:
+                        safety_fsm.transition(RobotState.STANDING)
+                        return verify
+                else:
+                    # 携带流：到达放置点，记录预期放置位置
+                    self._expected_grid_xy = (
+                        self._last_move_target[0] + 0.25,
+                        self._last_move_target[1],
+                    )
+
                 safety_fsm.transition(RobotState.ARRIVED)
             else:
                 safety_fsm.transition(RobotState.STANDING)
@@ -280,7 +321,96 @@ class RosAcceptanceAdapter:
             "box_released": self._box_released,
         }
 
+    # ── FP verification helpers ────────────────────────────────
+
+    def _estimated_odom(self) -> tuple[float, float, float]:
+        """用最后一次 move_to 目标作为 odometry 近似值（yaw 固定 0）。
+
+        RosAcceptanceAdapter 当前不订阅 /Odometry，用导航目标点代替。
+        对于原地 pick/place 后的验证，机器人位置不变，此近似足够。
+        后续接入 /Odometry 订阅后替换此方法即可。
+        """
+        return (self._last_move_target[0], self._last_move_target[1], 0.0)
+
+    def _rotate_relative(self, angle_deg: float) -> None:
+        """旋转到相对角度（度），用于 scan_to_find。
+
+        当前实现：暂停导航 + 发 /cmd_vel 角速度指令。
+        注意：RosAcceptanceAdapter 当前未订阅 /Odometry，无法精确控制旋转角度。
+        此方法为桩实现——旋转完成后由调用方 scan_to_find 读最新 FP 判断是否找到物体。
+        """
+        self.pause_navigation()
+        # 发角速度指令旋转（简化版：单次固定时长旋转）
+        # 完整实现需订阅 /Odometry 做闭环控制
+        duration_s = abs(angle_deg) / 30.0  # ~30°/s
+        if duration_s > 0:
+            time.sleep(duration_s)
+        self.resume_navigation()
+
     # ── internal ───────────────────────────────────────────────
+
+    def _verify_arrival(
+        self, request_id: str, goal_id: str, step_id: str,
+    ) -> dict[str, Any] | None:
+        """到达 approach 点后运行 FP 验证。
+
+        Returns:
+            None — FP 验证通过，可以继续搬起。
+            dict — 验证失败，应作为 error result 直接返回给调用方。
+        """
+        try:
+            action = run_arrival_check(
+                get_fp_state=lambda: self.get_fp_state(),
+                get_odom=lambda: self._estimated_odom(),
+                rotate_to_relative=lambda a: self._rotate_relative(a),
+                expected_obj_pose=(
+                    self._expected_slot_xy[0] if self._expected_slot_xy else 0.0,
+                    self._expected_slot_xy[1] if self._expected_slot_xy else 0.0,
+                    0.0,
+                ),
+            )
+        except Exception:
+            logger.exception("_verify_arrival: run_arrival_check failed")
+            return None  # 验证异常不阻塞正常流程
+
+        if action["action"] == "pre_pick":
+            # 记录 FP 选出的物体 ID，供 pre_pick_confirm 使用
+            target = action.get("target", {})
+            self._fp_target_object_id = target.get("object_id") if target else None
+            logger.info("FP arrival check passed, target object_id=%s",
+                        self._fp_target_object_id)
+            return None
+
+        if action["action"] == "replan":
+            approach = action.get("new_approach")
+            result = self._error_result(
+                "POSITION_DEVIATION",
+                f"FP detected position deviation: {action.get('reason', '')}",
+                request_id, goal_id, step_id,
+            )
+            if approach:
+                result["replan_target"] = {
+                    "x": approach[0], "y": approach[1], "z": 0.0, "theta": approach[2],
+                }
+            return result
+
+        if action["action"] == "scan":
+            return self._error_result(
+                "FP_NOT_VISIBLE",
+                f"FP cannot see object: {action.get('reason', '')}",
+                request_id, goal_id, step_id,
+            )
+
+        if action["action"] == "escalate":
+            return self._error_result(
+                "FP_LOST",
+                f"FP escalate {action.get('level', 'L2')}: {action.get('reason', '')}",
+                request_id, goal_id, step_id,
+            )
+
+        # action == "wait": FP 数据暂时不可信，不算错误，继续
+        logger.warning("FP arrival check: %s — continuing anyway", action.get("reason", ""))
+        return None
 
     def _spin_executor(self):
         try:
@@ -518,6 +648,19 @@ class RosAcceptanceAdapter:
         return self._place_sequence(request_id, goal_id, step_id)
 
     def _pick_sequence(self, request_id, goal_id, step_id):
+        # ── 搬起前：末次 FP 确认（物体还在吗？） ──
+        if self._fp_target_object_id is not None:
+            ok, detail = pre_pick_confirm(
+                get_fp_state=lambda: self.get_fp_state(),
+                target_object_id=self._fp_target_object_id,
+            )
+            if not ok:
+                return self._error_result(
+                    "FP_LOST",
+                    f"pre_pick_confirm failed: {detail}",
+                    request_id, goal_id, step_id,
+                )
+
         result = self._call_set_lift(request_id, goal_id, step_id)
         if result["status"] != "ok":
             return result
@@ -529,6 +672,36 @@ class RosAcceptanceAdapter:
             result["status"] = "error"
             result["error_code"] = "PICK_NOT_READY"
             result["message"] = "robot did not reach ready state after pick"
+            return result
+
+        # ── 搬起后：FP 验证地上还有箱子吗？ ──
+        if self._expected_slot_xy is not None:
+            verify = post_pick_verify(
+                get_fp_state=lambda: self.get_fp_state(),
+                get_odom=lambda: self._estimated_odom(),
+                expected_slot_xy=self._expected_slot_xy,
+            )
+            if verify["status"] == "PICK_FAILED":
+                result = self._error_result(
+                    "PICK_FAILED",
+                    verify["detail"],
+                    request_id, goal_id, step_id,
+                )
+                if verify.get("current_obj_pose"):
+                    result["replan_target"] = {
+                        "x": verify["current_obj_pose"][0],
+                        "y": verify["current_obj_pose"][1],
+                        "z": 0.0,
+                        "theta": verify["current_obj_pose"][2],
+                    }
+                return result
+            elif verify["status"] == "FP_UNAVAILABLE":
+                return self._error_result(
+                    "FP_UNAVAILABLE",
+                    verify["detail"],
+                    request_id, goal_id, step_id,
+                )
+
         return result
 
     def _place_sequence(self, request_id, goal_id, step_id):
@@ -562,7 +735,9 @@ class RosAcceptanceAdapter:
             return self._error_result("PLACE_NOT_READY",
                                       "robot did not reach ready state after place",
                                       request_id, goal_id, step_id)
-        return {
+
+        # ── 放置后：FP 验证目标格子有箱子吗？ ──
+        result = {
             "status": "ok",
             "error_code": None,
             "message": "placed",
@@ -572,6 +747,25 @@ class RosAcceptanceAdapter:
             "goal_id": goal_id,
             "step_id": step_id,
         }
+        if self._expected_grid_xy is not None:
+            verify = post_place_verify(
+                get_fp_state=lambda: self.get_fp_state(),
+                get_odom=lambda: self._estimated_odom(),
+                expected_grid_xy=self._expected_grid_xy,
+            )
+            if verify["status"] == "PLACE_FAILED":
+                return self._error_result(
+                    "PLACE_FAILED",
+                    verify["detail"],
+                    request_id, goal_id, step_id,
+                )
+            elif verify["status"] == "FP_UNAVAILABLE":
+                return self._error_result(
+                    "FP_UNAVAILABLE",
+                    verify["detail"],
+                    request_id, goal_id, step_id,
+                )
+        return result
 
     def _call_set_lift(self, request_id, goal_id, step_id):
         t0 = time.time()

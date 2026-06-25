@@ -241,6 +241,10 @@ class MissionRunner:
                             current_replans = self._replan_counts.get(task_idx, 0)
                             if current_replans < self._max_replans_per_task:
                                 self._replan_counts[task_idx] = current_replans + 1
+                                # 如果钩子返回了新步骤（含修正后的 target），替换当前 step
+                                if new_steps:
+                                    record.plan[record.current_step_index] = new_steps[0]
+                                    self._service.store.update(mission_id, record)
                                 # 重规划：不推进步骤，下次迭代重新执行当前步骤
                                 continue
                             else:
