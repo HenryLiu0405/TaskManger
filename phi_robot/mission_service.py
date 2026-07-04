@@ -89,7 +89,6 @@ class MissionService:
                 pause_requested=False,
                 abort_requested=False,
                 metrics={
-                    "max_replans": options.get("max_replans", 2) if options else 2,
                     "timeout_s": options.get("timeout_s", 20) if options else 20,
                 },
             )
@@ -121,7 +120,6 @@ class MissionService:
             current_stock_slot_index=0,
             state={},
             metrics={
-                "max_replans": options.get("max_replans", 2) if options else 2,
                 "timeout_s": options.get("timeout_s", 20) if options else 20,
             },
             last_error=None,

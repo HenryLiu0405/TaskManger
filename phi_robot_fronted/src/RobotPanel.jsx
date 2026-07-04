@@ -1,9 +1,11 @@
-import { Card, Descriptions, Tag, Tooltip } from 'antd';
+import { Card, Descriptions, Tag, Tooltip, Switch } from 'antd';
 import {
   AimOutlined,
   CompassOutlined,
   CheckCircleFilled,
   CloseCircleFilled,
+  RobotOutlined,
+  UserOutlined,
 } from '@ant-design/icons';
 
 const STATE_COLORS = {
@@ -57,9 +59,10 @@ const SERVICE_LABELS = {
   '/notify_goal_reached': '目标通知',
   '/get_locomotion_mode': '状态',
   '/pause_navigation': '暂停导航',
+  '/control/set_input_source': 'SONIC切换',
 };
 
-export default function RobotPanel({ manual, robot, services }) {
+export default function RobotPanel({ manual, robot, services, sonicSource, sonicLoading, onToggleSonicSource }) {
   const stateColor = STATE_COLORS[manual?.state] || 'default';
   const stateLabel = STATE_LABELS[manual?.state] || manual?.state || '--';
   const allOnline = Object.keys(services || {}).length > 0
@@ -105,6 +108,24 @@ export default function RobotPanel({ manual, robot, services }) {
                 </Tag>
               </Tooltip>
             ))}
+          </div>
+        </Descriptions.Item>
+
+        {/* SONIC 输入源切换 */}
+        <Descriptions.Item label="SONIC 控制">
+          <div className="flex items-center gap-2">
+            <Switch
+              checked={sonicSource === 'GAMEPAD'}
+              onChange={(v) => onToggleSonicSource && onToggleSonicSource(v)}
+              loading={sonicLoading}
+              checkedChildren={<><UserOutlined className="mr-1" />手柄</>}
+              unCheckedChildren={<><RobotOutlined className="mr-1" />ROS2</>}
+            />
+            <Tooltip title="当前 SONIC 控制源">
+              <Tag color={sonicSource === 'GAMEPAD' ? 'warning' : 'processing'}>
+                {sonicSource === 'GAMEPAD' ? '人工接管' : sonicSource === 'ROS2' ? '自动控制' : '未知'}
+              </Tag>
+            </Tooltip>
           </div>
         </Descriptions.Item>
 

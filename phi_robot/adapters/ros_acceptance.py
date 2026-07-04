@@ -3,8 +3,8 @@ ROS2 acceptance adapter.
 
 Bridges the RobotAdapter protocol to ROS2 services provided by colleagues:
   - move_to  → /start_navigation (trajectory_json → success)
-  - pick     → /set_lift → /request_replay
-  - place    → /notify_goal_reached → /set_lay_down → /request_replay → /set_stand
+  - pick     → /submit_carry_task (single-object pose → gateway state machine)
+  - place    → /notify_goal_reached → /set_lay_down → /set_stand
   - get_pose → returns minimal ok (no pose feedback needed)
 """
 
@@ -12,12 +12,17 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import os
+import subprocess
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
 from robot_interfaces.srv import ExecuteTrajectory
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Bool, Int32, String
@@ -25,15 +30,47 @@ from std_srvs.srv import SetBool, Trigger
 
 from ..robot_state import safety_fsm, RobotState
 from ..audit import audit_logger
-from ..recovery.recovery_executor import (
-    pre_pick_confirm,
-    post_pick_verify,
-    post_place_verify,
-    run_arrival_check,
+from ..recovery_diag import (
+    DiagEvent,
+    EVT_STEP_START,
+    make_fp_snapshot, make_odom_snapshot, make_step_result,
+    make_select_target, make_drop_status, make_drop_detector_state,
 )
-from ..recovery.replan_gate import scan_to_find
 
 logger = logging.getLogger("phi_robot.ros_acceptance")
+
+try:
+    from foundationpose_ros2.srv import SelectTarget, Activate
+    _HAS_SELECT_TARGET = True
+except ImportError:
+    SelectTarget = None
+    Activate = None
+    _HAS_SELECT_TARGET = False
+
+try:
+    from foundationpose_ros2.srv import Reset
+    _HAS_RESET = True
+except ImportError:
+    Reset = None
+    _HAS_RESET = False
+    logger.info("foundationpose_ros2.srv.SelectTarget/Activate not available; calls disabled")
+
+try:
+    from foundationpose_ros2.msg import PoseEstimate, PoseEstimateArray
+    _HAS_POSE_ESTIMATE = True
+except ImportError:
+    PoseEstimate = None
+    PoseEstimateArray = None
+    _HAS_POSE_ESTIMATE = False
+    logger.info("foundationpose_ros2.msg.PoseEstimate not available; pose subscription disabled")
+
+try:
+    from gear_sonic_interfaces.srv import SubmitCarryTask
+    _HAS_SUBMIT_CARRY = True
+except ImportError:
+    SubmitCarryTask = None
+    _HAS_SUBMIT_CARRY = False
+    logger.info("gear_sonic_interfaces.srv.SubmitCarryTask not available; carry task submission disabled")
 
 _READY_POLL_INTERVAL_S = 0.5
 _READY_TIMEOUT_S = 120.0
@@ -51,9 +88,11 @@ class RosAcceptanceAdapter:
         request_replay_service: str = "/request_replay",
         notify_goal_reached_service: str = "/notify_goal_reached",
         timeout_s: float = 60.0,
+        camera_host: str = "192.168.50.79",
     ):
         self._timeout_s = timeout_s
         self._path_plan_service = path_plan_service
+        self._camera_host = camera_host
 
         if not rclpy.ok():
             rclpy.init()
@@ -67,13 +106,91 @@ class RosAcceptanceAdapter:
         self._notify_goal_reached_client = self._node.create_client(SetBool, notify_goal_reached_service)
         self._get_mode_client = self._node.create_client(Trigger, "/get_locomotion_mode")
 
+        # 🆕 SONIC 输入源切换（ROS2 自动 ↔ Gamepad 人工接管）
+        self._set_input_source_client = self._node.create_client(
+            SetBool, '/control/set_input_source')
+        self._sonic_input_source: str = "ROS2"  # 默认自动控制
+
+        def _on_input_source_state(msg):
+            try:
+                data = json.loads(msg.data)
+                self._sonic_input_source = data.get("active_source", "ROS2")
+            except Exception:
+                pass
+        self._node.create_subscription(
+            String, '/control/input_source_state', _on_input_source_state, 10)
+
+        # 🆕 FoundationPose SelectTarget 服务（v3: 多物体选择移交 FP）
+        if _HAS_SELECT_TARGET:
+            self._select_target_client = self._node.create_client(
+                SelectTarget, '/foundationpose/select_target')
+            self._activate_client = self._node.create_client(
+                Activate, '/foundationpose/activate')
+        else:
+            self._select_target_client = None
+            self._activate_client = None
+
+        # FP Reset（独立，不影响 SelectTarget/Activate）
+        if _HAS_RESET:
+            self._reset_client = self._node.create_client(
+                Reset, '/foundationpose/reset')
+        else:
+            self._reset_client = None
+            logger.info("foundationpose_ros2.srv.Reset not available; reset calls disabled")
+
+        # 🆕 掉箱检测订阅（v3: drop_detector_node → /vision/box_drop_status）
+        self._box_drop_detected: bool = False
+        self._drop_odom_x: float = 0.0   # 掉落瞬间里程计 x（用于 replan_target）
+        self._drop_odom_y: float = 0.0   # 掉落瞬间里程计 y
+        self._drop_enable_pub = self._node.create_publisher(
+            Bool, '/vision/drop_detector_enable', 10)
+        self._drop_detector_process: subprocess.Popen | None = None  # 按需拉起的节点进程
+
+        def _on_box_drop_status(msg: Bool):
+            prev = self._box_drop_detected
+            self._box_drop_detected = not msg.data  # data:true=在, data:false=掉落
+            if not msg.data and not prev:
+                self._drop_odom_x = self._odom_x
+                self._drop_odom_y = self._odom_y
+                logger.error("⚠ 掉箱检测：箱子掉落！/vision/box_drop_status → false "
+                             "odom=(%.2f, %.2f)，记录位置，继续当前导航",
+                             self._drop_odom_x, self._drop_odom_y)
+                self._emit_diag(make_drop_status(
+                    self._current_step_id, False,
+                    self._drop_odom_x, self._drop_odom_y))
+            elif msg.data and prev:
+                logger.info("掉箱检测恢复: 箱子重新出现在画面中")
+                self._emit_diag(make_drop_status(
+                    self._current_step_id, True,
+                    self._odom_x, self._odom_y))
+
+        self._node.create_subscription(
+            Bool, '/vision/box_drop_status', _on_box_drop_status, 10)
+
         self._executor = MultiThreadedExecutor()
         self._executor.add_node(self._node)
         self._spin_thread = threading.Thread(target=self._spin_executor, daemon=True)
         self._spin_thread.start()
 
-        # Pause / resume navigation (Topic, not Service)
-        self._pause_nav_pub = self._node.create_publisher(Bool, "/pause_navigation", 10)
+        # ── 导航控制 ──
+        # /nav_pause: 暂停/恢复命令（上游 → Nav2）
+        #   True  = 暂停（速度归零，状态保持，恢复后断点继续）
+        #   False = 恢复（从断点继续导航）
+        self._pause_nav_pub = self._node.create_publisher(Bool, "/nav_pause", 10)
+
+        # /nav_reached: 到达通知（Nav2 → 上游）
+        #   False = 收到新目标，导航中
+        #   True  = 到达目标（位置<0.35m + 朝向<±10° + 持续1.5s），锁死零速
+        #   上游收到 True 后可做后续动作（下发新目标 / pick / place）
+        self._nav_reached: bool = False
+        def _on_nav_reached(msg: Bool):
+            prev = self._nav_reached
+            self._nav_reached = msg.data
+            if prev != self._nav_reached:
+                logger.info("nav_reached: %s → %s (%s)",
+                            prev, self._nav_reached,
+                            "到达" if self._nav_reached else "导航中")
+        self._node.create_subscription(Bool, "/nav_reached", _on_nav_reached, 10)
 
         # Locomotion mode publisher — keeps gateway mode fresh during navigation
         self._mode_pub = self._node.create_publisher(Int32, "/locomotion_mode", 10)
@@ -89,7 +206,27 @@ class RosAcceptanceAdapter:
         self._fp_rgb_jpeg: Optional[bytes] = None
         self._fp_depth_jpeg: Optional[bytes] = None
         self._fp_mask_jpeg: Optional[bytes] = None
+        self._drop_vis_jpeg: Optional[bytes] = None  # drop_detector 可视化画面
         # GIL 下 bytes 引用赋值是原子的，无需锁
+
+        # 里程计 — 订阅 /odom (nav_msgs/Odometry)，缓存最新位姿
+        self._odom_x: float = 0.0
+        self._odom_y: float = 0.0
+        self._odom_yaw: float = 0.0
+        self._scan_start_yaw: float | None = None
+
+        def _on_odom(msg: Odometry) -> None:
+            self._odom_x = msg.pose.pose.position.x
+            self._odom_y = msg.pose.pose.position.y
+            q = msg.pose.pose.orientation
+            # quaternion → yaw
+            siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+            self._odom_yaw = math.atan2(siny_cosp, cosy_cosp)
+        self._node.create_subscription(Odometry, "/odom", _on_odom, 10)
+
+        # /cmd_vel publisher — 旋转扫描时接管速度控制
+        self._cmd_vel_pub = self._node.create_publisher(Twist, "/cmd_vel", 10)
 
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         _fp_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -118,21 +255,107 @@ class RosAcceptanceAdapter:
         self._node.create_subscription(
             CompressedImage, '/fp/mask/compressed', _on_fp_mask, _fp_qos)
 
+        def _on_drop_vis(msg):
+            self._drop_vis_jpeg = msg.data
+        self._node.create_subscription(
+            CompressedImage, '/vision/drop_detector_vis/compressed', _on_drop_vis, _fp_qos)
+
         # place 操作容错标志
         self._box_released: bool = False
 
         # ── FP 验证用状态 ──
         # 最近一次 move_to 的目标坐标（Nav2 map 系），用作 odometry 的近似值
         self._last_move_target: tuple[float, float] = (0.0, 0.0)
-        # 当前任务预期的物料点 / 放置点（Nav2 map 系），调用方通过 args 传入
+        # 当前任务预期的物料点（Nav2 map 系），调用方通过 args 传入
         self._expected_slot_xy: tuple[float, float] | None = None
-        self._expected_grid_xy: tuple[float, float] | None = None
-        # FP 选出的最优物体 ID（由 run_arrival_check / select_target_object 设置）
+        # FP 选出的最优物体 ID（由 SelectTarget 服务 或 run_arrival_check 设置）
         self._fp_target_object_id: int | None = None
+        # SelectTarget(select=true) 是否已激活单目标模式（需在搬起后/重规划前清理）
+        self._select_target_active: bool = False
+
+        # ── 单物体位姿缓存（/foundationpose/pose_result → /submit_carry_task）──
+        # ── 物体位姿缓存（→ /submit_carry_task）──
+        # 多物体模式：遍历数组取第一个 TRACKING 物体
+        # 单物体模式（SelectTarget 激活）：数组仅含锁定物体
+        self._latest_pose_result = None  # PoseEstimate | None
+        if _HAS_POSE_ESTIMATE:
+            def _on_pose_results(msg: PoseEstimateArray):
+                for obj in msg.objects:
+                    if obj.state >= 1:  # IDLE(1) 或 TRACKING(2) 都接受
+                        self._latest_pose_result = obj
+                        break
+            self._node.create_subscription(
+                PoseEstimateArray, '/foundationpose/pose_results', _on_pose_results, 10)
+
+        # SubmitCarryTask 客户端（懒初始化，首次调用 /submit_carry_task 时创建）
+        self._submit_carry_client = None
+
+        # ── 分步调试诊断 ──
+        self._current_step_id: str = ""
+        self._diag_callback: Callable[[DiagEvent], None] | None = None
 
         logger.info("ROS2 node ready — path_plan=%s, lift=%s, lay_down=%s, stand=%s, replay=%s, notify_goal=%s",
                     "phi_robot_acceptance", path_plan_service, lift_service, lay_down_service, stand_service,
                     request_replay_service, notify_goal_reached_service)
+
+    # ── 诊断回调（分步调试用） ──────────────────────────────
+
+    def set_safety_bypass(self, enabled: bool) -> None:
+        """运行时开关：启用/禁用安全状态机旁路。
+
+        True  → 跳过所有 can_walk/can_pick/can_place 检查，transition 不校验。
+        False → 恢复正常安全检查。
+        """
+        safety_fsm.set_bypass(enabled)
+
+    def set_sonic_input_source(self, gamepad: bool) -> dict[str, Any]:
+        """切换 SONIC 输入源。
+
+        True  → 手柄接管 (GAMEPAD)，人工遥控。
+        False → ROS2 自动控制，TaskManger 下发指令。
+
+        返回: {"ok": True/False, "message": str, "active_source": str}
+        """
+        if not self._set_input_source_client.wait_for_service(timeout_sec=2.0):
+            return {"ok": False, "message": "/control/set_input_source 服务不可用",
+                    "active_source": self._sonic_input_source}
+
+        req = SetBool.Request()
+        req.data = gamepad
+
+        try:
+            future = self._set_input_source_client.call_async(req)
+            if not self._wait_future(future, timeout_sec=3.0):
+                return {"ok": False, "message": "set_input_source 调用超时",
+                        "active_source": self._sonic_input_source}
+            resp = future.result()
+            source = "GAMEPAD" if gamepad else "ROS2"
+            logger.warning("SONIC 输入源切换 → %s (success=%s)", source, resp.success)
+            return {"ok": resp.success, "message": resp.message,
+                    "active_source": source}
+        except Exception as e:
+            logger.exception("set_input_source 调用失败: %s", e)
+            return {"ok": False, "message": str(e),
+                    "active_source": self._sonic_input_source}
+
+    def get_sonic_input_source(self) -> str:
+        """查询当前 SONIC 输入源: "ROS2" | "GAMEPAD" | "unknown" """
+        return self._sonic_input_source or "unknown"
+
+    def set_diag_callback(self, cb: Callable[[DiagEvent], None] | None) -> None:
+        """注册诊断事件回调。分步调试模式下由 StepDebugController 调用。
+
+        传入 None 可取消回调（恢复正常模式，不产生诊断开销）。
+        """
+        self._diag_callback = cb
+
+    def _emit_diag(self, event: DiagEvent) -> None:
+        """向已注册的诊断回调推送事件（无回调时是空操作）"""
+        if self._diag_callback is not None:
+            try:
+                self._diag_callback(event)
+            except Exception:
+                pass  # 诊断回调异常不应阻断正常流程
 
     # ── RobotAdapter protocol ──────────────────────────────────
 
@@ -145,15 +368,31 @@ class RosAcceptanceAdapter:
         goal_id: str,
         step_id: str,
     ) -> dict[str, Any]:
+        # ── 诊断：记录步骤开始 ──
+        self._current_step_id = step_id
+        t_start = time.monotonic()
+        self._emit_diag(DiagEvent(
+            DiagEvent.now(), step_id, "", EVT_STEP_START,
+            {"tool": tool, "args_summary": _summarize_args(tool, args)},
+        ))
+
+        def _finish(result: dict[str, Any]) -> dict[str, Any]:
+            elapsed = time.monotonic() - t_start
+            self._emit_diag(make_step_result(
+                step_id,
+                status=result.get("status", "ok"),
+                error_code=result.get("error_code", "") or "",
+                message=result.get("message", ""),
+                elapsed_s=elapsed,
+            ))
+            return result
+
         # 安全检查 + 状态迁移
         if tool == "move_to":
             if not safety_fsm.can_walk():
-                return self._error_result("PRECONDITION_FAILED",
+                return _finish(self._error_result("PRECONDITION_FAILED",
                                          f"当前 {safety_fsm.state_value}, 不可走路",
-                                         request_id, goal_id, step_id)
-            # mode=2 (carry walk) when holding box, else mode=1 (normal walk)
-            is_carrying = safety_fsm.state == RobotState.HOLDING
-
+                                         request_id, goal_id, step_id))
             # 记录目标坐标（用作 odometry 近似值）
             target = args.get("target", {})
             self._last_move_target = (
@@ -161,60 +400,41 @@ class RosAcceptanceAdapter:
             )
 
             safety_fsm.transition(RobotState.MOVING)
-            result = self._call_path_plan(args, request_id, goal_id, step_id,
-                                          mode=2 if is_carrying else 1)
+            result = self._call_path_plan(args, request_id, goal_id, step_id)
             if result.get("status") == "ok":
-                # 搬起流（非携带）：到达 approach 点后验证 FP 是否看到物体
-                if not is_carrying:
-                    # expected_slot = approach + offset（物体在机器人前方 0.25m）
-                    self._expected_slot_xy = (
-                        self._last_move_target[0] + 0.25,
-                        self._last_move_target[1],
-                    )
-                    verify = self._verify_arrival(request_id, goal_id, step_id)
-                    if verify is not None:
-                        safety_fsm.transition(RobotState.STANDING)
-                        return verify
-                else:
-                    # 携带流：到达放置点，记录预期放置位置
-                    self._expected_grid_xy = (
-                        self._last_move_target[0] + 0.25,
-                        self._last_move_target[1],
-                    )
-
                 safety_fsm.transition(RobotState.ARRIVED)
             else:
                 safety_fsm.transition(RobotState.STANDING)
-            return result
+            return _finish(result)
 
         if tool == "pick":
             if not safety_fsm.can_pick():
-                return self._error_result("PRECONDITION_FAILED",
+                return _finish(self._error_result("PRECONDITION_FAILED",
                                          f"当前 {safety_fsm.state_value}, 不可搬起",
-                                         request_id, goal_id, step_id)
+                                         request_id, goal_id, step_id))
             safety_fsm.transition(RobotState.PICKING)
             result = self._call_locomotion("pick", request_id, goal_id, step_id)
             if result.get("status") == "ok":
                 safety_fsm.transition(RobotState.HOLDING)
             else:
                 safety_fsm.to_error()
-            return result
+            return _finish(result)
 
         if tool == "place":
             if not safety_fsm.can_place():
-                return self._error_result("PRECONDITION_FAILED",
+                return _finish(self._error_result("PRECONDITION_FAILED",
                                          f"当前 {safety_fsm.state_value}, 不可放下",
-                                         request_id, goal_id, step_id)
+                                         request_id, goal_id, step_id))
             safety_fsm.transition(RobotState.PLACING)
             result = self._call_locomotion("place", request_id, goal_id, step_id)
             if result.get("status") == "ok":
                 safety_fsm.transition(RobotState.STANDING)
             else:
                 safety_fsm.to_error()
-            return result
+            return _finish(result)
 
         # get_pose / get_gripper_state — not needed for acceptance test
-        return {
+        return _finish({
             "status": "ok",
             "error_code": None,
             "message": "acceptance: skipped",
@@ -223,13 +443,21 @@ class RosAcceptanceAdapter:
             "request_id": request_id,
             "goal_id": goal_id,
             "step_id": step_id,
-        }
+        })
 
     def snapshot(self) -> dict[str, Any]:
         return self._minimal_state()
 
     def reset(self) -> None:
-        pass
+        self._fp_target_object_id = None
+        self._select_target_active = False
+        self._expected_slot_xy = None
+        self._box_drop_detected = False
+        self._drop_odom_x = 0.0
+        self._drop_odom_y = 0.0
+        self._current_carrying_object_id = None
+        self._last_mission_slot_id = None
+        self._nav_status = ""
 
     def should_route_real_move_to(self, tool: str, args: dict[str, Any]) -> bool:
         """All move_to calls go through ROS — never inject local 'current' pose."""
@@ -245,6 +473,7 @@ class RosAcceptanceAdapter:
             ("/request_replay", self._request_replay_client),
             ("/notify_goal_reached", self._notify_goal_reached_client),
             ("/get_locomotion_mode", self._get_mode_client),
+            ("/control/set_input_source", self._set_input_source_client),
         ]
         status = {}
         for name, client in checks:
@@ -257,31 +486,204 @@ class RosAcceptanceAdapter:
         return status
 
     def pause_navigation(self):
-        """Publish Bool(data=True) to /pause_navigation — robot stops immediately."""
+        """Publish Bool(data=True) to /nav_pause — 速度归零，状态保持，恢复后断点继续。
+
+        与 /nav_reached 是两套独立机制：
+          /nav_pause   = 暂停/恢复命令（上游 → Nav2）
+          /nav_reached = 到达通知（Nav2 → 上游），属 nav_reached 属性
+        """
         msg = Bool()
         msg.data = True
         self._pause_nav_pub.publish(msg)
-        logger.info("pause_navigation: published data=true")
+        logger.info("pause_navigation: published data=true → /nav_pause")
 
     def resume_navigation(self):
-        """Publish Bool(data=False) to /pause_navigation — robot resumes from saved path."""
+        """Publish Bool(data=False) to /nav_pause — 从断点恢复导航。
+
+        见 pause_navigation() 说明。
+        """
         msg = Bool()
         msg.data = False
         self._pause_nav_pub.publish(msg)
-        logger.info("pause_navigation: published data=false")
+        logger.info("resume_navigation: published data=false → /nav_pause")
+
+    @property
+    def nav_reached(self) -> bool:
+        """Nav2 /nav_reached 到达通知: False=导航中, True=已到达且锁死零速。
+
+        到达条件: 位置<0.35m + 朝向<±10° + 持续1.5s。
+        上游收到 True 后可做后续动作（下发新目标/pick/place）。
+        注意：这是状态通知，不是暂停命令。暂停用 pause_navigation() → /nav_pause。
+        """
+        return self._nav_reached
 
     def get_navigation_status(self) -> str:
         """Return cached /navigation_status value."""
         return self._nav_status
 
+    # ── 掉箱处理（手动重规划） ─────────────────────────────────
+
+    def enable_drop_detector(self) -> dict:
+        """启动 drop_detector_node 子进程，启用掉箱检测。"""
+        # 如果已有进程在跑，先杀掉
+        if self._drop_detector_process is not None:
+            self._kill_drop_detector_process()
+
+        # 启动 drop_detector_node 子进程（继承当前 ROS2 环境）
+        cmd = [
+            'ros2', 'run', 'foundationpose_ros2', 'drop_detector_node',
+            '--ros-args',
+            '-p', f'camera_host:={self._camera_host}',
+            '-p', 'enable_visualization:=true',
+        ]
+        try:
+            self._drop_detector_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ},  # 继承当前环境（ROS_DOMAIN_ID 等）
+            )
+            logger.info("drop_detector_node 子进程已启动 (pid=%d)", self._drop_detector_process.pid)
+        except Exception as e:
+            logger.exception("drop_detector_node 启动失败: %s", e)
+            return {"ok": False, "message": f"启动 drop_detector_node 失败: {e}"}
+
+        # 等待节点初始化（发布者就绪）
+        time.sleep(1.0)
+
+        # 发布启用信号
+        msg = Bool(data=True)
+        self._drop_enable_pub.publish(msg)
+        self._emit_diag(make_drop_detector_state(self._current_step_id, True))
+        logger.info("drop_detector enabled (camera=%s)", self._camera_host)
+        return {"ok": True, "message": f"drop detector started and enabled (camera={self._camera_host})"}
+
+    def disable_drop_detector(self) -> dict:
+        """禁用掉箱检测并终止 drop_detector_node 子进程。"""
+        # 先发禁用信号
+        msg = Bool(data=False)
+        self._drop_enable_pub.publish(msg)
+        self._emit_diag(make_drop_detector_state(self._current_step_id, False))
+
+        # 杀掉子进程
+        self._kill_drop_detector_process()
+        logger.info("drop_detector disabled and process killed")
+        return {"ok": True, "message": "drop detector disabled and process killed"}
+
+    def _kill_drop_detector_process(self):
+        """终止 drop_detector_node 子进程（先 SIGTERM，超时则 SIGKILL）。"""
+        if self._drop_detector_process is None:
+            return
+        p = self._drop_detector_process
+        self._drop_detector_process = None
+        # 进程已自行退出
+        if p.poll() is not None:
+            logger.info("drop_detector_node 进程已自行退出 (pid=%d, rc=%d)", p.pid, p.returncode)
+            return
+        try:
+            p.terminate()
+            try:
+                p.wait(timeout=3)
+                logger.info("drop_detector_node 进程已终止 (pid=%d)", p.pid)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+                logger.warning("drop_detector_node 进程被强制杀死 (pid=%d)", p.pid)
+        except Exception as e:
+            logger.warning("终止 drop_detector_node 时出错: %s", e)
+
+    def stand_robot(self) -> dict:
+        """调用 /set_stand 服务让机器人站立（放下手臂）。"""
+        return self._call_set_stand("replan", "replan", "replan-stand")
+
+    def identify_dropped_box(
+        self, material_points_xy: list[float] | None = None,
+        target_points_xy: list[float] | None = None,
+    ) -> dict:
+        """
+        调用 FP SelectTarget MODE_DROPPED=1 识别掉落箱子。
+
+        Args:
+            material_points_xy: 所有物料点 XY 扁平列表 [x1,y1,x2,y2,...]
+            target_points_xy: 所有目标点 XY 扁平列表
+
+        Returns:
+            {"ok": True/False, "matched_object_id": int, "box_world_xy": [...],
+             "message": str, "pose": {...} | None}
+        """
+        if material_points_xy is None:
+            material_points_xy = [s.x for s in self._stock_slot_cache] if hasattr(self, '_stock_slot_cache') else []
+        if target_points_xy is None:
+            target_points_xy = []
+
+        result = self._call_select_target(
+            select=True, mode=1,  # MODE_DROPPED
+            pick_x=0.0, pick_y=0.0,
+            material_points_xy=material_points_xy,
+            target_points_xy=target_points_xy,
+            point_tolerance=0.3,
+            step_id="replan-identify",
+        )
+        if result and result.get("success"):
+            obj_id = result.get("matched_object_id", -1)
+            box_xy = result.get("box_world_xy", [])
+            logger.info("identify_dropped_box: found object_id=%s at %s", obj_id, box_xy)
+            pose = None
+            if obj_id >= 0 and self._latest_pose_result is not None:
+                p = self._latest_pose_result
+                pose = {"x": float(p.pose.position.x), "y": float(p.pose.position.y),
+                        "z": float(p.pose.position.z),
+                        "qx": float(p.pose.orientation.x), "qy": float(p.pose.orientation.y),
+                        "qz": float(p.pose.orientation.z), "qw": float(p.pose.orientation.w)}
+            return {"ok": True, "matched_object_id": obj_id, "box_world_xy": box_xy,
+                    "pose": pose, "message": result.get("message", "")}
+        else:
+            return {"ok": False, "matched_object_id": -1, "box_world_xy": [],
+                    "pose": None, "message": result.get("message", "") if result else "no result"}
+
+    def replan_pick(self, request_id: str = "replan", goal_id: str = "replan",
+                    step_id: str = "replan-pick") -> dict:
+        """
+        用缓存的掉落箱子位姿执行搬起操作。
+
+        依赖 identify_dropped_box 先被调用以缓存位姿到 self._latest_pose_result。
+
+        Returns:
+            {"ok": True/False, "message": str, ...}
+        """
+        if self._latest_pose_result is None:
+            return {"ok": False, "message": "no cached pose; call identify_dropped_box first"}
+        self._select_target_active = True  # 标记为单物体模式
+        result = self._call_submit_carry_task(request_id, goal_id, step_id)
+        if result["status"] == "ok":
+            ready = self._wait_until_ready("carry")
+            if not ready:
+                result["status"] = "error"
+                result["error_code"] = "PICK_NOT_READY"
+                result["message"] = "robot did not reach ready state after replan pick"
+        self._cleanup_select_target(step_id)
+        return result
+
+    # ── 基础查询 ──────────────────────────────────────────────
+
     def get_fp_state(self) -> dict[str, Any]:
         """获取 FoundationPose 最新状态."""
         return dict(self._fp_state)
 
-    def get_fp_video_frame(self, channel: str) -> Optional[bytes]:
-        """获取 FoundationPose 最新视频帧 (JPEG bytes).
+    def get_odom(self) -> dict[str, Any]:
+        """获取最新里程计 (x, y, yaw_deg)."""
+        return {
+            "x": getattr(self, "_odom_x", 0.0),
+            "y": getattr(self, "_odom_y", 0.0),
+            "yaw_deg": round(
+                math.degrees(getattr(self, "_odom_yaw", 0.0)), 1
+            ),
+        }
 
-        channel: 'rgb' | 'depth' | 'mask'
+    def get_fp_video_frame(self, channel: str) -> Optional[bytes]:
+        """获取 FoundationPose / drop_detector 最新视频帧 (JPEG bytes).
+
+        channel: 'rgb' | 'depth' | 'mask' | 'drop'
         """
         if channel == 'rgb':
             return self._fp_rgb_jpeg
@@ -289,6 +691,8 @@ class RosAcceptanceAdapter:
             return self._fp_depth_jpeg
         elif channel == 'mask':
             return self._fp_mask_jpeg
+        elif channel == 'drop':
+            return self._drop_vis_jpeg
         return None
 
     def get_robot_state(self) -> dict[str, Any]:
@@ -324,93 +728,56 @@ class RosAcceptanceAdapter:
     # ── FP verification helpers ────────────────────────────────
 
     def _estimated_odom(self) -> tuple[float, float, float]:
-        """用最后一次 move_to 目标作为 odometry 近似值（yaw 固定 0）。
+        """当前里程计位姿，来自 /odom 订阅。
 
-        RosAcceptanceAdapter 当前不订阅 /Odometry，用导航目标点代替。
-        对于原地 pick/place 后的验证，机器人位置不变，此近似足够。
-        后续接入 /Odometry 订阅后替换此方法即可。
+        返回 (x, y, yaw) 在 Nav2 map 系下。
+        yaw 由 orientation quaternion 转换，实时反映机器人朝向。
         """
-        return (self._last_move_target[0], self._last_move_target[1], 0.0)
+        x, y, yaw = self._odom_x, self._odom_y, self._odom_yaw
+        self._emit_diag(make_odom_snapshot(self._current_step_id, x, y, yaw))
+        return (x, y, yaw)
 
     def _rotate_relative(self, angle_deg: float) -> None:
-        """旋转到相对角度（度），用于 scan_to_find。
+        """旋转到从扫描起始朝向算起的绝对偏移角度。
 
-        当前实现：暂停导航 + 发 /cmd_vel 角速度指令。
-        注意：RosAcceptanceAdapter 当前未订阅 /Odometry，无法精确控制旋转角度。
-        此方法为桩实现——旋转完成后由调用方 scan_to_find 读最新 FP 判断是否找到物体。
+        发 /cmd_vel angular.z=±0.5 rad/s，通过 /odom 做闭环控制，
+        到达目标 yaw（误差 < 2°）后停止。
+
+        Args:
+            angle_deg: 从 _scan_start_yaw 算起的绝对偏移角度（度）。
+                      0° = 保持起始朝向不转。
+                      正值 = 左转，负值 = 右转。
         """
+        if angle_deg == 0:
+            return
+
+        # 目标朝向 = 扫描起始朝向 + 偏移量
+        start_yaw = self._scan_start_yaw if self._scan_start_yaw is not None else self._odom_yaw
+        target_yaw = start_yaw + math.radians(angle_deg)
+        target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))  # normalize
+
         self.pause_navigation()
-        # 发角速度指令旋转（简化版：单次固定时长旋转）
-        # 完整实现需订阅 /Odometry 做闭环控制
-        duration_s = abs(angle_deg) / 30.0  # ~30°/s
-        if duration_s > 0:
-            time.sleep(duration_s)
-        self.resume_navigation()
-
-    # ── internal ───────────────────────────────────────────────
-
-    def _verify_arrival(
-        self, request_id: str, goal_id: str, step_id: str,
-    ) -> dict[str, Any] | None:
-        """到达 approach 点后运行 FP 验证。
-
-        Returns:
-            None — FP 验证通过，可以继续搬起。
-            dict — 验证失败，应作为 error result 直接返回给调用方。
-        """
         try:
-            action = run_arrival_check(
-                get_fp_state=lambda: self.get_fp_state(),
-                get_odom=lambda: self._estimated_odom(),
-                rotate_to_relative=lambda a: self._rotate_relative(a),
-                expected_obj_pose=(
-                    self._expected_slot_xy[0] if self._expected_slot_xy else 0.0,
-                    self._expected_slot_xy[1] if self._expected_slot_xy else 0.0,
-                    0.0,
-                ),
-            )
-        except Exception:
-            logger.exception("_verify_arrival: run_arrival_check failed")
-            return None  # 验证异常不阻塞正常流程
+            deadline = time.time() + 10.0  # 最多转 10 秒
+            twist = Twist()
+            while time.time() < deadline:
+                # 每轮根据当前误差重新算方向，防止 overshoot 后失控
+                current_error = target_yaw - self._odom_yaw
+                current_error = math.atan2(math.sin(current_error), math.cos(current_error))
+                if abs(current_error) < math.radians(2.0):  # 2° 内到位
+                    break
+                twist.angular.z = 0.5 if current_error > 0.0 else -0.5
+                self._cmd_vel_pub.publish(twist)
+                self._emit_diag(make_rotate_cmd(
+                    self._current_step_id, target_yaw, self._odom_yaw,
+                    current_error, twist.angular.z,
+                ))
+                time.sleep(0.05)
 
-        if action["action"] == "pre_pick":
-            # 记录 FP 选出的物体 ID，供 pre_pick_confirm 使用
-            target = action.get("target", {})
-            self._fp_target_object_id = target.get("object_id") if target else None
-            logger.info("FP arrival check passed, target object_id=%s",
-                        self._fp_target_object_id)
-            return None
-
-        if action["action"] == "replan":
-            approach = action.get("new_approach")
-            result = self._error_result(
-                "POSITION_DEVIATION",
-                f"FP detected position deviation: {action.get('reason', '')}",
-                request_id, goal_id, step_id,
-            )
-            if approach:
-                result["replan_target"] = {
-                    "x": approach[0], "y": approach[1], "z": 0.0, "theta": approach[2],
-                }
-            return result
-
-        if action["action"] == "scan":
-            return self._error_result(
-                "FP_NOT_VISIBLE",
-                f"FP cannot see object: {action.get('reason', '')}",
-                request_id, goal_id, step_id,
-            )
-
-        if action["action"] == "escalate":
-            return self._error_result(
-                "FP_LOST",
-                f"FP escalate {action.get('level', 'L2')}: {action.get('reason', '')}",
-                request_id, goal_id, step_id,
-            )
-
-        # action == "wait": FP 数据暂时不可信，不算错误，继续
-        logger.warning("FP arrival check: %s — continuing anyway", action.get("reason", ""))
-        return None
+            # 停转
+            self._cmd_vel_pub.publish(Twist())
+        finally:
+            self.resume_navigation()
 
     def _spin_executor(self):
         try:
@@ -567,49 +934,41 @@ class RosAcceptanceAdapter:
         except Exception:
             pass
 
-    def _call_path_plan(self, args, request_id, goal_id, step_id, mode=1):
+    def _call_path_plan(self, args, request_id, goal_id, step_id):
         t0 = time.time()
         target = args.get("target", {})
         tx = float(target.get("x", 0.0))
         ty = float(target.get("y", 0.0))
+        theta = float(target.get("theta", math.pi / 2))
 
-        self._start_mode_publishing(mode)
-        try:
-            trajectory = self._build_trajectory(tx, ty)
-            req = ExecuteTrajectory.Request()
-            req.trajectory_json = trajectory
+        trajectory = self._build_trajectory(tx, ty, yaw=theta)
+        req = ExecuteTrajectory.Request()
+        req.trajectory_json = trajectory
 
-            print(f"\n  [ros] >>> {self._path_plan_service}  "
-                  f"target=({tx:.1f}, {ty:.1f})", flush=True)
+        print(f"\n  [ros] >>> {self._path_plan_service}  "
+              f"target=({tx:.1f}, {ty:.1f})", flush=True)
 
-            future = self._path_plan_client.call_async(req)
-            ok = self._wait_future(future, self._timeout_s)
-            elapsed = (time.time() - t0) * 1000
+        future = self._path_plan_client.call_async(req)
+        ok = self._wait_future(future, self._timeout_s)
+        elapsed = (time.time() - t0) * 1000
 
-            if not ok:
-                logger.error("path-planning call timed out for (%.1f, %.1f)", tx, ty)
-                audit_logger.log_ros2_call(service=self._path_plan_service, duration_ms=elapsed,
-                                           success=False, message="timed out")
-                return self._error_result("PATH_PLAN_TIMEOUT",
-                                         f"timed out: ({tx}, {ty})",
-                                         request_id, goal_id, step_id)
-
-            result = future.result()
-            print(f"  [ros] <<< success={result.success}", flush=True)
+        if not ok:
+            logger.error("path-planning call timed out for (%.1f, %.1f)", tx, ty)
             audit_logger.log_ros2_call(service=self._path_plan_service, duration_ms=elapsed,
-                                       success=result.success, message=str(result.success))
+                                       success=False, message="timed out")
+            return self._error_result("PATH_PLAN_TIMEOUT",
+                                     f"timed out: ({tx}, {ty})",
+                                     request_id, goal_id, step_id)
 
-            if not result.success:
-                return self._error_result("PATH_PLAN_FAILED",
-                                         f"start_navigation returned success=false for ({tx:.1f}, {ty:.1f})",
-                                         request_id, goal_id, step_id)
-        finally:
-            self._stop_mode_publishing()
+        result = future.result()
+        print(f"  [ros] <<< success={result.success}", flush=True)
+        audit_logger.log_ros2_call(service=self._path_plan_service, duration_ms=elapsed,
+                                   success=result.success, message=str(result.success))
 
-        # Notify gateway that the robot has arrived.
-        # For carry walk: gateway transitions carry_walking → goal_reached_locked.
-        # For normal walk: gateway rejects (not in carry pipeline), harmless.
-        self._notify_arrival()
+        if not result.success:
+            return self._error_result("PATH_PLAN_FAILED",
+                                     f"start_navigation returned success=false for ({tx:.1f}, {ty:.1f})",
+                                     request_id, goal_id, step_id)
 
         ready = self._wait_until_ready("move_to")
         if not ready:
@@ -621,7 +980,7 @@ class RosAcceptanceAdapter:
             "status": "ok",
             "error_code": None,
             "message": "arrived",
-            "pose": {"x": tx, "y": ty, "z": 0.0, "theta": 0.0},
+            "pose": {"x": tx, "y": ty, "z": 0.0, "theta": theta},
             "metrics": {},
             "request_id": request_id,
             "goal_id": goal_id,
@@ -629,14 +988,162 @@ class RosAcceptanceAdapter:
         }
 
     @staticmethod
-    def _build_trajectory(tx: float, ty: float) -> str:
+    def _build_trajectory(tx: float, ty: float, yaw: float | None = None) -> str:
         """Build a coordinate-format trajectory JSON for /start_navigation."""
+        if yaw is None:
+            yaw = math.pi / 2   # 默认朝向 y 轴正方向
         return json.dumps({
             "target_x": tx,
             "target_y": ty,
-            "yaw": 0.0,
+            "yaw": yaw,
             "walk": True,
         })
+
+    # 🆕 Activate service wrapper (v3)
+    def _call_activate(self, activate: bool, step_id: str = "") -> bool:
+        """调 FP /foundationpose/activate 开启/关闭位姿估计。
+
+        Returns:
+            True — 调用成功
+            False — 调用失败或 service 不可用
+        """
+        if self._activate_client is None:
+            logger.warning("Activate client not available; skipping")
+            return False
+
+        req = Activate.Request()
+        req.activate = activate
+
+        if not self._activate_client.wait_for_service(timeout_sec=2.0):
+            logger.error("Activate service not available")
+            return False
+
+        try:
+            future = self._activate_client.call_async(req)
+            if not self._wait_future(future, timeout_sec=3.0):
+                logger.error("Activate call timed out")
+                return False
+            resp = future.result()
+            logger.info("Activate(activate=%s) → success=%s", activate, resp.success)
+            return resp.success
+        except Exception as e:
+            logger.exception("Activate call failed: %s", e)
+            return False
+
+    def _cleanup_select_target(self, step_id: str) -> None:
+        """若 SelectTarget 单目标模式已激活，退出并恢复多物体模式。"""
+        if self._select_target_active:
+            self._call_select_target(select=False, step_id=step_id)
+            self._select_target_active = False
+
+    # 🆕 SelectTarget service wrapper (v3)
+    def _call_select_target(self, select: bool, pick_x: float = 0.0,
+                            pick_y: float = 0.0,
+                            material_points_xy: list[float] | None = None,
+                            target_points_xy: list[float] | None = None,
+                            mode: int = 0, point_tolerance: float = 0.3,
+                            step_id: str = "") -> dict[str, Any] | None:
+        """调 FP /foundationpose/select_target 进入/退出单目标模式。
+
+        Args:
+            select: True=进入单目标模式, False=退出
+            mode: 0=MODE_TARGET (取箱), 1=MODE_DROPPED (掉箱检测)
+            point_tolerance: 判断"在点位上"的容差（米）
+
+        Returns:
+            dict with success/object_id 或 None（service 不可用时）
+        """
+        if self._select_target_client is None:
+            logger.warning("SelectTarget client not available; skipping")
+            return None
+
+        req = SelectTarget.Request()
+        req.mode = mode
+        req.select = select
+        req.pick_x = pick_x
+        req.pick_y = pick_y
+        req.material_points_xy = material_points_xy or []
+        req.target_points_xy = target_points_xy or []
+        req.point_tolerance = point_tolerance
+
+        if not self._select_target_client.wait_for_service(timeout_sec=2.0):
+            logger.error("SelectTarget service not available")
+            return None
+
+        try:
+            future = self._select_target_client.call_async(req)
+            if not self._wait_future(future, timeout_sec=3.0):
+                logger.error("SelectTarget call timed out")
+                return None
+            resp = future.result()
+            result = {
+                "success": resp.success,
+                "message": resp.message,
+                "matched_object_id": resp.matched_object_id,
+                "box_world_xy": list(resp.box_world_xy) if resp.box_world_xy else [],
+                "box_object_ids": list(resp.box_object_ids) if resp.box_object_ids else [],
+            }
+            # ── 诊断 ──
+            self._emit_diag(make_select_target(
+                step_id, select, pick_x, pick_y,
+                resp.matched_object_id, resp.success,
+            ))
+            if select and resp.success:
+                self._fp_target_object_id = resp.matched_object_id
+                logger.info("SelectTarget(select=true) → object_id=%s", resp.matched_object_id)
+            elif not select:
+                self._emit_diag(make_drop_detector_state(
+                    step_id, True, "SelectTarget(select=false)"))
+                logger.info("SelectTarget(select=false) → 掉箱检测已恢复")
+            return result
+        except Exception as e:
+            logger.exception("SelectTarget call failed: %s", e)
+            return None
+
+    # ── 公开入口（供 step_debug 手动切换用） ──
+
+    def select_target_public(
+        self,
+        select: bool,
+        pick_x: float = 0.0,
+        pick_y: float = 0.0,
+        material_points_xy: list[float] | None = None,
+        step_id: str = "",
+    ) -> dict[str, Any] | None:
+        """手动切换 FoundationPose 单目标模式的公开入口。
+
+        与 _call_select_target 完全相同的逻辑，仅暴露为公开方法。
+        """
+        return self._call_select_target(
+            select=select,
+            pick_x=pick_x,
+            pick_y=pick_y,
+            material_points_xy=material_points_xy or [],
+            step_id=step_id,
+        )
+
+    def call_reset_fp(self) -> dict | None:
+        """调 FP /foundationpose/reset 重新标定物体（清空所有 tracker 重新检测）"""
+        if self._reset_client is None:
+            logger.warning("Reset client not available; skipping")
+            return None
+
+        req = Reset.Request()
+        if not self._reset_client.wait_for_service(timeout_sec=2.0):
+            logger.error("Reset service not available")
+            return None
+
+        try:
+            future = self._reset_client.call_async(req)
+            if not self._wait_future(future, timeout_sec=3.0):
+                logger.error("Reset call timed out")
+                return None
+            resp = future.result()
+            logger.info("Reset → success=%s message=%s", resp.success, resp.message)
+            return {"success": resp.success, "message": resp.message}
+        except Exception as e:
+            logger.exception("Reset call failed: %s", e)
+            return None
 
     def _call_locomotion(self, tool, request_id, goal_id, step_id):
         if tool == "pick":
@@ -648,61 +1155,23 @@ class RosAcceptanceAdapter:
         return self._place_sequence(request_id, goal_id, step_id)
 
     def _pick_sequence(self, request_id, goal_id, step_id):
-        # ── 搬起前：末次 FP 确认（物体还在吗？） ──
-        if self._fp_target_object_id is not None:
-            ok, detail = pre_pick_confirm(
-                get_fp_state=lambda: self.get_fp_state(),
-                target_object_id=self._fp_target_object_id,
-            )
-            if not ok:
-                return self._error_result(
-                    "FP_LOST",
-                    f"pre_pick_confirm failed: {detail}",
-                    request_id, goal_id, step_id,
-                )
-
-        result = self._call_set_lift(request_id, goal_id, step_id)
-        if result["status"] != "ok":
-            return result
-        result = self._call_request_replay(request_id, goal_id, step_id)
-        if result["status"] != "ok":
-            return result
-        ready = self._wait_until_ready("pick")
-        if not ready:
-            result["status"] = "error"
-            result["error_code"] = "PICK_NOT_READY"
-            result["message"] = "robot did not reach ready state after pick"
-            return result
-
-        # ── 搬起后：FP 验证地上还有箱子吗？ ──
-        if self._expected_slot_xy is not None:
-            verify = post_pick_verify(
-                get_fp_state=lambda: self.get_fp_state(),
-                get_odom=lambda: self._estimated_odom(),
-                expected_slot_xy=self._expected_slot_xy,
-            )
-            if verify["status"] == "PICK_FAILED":
-                result = self._error_result(
-                    "PICK_FAILED",
-                    verify["detail"],
-                    request_id, goal_id, step_id,
-                )
-                if verify.get("current_obj_pose"):
-                    result["replan_target"] = {
-                        "x": verify["current_obj_pose"][0],
-                        "y": verify["current_obj_pose"][1],
-                        "z": 0.0,
-                        "theta": verify["current_obj_pose"][2],
-                    }
+        try:
+            # ★ 新 C++ gateway: 一步完成 motion1（替代 set_lift + request_replay）
+            # /submit_carry_task 接收单物体位姿 (torso_link)，
+            # gateway 自动选择 center/right/left/front 并执行搬起动捕
+            result = self._call_submit_carry_task(request_id, goal_id, step_id)
+            if result["status"] != "ok":
                 return result
-            elif verify["status"] == "FP_UNAVAILABLE":
-                return self._error_result(
-                    "FP_UNAVAILABLE",
-                    verify["detail"],
-                    request_id, goal_id, step_id,
-                )
+            ready = self._wait_until_ready("carry")
+            if not ready:
+                result["status"] = "error"
+                result["error_code"] = "PICK_NOT_READY"
+                result["message"] = "robot did not reach ready state after pick"
+                return result
 
-        return result
+            return result
+        finally:
+            self._cleanup_select_target(step_id)
 
     def _place_sequence(self, request_id, goal_id, step_id):
         self._box_released = False
@@ -736,8 +1205,7 @@ class RosAcceptanceAdapter:
                                       "robot did not reach ready state after place",
                                       request_id, goal_id, step_id)
 
-        # ── 放置后：FP 验证目标格子有箱子吗？ ──
-        result = {
+        return {
             "status": "ok",
             "error_code": None,
             "message": "placed",
@@ -747,25 +1215,94 @@ class RosAcceptanceAdapter:
             "goal_id": goal_id,
             "step_id": step_id,
         }
-        if self._expected_grid_xy is not None:
-            verify = post_place_verify(
-                get_fp_state=lambda: self.get_fp_state(),
-                get_odom=lambda: self._estimated_odom(),
-                expected_grid_xy=self._expected_grid_xy,
-            )
-            if verify["status"] == "PLACE_FAILED":
-                return self._error_result(
-                    "PLACE_FAILED",
-                    verify["detail"],
-                    request_id, goal_id, step_id,
-                )
-            elif verify["status"] == "FP_UNAVAILABLE":
-                return self._error_result(
-                    "FP_UNAVAILABLE",
-                    verify["detail"],
-                    request_id, goal_id, step_id,
-                )
-        return result
+
+    def _call_submit_carry_task(self, request_id, goal_id, step_id):
+        """将缓存的单物体位姿提交给 C++ gateway 的 /submit_carry_task 服务。
+
+        替代旧的两步调用 (_call_set_lift + _call_request_replay)。
+        前提: 用户已通过 SelectTarget 进入单目标模式，
+              FP 正在发布 /foundationpose/pose_result (torso_link 帧)。
+
+        返回: {"status": "ok"/"error", ...}
+        """
+        if not _HAS_SUBMIT_CARRY:
+            return self._error_result(
+                "NOT_AVAILABLE",
+                "gear_sonic_interfaces 未安装，无法调用 /submit_carry_task",
+                request_id, goal_id, step_id)
+
+        pose_est = self._latest_pose_result
+        if pose_est is None:
+            return self._error_result(
+                "NO_POSE", "没有可用的单物体位姿 (pose_result 为空)",
+                request_id, goal_id, step_id)
+        if pose_est.state < 1:  # STATE_PAUSED(0) 不可用，IDLE(1) 及以上都接受
+            return self._error_result(
+                "POSE_NOT_READY",
+                f"pose_result 状态不可用 (当前 state={pose_est.state})",
+                request_id, goal_id, step_id)
+
+        # 懒初始化客户端
+        if self._submit_carry_client is None:
+            self._submit_carry_client = self._node.create_client(
+                SubmitCarryTask, '/submit_carry_task')
+        if not self._submit_carry_client.wait_for_service(timeout_sec=3.0):
+            return self._error_result(
+                "SERVICE_UNAVAILABLE",
+                "/submit_carry_task 不可用 (gateway 是否已启动?)",
+                request_id, goal_id, step_id)
+
+        req = SubmitCarryTask.Request()
+        req.request_id = f"{request_id}-{step_id}"
+        req.command = "carry"
+        req.object_pose.header = pose_est.header
+        req.object_pose.header.frame_id = "torso"  # gateway 要求 frame_id="torso"，FP 输出 "torso_link" 是同一刚体不同命名，写死覆写
+        req.object_pose.pose = pose_est.pose       # position + orientation
+
+        print(f"\n  [ros] >>> /submit_carry_task  "
+              f"x={req.object_pose.pose.position.x:.3f}  "
+              f"y={req.object_pose.pose.position.y:.3f}  "
+              f"z={req.object_pose.pose.position.z:.3f}  "
+              f"frame_id={req.object_pose.header.frame_id}", flush=True)
+
+        future = self._submit_carry_client.call_async(req)
+        ok = self._wait_future(future, timeout_sec=10.0)
+        if not ok:
+            print(f"  [ros] <<< /submit_carry_task TIMEOUT", flush=True)
+            return self._error_result(
+                "TIMEOUT", "/submit_carry_task 超时 (10s)",
+                request_id, goal_id, step_id)
+        resp = future.result()
+
+        if resp is None:
+            return self._error_result(
+                "TIMEOUT", "/submit_carry_task 超时 (10s)",
+                request_id, goal_id, step_id)
+        if not resp.accepted:
+            print(f"  [ros] <<< /submit_carry_task accepted=False  "
+                  f"message={resp.message[:80] if resp.message else ''}", flush=True)
+            return self._error_result(
+                "CARRY_REJECTED",
+                f"gateway 拒绝: {resp.message}",
+                request_id, goal_id, step_id)
+
+        print(f"  [ros] <<< /submit_carry_task accepted=True  "
+              f"action={resp.selected_action}  "
+              f"dist={resp.distance:.3f}m  yaw={resp.yaw_deg:.1f}°", flush=True)
+        logger.info(
+            "submit_carry_task accepted: request_id=%s action=%s "
+            "dist=%.3fm yaw=%.1f° → %s",
+            req.request_id, resp.selected_action,
+            resp.distance, resp.yaw_deg, resp.message)
+        return {
+            "status": "ok",
+            "message": resp.message,
+            "selected_action": resp.selected_action,
+            "distance": resp.distance,
+            "yaw_deg": resp.yaw_deg,
+            "target_x": resp.target_x,
+            "target_y": resp.target_y,
+        }
 
     def _call_set_lift(self, request_id, goal_id, step_id):
         t0 = time.time()
@@ -974,3 +1511,20 @@ class RosAcceptanceAdapter:
             self.shutdown()
         except Exception:
             pass
+
+
+# ═══════════════════════════════════════════════════════════════
+# 模块级工具
+# ═══════════════════════════════════════════════════════════════
+
+
+def _summarize_args(tool: str, args: dict[str, Any]) -> str:
+    """提取步骤参数摘要，供诊断事件的 step_start 使用。"""
+    if tool == "move_to":
+        t = args.get("target", {})
+        return f"move_to({t.get('x', '?')}, {t.get('y', '?')})"
+    if tool == "pick":
+        return f"pick({args.get('object_id', '?')})"
+    if tool == "place":
+        return f"place({args.get('x', '?')}, {args.get('y', '?')})"
+    return tool

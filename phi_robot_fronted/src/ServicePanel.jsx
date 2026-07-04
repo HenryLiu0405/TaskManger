@@ -1,10 +1,11 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Tag, Button, Card, Space, Tooltip } from 'antd';
 import {
   ReloadOutlined,
   PlayCircleOutlined,
   PauseCircleOutlined,
   SyncOutlined,
+  CameraOutlined,
 } from '@ant-design/icons';
 
 const API = '/api/services';
@@ -13,6 +14,8 @@ export default function ServicePanel() {
   const [services, setServices] = useState([]);
   const [summary, setSummary] = useState({ total: 0, online: 0, offline: 0 });
   const [loading, setLoading] = useState({});
+  const [previewSvc, setPreviewSvc] = useState(null); // 当前展开画面预览的服务 id
+  const previewTs = useRef(Date.now());               // 稳定时间戳，避免 MJPEG 重连
 
   // ── 拉取服务状态 ──────────────────────────────────
   const fetchStatus = useCallback(async () => {
@@ -70,68 +73,94 @@ export default function ServicePanel() {
     const canControl = isContainer || isManaged;
     const online = svc.online;
     const busy = loading[svc.id];
+    const hasPreview = svc.id === 'foundationpose'; // FP 有多物体识别画面
+    const showPreview = previewSvc === svc.id;
+    const previewUrl = hasPreview ? `/api/fp/video/rgb/stream?t=${previewTs.current}` : null;
 
     return (
-      <div
-        key={svc.id}
-        className="flex items-center justify-between py-1.5 border-b border-[#1a1a22] last:border-0"
-      >
-        {/* 左侧：状态点 + 名称 */}
-        <div className="flex items-center gap-2 min-w-0">
-          <span
-            className="w-2 h-2 rounded-full shrink-0"
-            style={{ background: online ? '#52c41a' : '#ff4d4f' }}
-            title={online ? 'online' : 'offline'}
-          />
-          <div className="min-w-0">
-            <div className="text-xs font-medium text-white truncate">
-              {svc.label}
+      <div key={svc.id}>
+        <div className="flex items-center justify-between py-1.5 border-b border-[#1a1a22] last:border-0">
+          {/* 左侧：状态点 + 名称 */}
+          <div className="flex items-center gap-2 min-w-0">
+            <span
+              className="w-2 h-2 rounded-full shrink-0"
+              style={{ background: online ? '#52c41a' : '#ff4d4f' }}
+              title={online ? 'online' : 'offline'}
+            />
+            <div className="min-w-0">
+              <div className="text-xs font-medium text-white truncate">
+                {svc.label}
+              </div>
+              <Tag
+                color={online ? 'success' : 'error'}
+                className="text-[10px] leading-none px-1"
+              >
+                {online ? 'ON' : 'OFF'}
+              </Tag>
             </div>
-            <Tag
-              color={online ? 'success' : 'error'}
-              className="text-[10px] leading-none px-1"
-            >
-              {online ? 'ON' : 'OFF'}
-            </Tag>
           </div>
+
+          {/* 右侧：操作按钮 */}
+          <Space size={2}>
+            {hasPreview && online && (
+              <Tooltip title={showPreview ? '隐藏画面' : '查看实时画面'}>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<CameraOutlined />}
+                  onClick={() => setPreviewSvc(showPreview ? null : svc.id)}
+                  style={{ color: showPreview ? '#1677ff' : '#8a8a8a' }}
+                />
+              </Tooltip>
+            )}
+            {canControl && (
+              <>
+                <Tooltip title="启动">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<PlayCircleOutlined />}
+                    loading={busy === 'start'}
+                    onClick={() => action(svc.id, 'start')}
+                    disabled={online}
+                    style={{ color: online ? '#555' : '#52c41a' }}
+                  />
+                </Tooltip>
+                <Tooltip title="停止">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<PauseCircleOutlined />}
+                    loading={busy === 'stop'}
+                    onClick={() => action(svc.id, 'stop')}
+                    disabled={!online}
+                    style={{ color: online ? '#ff4d4f' : '#555' }}
+                  />
+                </Tooltip>
+                <Tooltip title="重启">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<SyncOutlined />}
+                    loading={busy === 'restart'}
+                    onClick={() => action(svc.id, 'restart')}
+                    disabled={!online}
+                  />
+                </Tooltip>
+              </>
+            )}
+          </Space>
         </div>
 
-        {/* 右侧：操作按钮（容器服务 或 systemd 管理） */}
-        {canControl && (
-          <Space size={2}>
-            <Tooltip title="启动">
-              <Button
-                type="text"
-                size="small"
-                icon={<PlayCircleOutlined />}
-                loading={busy === 'start'}
-                onClick={() => action(svc.id, 'start')}
-                disabled={online}
-                style={{ color: online ? '#555' : '#52c41a' }}
-              />
-            </Tooltip>
-            <Tooltip title="停止">
-              <Button
-                type="text"
-                size="small"
-                icon={<PauseCircleOutlined />}
-                loading={busy === 'stop'}
-                onClick={() => action(svc.id, 'stop')}
-                disabled={!online}
-                style={{ color: online ? '#ff4d4f' : '#555' }}
-              />
-            </Tooltip>
-            <Tooltip title="重启">
-              <Button
-                type="text"
-                size="small"
-                icon={<SyncOutlined />}
-                loading={busy === 'restart'}
-                onClick={() => action(svc.id, 'restart')}
-                disabled={!online}
-              />
-            </Tooltip>
-          </Space>
+        {/* 内嵌实时画面 */}
+        {showPreview && (
+          <div className="mb-1 px-1">
+            <img
+              src={previewUrl}
+              alt={`${svc.label} 实时画面`}
+              style={{ width: '100%', borderRadius: 4, background: '#1a1a1a' }}
+            />
+          </div>
         )}
       </div>
     );

@@ -18,6 +18,7 @@ cd "$PROJECT_DIR"
 # ── ROS2 环境 ────────────────────────────────────────────
 source /opt/ros/jazzy/setup.bash
 source "$PROJECT_DIR/install/setup.bash"
+source /home/hairo/waic/gear_sonic_client_ws/install/setup.bash  # SubmitCarryTask 接口
 
 # ── DDS 配置（三方约定） ─────────────────────────────────
 export ROS_DOMAIN_ID=66

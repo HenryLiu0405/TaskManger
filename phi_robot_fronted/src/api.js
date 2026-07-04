@@ -273,6 +273,34 @@ class PhiRobotAPIClient {
   _generateId() {
     return Math.random().toString(36).substr(2, 8);
   }
+
+  /**
+   * 查询 SONIC 输入源
+   * @returns {Promise<{active_source: string}>}
+   */
+  async getSonicInputSource() {
+    const response = await fetch(`${this.baseURL}/dev/sonic/input_source`);
+    if (!response.ok) {
+      throw new Error(`Failed to get SONIC input source: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 切换 SONIC 输入源
+   * @param {boolean} gamepad - true=手柄接管, false=ROS2 自动控制
+   */
+  async setSonicInputSource(gamepad) {
+    const response = await fetch(`${this.baseURL}/dev/sonic/input_source`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gamepad }),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to set SONIC input source: ${response.statusText}`);
+    }
+    return response.json();
+  }
 }
 
 export default PhiRobotAPIClient;

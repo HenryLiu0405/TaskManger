@@ -98,6 +98,21 @@ function LockBoard2D({
   const showPreview = isDrawing && latestId && mousePos;
   const previewFrom = latestId ? NODE_BY_ID[latestId] : null;
 
+  /* ── Palette (mirrors index.css :root) ── */
+  const C = {
+    idleDotFill: 'rgba(8,12,20,0.85)',
+    idleDotStroke: 'rgba(64,110,142,0.45)',
+    hoverDotFill: 'rgba(0,229,255,0.06)',
+    hoverDotStroke: 'rgba(0,229,255,0.55)',
+    lockedDotFill: 'rgba(0,229,255,0.12)',
+    lockedDotStroke: '#00e5ff',
+    idleLabel: 'rgba(255,255,255,0.12)',
+    lockedLabel: '#ffffff',
+    connectionLine: 'rgba(0,229,255,0.45)',
+    previewLine: 'rgba(0,229,255,0.35)',
+    gridDot: 'rgba(64,110,142,0.2)',
+  };
+
   return (
     <div
       className={`lock-board${isDrawing ? ' lock-board--drawing' : ''}${isRunning ? ' lock-board--running' : ''}${className ? ` ${className}` : ''}`}
@@ -111,10 +126,10 @@ function LockBoard2D({
         onPointerLeave={handleSvgUp}
       >
         {/* Subtle grid guide */}
-        <g opacity="0.12">
+        <g opacity="1">
           {[21, 50, 79].map((cy) =>
             [21, 50, 79].map((cx) => (
-              <circle key={`g${cx}-${cy}`} cx={cx} cy={cy} r="0.9" fill="#d0d4d8" />
+              <circle key={`g${cx}-${cy}`} cx={cx} cy={cy} r="0.6" fill={C.gridDot} />
             )),
           )}
         </g>
@@ -127,10 +142,9 @@ function LockBoard2D({
             y1={from.y}
             x2={to.x}
             y2={to.y}
-            stroke="#4682B4"
-            strokeWidth="1.5"
+            stroke={C.connectionLine}
+            strokeWidth="2"
             strokeLinecap="round"
-            opacity="0.85"
           />
         ))}
 
@@ -141,11 +155,10 @@ function LockBoard2D({
             y1={previewFrom.y}
             x2={mousePos.x}
             y2={mousePos.y}
-            stroke="#87CEEB"
-            strokeWidth="1.5"
+            stroke={C.previewLine}
+            strokeWidth="2"
             strokeLinecap="round"
-            strokeDasharray="2 3"
-            opacity="0.45"
+            strokeDasharray="2 4"
           />
         )}
 
@@ -155,17 +168,11 @@ function LockBoard2D({
           const latest = n.id === latestId;
           const hovered = hoveredId === n.id && !locked;
 
-          // Outer ring
-          const ringR = locked ? 10 : hovered ? 10 : 8;
-          const ringStroke = locked ? '#00CC00' : hovered ? '#87CEEB' : '#4682B4';
-          const ringOpacity = locked ? 0.28 : hovered ? 0.45 : 0.12;
-          const ringWidth = locked ? 1.8 : hovered ? 1.8 : 1;
-
           // Main dot
           const dotR = locked ? NODE_R : hovered ? NODE_R + 1 : NODE_R;
-          const dotFill = locked ? '#00CC00' : hovered ? '#e8f2fa' : '#ffffff';
-          const dotStroke = locked ? '#00CC00' : hovered ? '#87CEEB' : '#4682B4';
-          const dotSw = locked ? 2.2 : hovered ? 2.2 : 1.8;
+          const dotFill = locked ? C.lockedDotFill : hovered ? C.hoverDotFill : C.idleDotFill;
+          const dotStroke = locked ? C.lockedDotStroke : hovered ? C.hoverDotStroke : C.idleDotStroke;
+          const dotSw = locked ? 2.5 : hovered ? 2 : 2;
 
           return (
             <g key={n.id}>
@@ -175,25 +182,13 @@ function LockBoard2D({
                 cy={n.y}
                 r={12}
                 fill="transparent"
-                style={{ cursor: isRunning ? 'default' : 'pointer' }}
+                style={{ cursor: isRunning ? 'default' : 'crosshair' }}
                 onPointerDown={(e) => {
                   e.stopPropagation();
                   handleNodeDown(n.id);
                 }}
                 onPointerEnter={() => handleNodeEnter(n.id)}
                 onPointerLeave={handleNodeLeave}
-              />
-              {/* Glow ring */}
-              <circle
-                cx={n.x}
-                cy={n.y}
-                r={ringR}
-                fill="none"
-                stroke={ringStroke}
-                strokeWidth={ringWidth}
-                opacity={ringOpacity}
-                className={latest ? 'lock-board__node--latest' : ''}
-                style={{ pointerEvents: 'none' }}
               />
               {/* Main dot */}
               <circle
@@ -211,10 +206,10 @@ function LockBoard2D({
                 y={n.y}
                 textAnchor="middle"
                 dominantBaseline="central"
-                fill={locked ? '#fff' : '#2F4F4F'}
+                fill={locked ? C.lockedLabel : C.idleLabel}
                 fontSize="5.5"
-                fontWeight="700"
-                fontFamily="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+                fontWeight="400"
+                fontFamily="Helvetica Neue, Arial, sans-serif"
                 style={{ pointerEvents: 'none', userSelect: 'none' }}
               >
                 {n.id}

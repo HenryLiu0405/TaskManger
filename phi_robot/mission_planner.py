@@ -4,10 +4,72 @@ phi_robot 任务规划生成器
 """
 
 from __future__ import annotations
+import math
 from typing import List, Dict, Any, Tuple
 from .models import PlanStep, GridCell, StockSlot
-from .recovery.coordinate_transform import real_to_nav2
-from .recovery.approach_calculator import compute_approach
+
+
+# ── 坐标变换 ──────────────────────────────────────────────────────────
+# 真实场地坐标系 → Nav2 map 坐标系（仿射变换，由四个角点标定确定）
+#   真实            →   Nav2 map
+#   (0, 3)   左上   →   (-0.46, -2.30)
+#   (0, 0)   左下   →   (-0.63,  0.67)
+#   (5, 3)   右上   →   ( 4.54, -2.30)
+#   (5, 0)   右下   →   ( 4.37,  0.67)
+
+
+def real_to_nav2(x: float, y: float) -> tuple[float, float]:
+    """真实场地坐标 (米) → Nav2 map 坐标 (米)"""
+    nav2_x = 1.0 * x + 0.0567 * y - 0.63
+    nav2_y = 0.0 * x - 0.99 * y + 0.67
+    return (nav2_x, nav2_y)
+
+
+# ── approach 点计算 ────────────────────────────────────────────────────
+# Nav2 地图边界（由四个角点标定确定）
+_MAP_X_MIN = -0.7
+_MAP_X_MAX = 4.6
+_MAP_Y_MIN = -2.4
+_MAP_Y_MAX = 0.7
+
+
+def compute_approach(
+    obj_nav2: tuple[float, float, float],
+    offset: float = 0.1,
+) -> tuple[float, float, float]:
+    """
+    从物体在 Nav2 map 系下的位姿，计算机器人接近位姿。
+
+    机器人停在物体前方 offset 米处，朝向 +Y（π/2），
+    为搬起/放下动作留出操作距离。
+
+    Args:
+        obj_nav2: 物体在 Nav2 map 系下的 (x, y, yaw)，yaw 为弧度
+        offset: 机器人停在物体前方的距离（米），默认 0.1
+
+    Returns:
+        (app_x, app_y, app_yaw) — Nav2 map 系下的接近位姿
+
+    Raises:
+        ValueError: 如果接近点超出地图边界
+    """
+    ox, oy, oyaw = obj_nav2
+    _ = oyaw  # 保留参数兼容性；朝向统一用 π/2
+
+    app_yaw = math.pi / 2   # 机器人最终朝向 y 轴正方向
+    app_x = ox - offset * math.cos(app_yaw)
+    app_y = oy - offset * math.sin(app_yaw)
+
+    if not (_MAP_X_MIN <= app_x <= _MAP_X_MAX):
+        raise ValueError(
+            f"approach x={app_x:.2f} out of map bounds [{_MAP_X_MIN}, {_MAP_X_MAX}]"
+        )
+    if not (_MAP_Y_MIN <= app_y <= _MAP_Y_MAX):
+        raise ValueError(
+            f"approach y={app_y:.2f} out of map bounds [{_MAP_Y_MIN}, {_MAP_Y_MAX}]"
+        )
+
+    return (app_x, app_y, app_yaw)
 
 
 # 九宫格编号到坐标的映射（单位：米，真实场地坐标系）
@@ -125,7 +187,7 @@ class MissionPlanner:
             nav2_x, nav2_y = real_to_nav2(stock_slot.x, stock_slot.y)
             try:
                 app_x, app_y, app_yaw = compute_approach(
-                    (nav2_x, nav2_y, 0.0), offset=0.25
+                    (nav2_x, nav2_y, 0.0), offset=0.6
                 )
             except ValueError as e:
                 raise ValueError(
@@ -142,6 +204,8 @@ class MissionPlanner:
                         "timeout_s": 30,
                         "request_id": request_id,
                         "goal_id": goal_id,
+                        "slot_nav2_x": nav2_x,    # 物料点在 Nav2 map 系的坐标
+                        "slot_nav2_y": nav2_y,    # 供 FP 验证钩子使用
                     },
                     status="pending",
                 )
@@ -163,28 +227,22 @@ class MissionPlanner:
                 )
             )
 
-            # 第 3 步: 移动到目标放置位 approach 点
+            # 第 3 步: 移动到目标放置位（直接到格子，不需要 approach offset）
             goal_cell = grid_cells[destination_position]
             nav2_gx, nav2_gy = real_to_nav2(goal_cell.x, goal_cell.y)
-            try:
-                place_x, place_y, place_yaw = compute_approach(
-                    (nav2_gx, nav2_gy, 0.0), offset=0.25
-                )
-            except ValueError as e:
-                raise ValueError(
-                    f"grid {goal_cell.name} approach 点越界: {e}"
-                ) from e
             plan.append(
                 PlanStep(
                     step_id=self._next_step_id(),
                     task_index=task_index,
                     tool="move_to",
                     args={
-                        "target": {"x": place_x, "y": place_y, "z": goal_cell.z, "theta": place_yaw},
+                        "target": {"x": nav2_gx, "y": nav2_gy, "z": goal_cell.z, "theta": math.pi / 2},
                         "action": "start",
                         "timeout_s": 30,
                         "request_id": request_id,
                         "goal_id": goal_id,
+                        "grid_nav2_x": nav2_gx,
+                        "grid_nav2_y": nav2_gy,
                     },
                     status="pending",
                 )

@@ -101,9 +101,14 @@ if __name__ == "__main__":
         default=None,
         help="服务注册表 JSON 路径 (启用 ServiceManager)",
     )
+    parser.add_argument(
+        "--bypass-safety",
+        action="store_true",
+        default=False,
+        help="绕过安全状态机，允许自由调用 move_to/pick/place 不限顺序",
+    )
 
     args = parser.parse_args()
-
     adapter = None
     if args.acceptance == "http":
         if not args.move_to_url:
@@ -124,7 +129,7 @@ if __name__ == "__main__":
             request_replay_service=args.request_replay_service,
             notify_goal_reached_service=args.notify_goal_reached_service,
         )
-        print(f"ROS2 验收模式:")
+        print("ROS2 验收模式:")
         print(f"  路径规划: {args.path_plan_service}")
         print(f"  搬起(lift): {args.lift_service}")
         print(f"  放下(lay_down): {args.lay_down_service}")
@@ -161,6 +166,12 @@ if __name__ == "__main__":
         )
         print(f"ServiceManager: compose={args.compose_file}")
         print(f"  registry={args.service_registry}")
+
+    if args.bypass_safety:
+        from phi_robot.robot_state import safety_fsm
+        safety_fsm.set_bypass(True)
+        print("⚠ 安全旁路已启用 — 所有 can_walk/can_pick/can_place 强制返回 true")
+        print("  可通过 POST /api/robot/safety/bypass {\"bypass\": false} 恢复")
 
     server = PhiRobotAPIServer(
         host=args.host, port=args.port, adapter=adapter,

@@ -22,6 +22,7 @@ from .mission_runner import MissionRunner, MissionExecutionHook
 from .mission_event_hub import SyncEventHub
 from .adapters.unitree_sim import UnitreeSimBackend
 from .dev_console import DevConsoleController
+from .step_debug import StepDebugController
 from .robot_state import safety_fsm, RobotState
 from .audit import audit_logger
 
@@ -72,7 +73,7 @@ class APIHook(MissionExecutionHook):
         self._event_hub.publish(self.mission_id, event)
 
     def apply_replan_policy(self, record: Any, result: dict, events: Any = None) -> tuple:
-        """重规划策略 — 根据错误代码分类处理"""
+        """错误处理策略 — 区分 abort / retry / continue"""
         error_code = result.get("error_code", "")
 
         if error_code == "safety_alert":
@@ -82,21 +83,19 @@ class APIHook(MissionExecutionHook):
                 "message": "Safety alert triggered, aborting mission"
             })
             return ("abort", None)
-        elif error_code in ("GRIP_FAIL", "TIMEOUT", "PATH_PLAN_FAILED",
-                            "LIFT_FAILED", "LAY_DOWN_FAILED", "NOTIFY_GOAL_FAILED",
-                            "REPLAY_FAILED", "FP_UNAVAILABLE"):
-            return ("retry", None)
-        elif error_code in ("NOT_REACHABLE", "OBSTRUCTED",
-                            "POSITION_DEVIATION", "GRASP_NOT_FEASIBLE",
-                            "PICK_FAILED", "PLACE_FAILED", "FP_LOST"):
-            return ("replan", None)
-        elif error_code == "FP_NOT_VISIBLE":
-            return ("retry", None)       # retry with scan_to_find in ros_acceptance
-        elif error_code == "INVALID_ARGS":
-            return ("abort", None)       # 配置错误，不可恢复
-        elif error_code == "PRECONDITION_FAILED":
-            return ("replan", None)      # 仿真状态不一致，走有限重规划，避免无限重试卡死
 
+        # 致命错误 → 中止
+        if error_code in ("NOT_REACHABLE", "OBSTRUCTED", "INVALID_ARGS"):
+            return ("abort", None)
+        # 可重试的瞬态错误
+        if error_code in ("GRIP_FAIL", "TIMEOUT", "PATH_PLAN_FAILED",
+                          "LIFT_FAILED", "LAY_DOWN_FAILED",
+                          "NOTIFY_GOAL_FAILED", "REPLAY_FAILED",
+                          "FP_UNAVAILABLE", "FP_NOT_VISIBLE",
+                          "PICK_NOT_READY", "PLACE_NOT_READY",
+                          "REPLAY_NOT_DONE", "PATH_PLAN_NOT_READY"):
+            return ("retry", None)
+        # 其他错误 → 继续下一步
         return ("continue", None)
 
 
@@ -122,6 +121,7 @@ class PhiRobotAPIServer:
         self._cancel_events: Dict[str, threading.Event] = {}
         self.event_hub = SyncEventHub(self.service.store)
         self.dev_console = DevConsoleController(self.adapter, mission_service=self.service)
+        self.step_debug = StepDebugController(self.adapter, mission_service=self.service)
         self.service_manager = service_manager
 
         self._setup_routes()
@@ -429,7 +429,58 @@ class PhiRobotAPIServer:
                 "can_walk": safety_fsm.can_walk(),
                 "can_pick": safety_fsm.can_pick(),
                 "can_place": safety_fsm.can_place(),
+                "bypass": safety_fsm.bypass,
+                "sonic_input_source": (
+                    self.adapter.get_sonic_input_source()
+                    if hasattr(self.adapter, "get_sonic_input_source") else "unknown"
+                ),
             })
+
+        @self.app.route("/api/robot/safety/bypass", methods=["POST"])
+        def set_safety_bypass():
+            """运行时开关：启用/禁用安全状态机旁路。
+
+            请求体: {"bypass": true} → 跳过所有安全检查，自由调用 move_to/pick/place
+                    {"bypass": false} → 恢复正常安全校验
+            """
+            data = request.json or {}
+            enabled = bool(data.get("bypass", False))
+            safety_fsm.set_bypass(enabled)
+            logger.warning("API: 安全旁路 %s", "启用" if enabled else "关闭")
+            return jsonify({
+                "ok": True,
+                "bypass": enabled,
+                "message": "安全旁路已{} — 所有 can_walk/can_pick/can_place 强制返回 true".format(
+                    "启用" if enabled else "关闭"
+                ),
+            })
+
+        # ── SONIC 输入源切换 ──────────────────────────────
+
+        @self.app.route("/api/dev/sonic/input_source", methods=["GET"])
+        def get_sonic_input_source():
+            """查询当前 SONIC 输入源: "ROS2" | "GAMEPAD" | "unknown" """
+            source = "unknown"
+            if hasattr(self.adapter, "get_sonic_input_source"):
+                source = self.adapter.get_sonic_input_source()
+            return jsonify({"active_source": source})
+
+        @self.app.route("/api/dev/sonic/input_source", methods=["POST"])
+        def set_sonic_input_source():
+            """切换 SONIC 输入源。
+
+            请求体: {"gamepad": true}  → 手柄接管 (GAMEPAD)
+                    {"gamepad": false} → ROS2 自动控制
+            """
+            data = request.json or {}
+            gamepad = bool(data.get("gamepad", False))
+            if hasattr(self.adapter, "set_sonic_input_source"):
+                result = self.adapter.set_sonic_input_source(gamepad)
+                logger.warning("API: SONIC 输入源 → %s (ok=%s)",
+                              "GAMEPAD" if gamepad else "ROS2", result.get("ok"))
+                return jsonify(result)
+            return jsonify({"ok": False, "message": "适配器不支持 SONIC 输入源切换",
+                           "active_source": "unknown"})
 
         # ── 调试控制台 API ────────────────────────────────
 
@@ -544,6 +595,255 @@ class PhiRobotAPIServer:
             result = self.dev_console.auto_stop()
             return jsonify(result)
 
+        # ── 分步调试 API ────────────────────────────────
+
+        @self.app.route("/api/dev/step_debug/load", methods=["POST"])
+        def step_debug_load():
+            """加载 mission plan → 返回步骤列表"""
+            data = request.json or {}
+            destinations = data.get("destinations", [])
+            if not destinations:
+                return jsonify({"ok": False, "message": "destinations 不能为空"}), 400
+            result = self.step_debug.load_plan(destinations)
+            return jsonify(result)
+
+        @self.app.route("/api/dev/step_debug/execute", methods=["POST"])
+        def step_debug_execute():
+            """异步执行当前步骤，立即返回 started"""
+            result = self.step_debug.execute_current_step()
+            return jsonify(result)
+
+        @self.app.route("/api/dev/step_debug/retry", methods=["POST"])
+        def step_debug_retry():
+            """重试当前步骤"""
+            result = self.step_debug.retry_step()
+            return jsonify(result)
+
+        @self.app.route("/api/dev/step_debug/skip", methods=["POST"])
+        def step_debug_skip():
+            """跳过当前步骤（仅 STEP_READY / STEP_DONE）"""
+            result = self.step_debug.skip_step()
+            return jsonify(result)
+
+        @self.app.route("/api/dev/step_debug/force_skip", methods=["POST"])
+        def step_debug_force_skip():
+            """强制跳过（含失败步）"""
+            result = self.step_debug.force_skip()
+            return jsonify(result)
+
+        @self.app.route("/api/dev/step_debug/pause", methods=["POST"])
+        def step_debug_pause():
+            """暂停正在执行的步骤"""
+            result = self.step_debug.pause_execution()
+            return jsonify(result)
+
+        @self.app.route("/api/dev/step_debug/resume", methods=["POST"])
+        def step_debug_resume():
+            """恢复暂停的步骤"""
+            result = self.step_debug.resume_execution()
+            return jsonify(result)
+
+        @self.app.route("/api/dev/step_debug/abort", methods=["POST"])
+        def step_debug_abort():
+            """终止调试会话"""
+            result = self.step_debug.abort()
+            return jsonify(result)
+
+        @self.app.route("/api/dev/step_debug/select_target_toggle", methods=["POST"])
+        def step_debug_select_target_toggle():
+            """切换 FoundationPose 单目标模式"""
+            result = self.step_debug.toggle_select_target()
+            return jsonify(result)
+
+        @self.app.route("/api/dev/step_debug/reset_fp", methods=["POST"])
+        def step_debug_reset_fp():
+            """FoundationPose 重新标定物体"""
+            try:
+                if hasattr(self.adapter, "call_reset_fp"):
+                    result = self.adapter.call_reset_fp()
+                    if result is None:
+                        return jsonify({"ok": False, "message": "Reset 服务不可用或超时"})
+                    return jsonify({"ok": result.get("success", False),
+                                    "message": result.get("message", "")})
+                return jsonify({"ok": False, "message": "适配器不支持"})
+            except Exception as e:
+                logger.exception("reset_fp 失败")
+                return jsonify({"ok": False, "message": str(e)})
+
+        # ── 掉箱处理（手动重规划） ──
+
+        @self.app.route("/api/dev/step_debug/drop_detector/enable", methods=["POST"])
+        def step_debug_drop_detector_enable():
+            """开启掉箱检测"""
+            try:
+                result = self.step_debug.enable_drop_detector()
+                return jsonify(result)
+            except Exception as e:
+                logger.exception("drop_detector enable 失败")
+                return jsonify({"ok": False, "message": str(e)})
+
+        @self.app.route("/api/dev/step_debug/drop_detector/disable", methods=["POST"])
+        def step_debug_drop_detector_disable():
+            """关闭掉箱检测"""
+            try:
+                result = self.step_debug.disable_drop_detector()
+                return jsonify(result)
+            except Exception as e:
+                logger.exception("drop_detector disable 失败")
+                return jsonify({"ok": False, "message": str(e)})
+
+        @self.app.route("/api/dev/step_debug/robot/pause", methods=["POST"])
+        def step_debug_pause_robot():
+            """暂停机器人导航"""
+            try:
+                result = self.step_debug.pause_robot()
+                return jsonify(result)
+            except Exception as e:
+                logger.exception("pause_robot 失败")
+                return jsonify({"ok": False, "message": str(e)})
+
+        @self.app.route("/api/dev/step_debug/robot/stand", methods=["POST"])
+        def step_debug_stand_robot():
+            """切换机器人站立模式"""
+            try:
+                result = self.step_debug.stand_robot()
+                return jsonify(result)
+            except Exception as e:
+                logger.exception("stand_robot 失败")
+                return jsonify({"ok": False, "message": str(e)})
+
+        @self.app.route("/api/dev/step_debug/dropped/identify", methods=["POST"])
+        def step_debug_identify_dropped():
+            """识别掉落箱子（FP MODE_DROPPED）"""
+            try:
+                result = self.step_debug.identify_dropped_box()
+                return jsonify(result)
+            except Exception as e:
+                logger.exception("identify_dropped 失败")
+                return jsonify({"ok": False, "message": str(e)})
+
+        @self.app.route("/api/dev/step_debug/dropped/replan_pick", methods=["POST"])
+        def step_debug_replan_pick():
+            """执行重规划搬起"""
+            try:
+                result = self.step_debug.replan_pick()
+                return jsonify(result)
+            except Exception as e:
+                logger.exception("replan_pick 失败")
+                return jsonify({"ok": False, "message": str(e)})
+
+        @self.app.route("/api/dev/step_debug/pose_snapshot", methods=["GET"])
+        def step_debug_pose_snapshot():
+            """返回缓存的单物体位姿 (torso_link 帧)，供前端确认数据正确后再执行 pick"""
+            try:
+                if not hasattr(self.adapter, '_latest_pose_result'):
+                    return jsonify({"ok": False, "message": "适配器不支持"})
+                pose = self.adapter._latest_pose_result
+                if pose is None or getattr(pose, 'state', 0) != 2:
+                    return jsonify({"ok": True, "has_pose": False})
+                import math
+                x = pose.pose.position.x
+                y = pose.pose.position.y
+                z = pose.pose.position.z
+                yaw_deg = round(math.degrees(math.atan2(y, x)), 1)
+                dist = round(math.sqrt(x * x + y * y), 3)
+                return jsonify({
+                    "ok": True,
+                    "has_pose": True,
+                    "x": x, "y": y, "z": z,
+                    "yaw_deg": yaw_deg,
+                    "distance": dist,
+                    "frame_id": pose.header.frame_id,
+                    "tracking_frames": getattr(pose, 'tracking_frames', 0),
+                })
+            except Exception as e:
+                logger.exception("pose_snapshot 失败")
+                return jsonify({"ok": False, "message": str(e)})
+
+        @self.app.route("/api/dev/step_debug/state", methods=["GET"])
+        def step_debug_state():
+            """同步快照：plan + current_index + diag_events + step_logs + odom"""
+            state = self.step_debug.get_state()
+            # 附加机器人安全状态 + 里程计
+            state["robot_state"] = {
+                "state": safety_fsm.state_value,
+                "can_walk": safety_fsm.can_walk(),
+                "can_pick": safety_fsm.can_pick(),
+                "can_place": safety_fsm.can_place(),
+            }
+            try:
+                if hasattr(self.adapter, "get_odom"):
+                    odom = self.adapter.get_odom()
+                    state["odom"] = {
+                        "x": round(float(odom.get("x", 0)), 3),
+                        "y": round(float(odom.get("y", 0)), 3),
+                        "yaw_deg": round(float(odom.get("yaw_deg", 0)), 1),
+                    }
+            except Exception:
+                state["odom"] = None
+            return jsonify(state)
+
+        @self.app.route("/api/dev/step_debug/stream", methods=["GET"])
+        def step_debug_stream():
+            """SSE 增量推送：diag 事件 + state_change"""
+            import time as _time
+            # None 强制首次循环推送初始状态，避免依赖前端恰好也初始化为 'idle'
+            _last_state = None
+
+            def _json_default(obj):
+                """自定义 JSON encoder：遇到非标准类型时 log warning 再转字符串，
+                避免 silent data corruption（如 tuple 被序列化为 "(1.5, 2.3)"）。"""
+                logger.warning(
+                    "SSE 序列化: 非标准类型 %s，值=%r，已转为字符串。"
+                    "请检查上游代码是否漏了 list() 转换。",
+                    type(obj).__name__, obj,
+                )
+                return str(obj)
+
+            def generate():
+                nonlocal _last_state
+                try:
+                    while True:
+                        # 增量诊断事件
+                        diag_events = self.step_debug.drain_diag_events()
+                        if diag_events:
+                            yield (
+                                "event: diag\n"
+                                "data: " + json.dumps(
+                                    {"type": "diag", "events": diag_events},
+                                    default=_json_default,
+                                ) + "\n\n"
+                            )
+
+                        # 状态变更检测
+                        current = self.step_debug.get_state()
+                        current_state = current.get("state", "")
+                        if current_state != _last_state:
+                            _last_state = current_state
+                            yield (
+                                "event: state\n"
+                                "data: " + json.dumps(
+                                    {
+                                        "type": "state_change",
+                                        "state": current_state,
+                                        "current_index": current.get("current_index"),
+                                        "plan": current.get("plan"),
+                                        "step_logs": current.get("step_logs"),
+                                        "select_target_active": current.get("select_target_active"),
+                                        "nav_reached": current.get("nav_reached"),  # 🆕 Nav2 导航到达状态
+                                    },
+                                    default=_json_default,
+                                ) + "\n\n"
+                            )
+
+                        _time.sleep(0.1)  # 100ms 轮询，保证诊断事件延迟低
+                except GeneratorExit:
+                    logger.debug("step_debug SSE 客户端断开")
+                except Exception:
+                    logger.exception("step_debug SSE 生成器异常")
+
+            return Response(generate(), mimetype="text/event-stream")
+
         # ── 审计日志 API ──────────────────────────────────
 
         @self.app.route("/api/dev/audit/today", methods=["GET"])
@@ -606,8 +906,8 @@ class PhiRobotAPIServer:
         @self.app.route("/api/fp/video/<channel>/stream", methods=["GET"])
         def fp_video_stream(channel: str):
             """MJPEG stream for FP video channels (rgb / depth / mask)."""
-            if channel not in ('rgb', 'depth', 'mask'):
-                return jsonify({'error': 'unknown channel, use rgb/depth/mask'}), 404
+            if channel not in ('rgb', 'depth', 'mask', 'drop'):
+                return jsonify({'error': 'unknown channel, use rgb/depth/mask/drop'}), 404
 
             adapter = self.adapter
             get_frame = getattr(adapter, 'get_fp_video_frame', None)

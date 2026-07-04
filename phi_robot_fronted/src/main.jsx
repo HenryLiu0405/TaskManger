@@ -5,43 +5,23 @@ import { ConfigProvider } from 'antd';
 import App from './App.jsx';
 import './index.css';
 
-const neoTheme = {
+const theme = {
   token: {
-    colorPrimary: "#4682B4",
+    colorPrimary: "#ffffff",
     borderRadius: 0,
-    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-    colorBgBase: "#ffffff",
-    colorTextBase: "#2F4F4F",
-    wireframe: true,
-    colorSuccess: "#00CC00",
-    colorInfo: "#87CEEB",
-  },
-  components: {
-    Button: {
-      borderRadius: 0,
-      controlHeight: 40,
-      defaultBorderColor: "#2F4F4F",
-      defaultColor: "#2F4F4F",
-      primaryColor: "#FFFFFF",
-      contentFontSize: 16,
-      fontWeight: 600,
-    },
-    Input: {
-      borderRadius: 0,
-      colorBorder: "#2F4F4F",
-      activeBorderColor: "#4682B4",
-      hoverBorderColor: "#87CEEB",
-    },
-    Card: {
-      borderRadius: 0,
-      colorBorder: "#2F4F4F",
-    },
+    fontFamily: '"Helvetica Neue", Arial, sans-serif',
+    colorBgBase: "#000000",
+    colorTextBase: "#ffffff",
+    colorSuccess: "rgba(255,255,255,0.7)",
+    colorInfo: "rgba(255,255,255,0.5)",
+    colorWarning: "rgba(255,255,255,0.5)",
+    colorError: "rgba(255,255,255,0.3)",
   },
 };
 
 ReactDOM.createRoot(document.getElementById('app')).render(
   <React.StrictMode>
-    <ConfigProvider theme={neoTheme}>
+    <ConfigProvider theme={theme}>
       <App />
     </ConfigProvider>
   </React.StrictMode>,

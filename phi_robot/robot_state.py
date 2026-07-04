@@ -65,6 +65,26 @@ class SafetyStateMachine:
     def __init__(self) -> None:
         self._state: RobotState = RobotState.STANDING  # 默认站立
         self._lock = threading.Lock()
+        self._bypass: bool = False  # 旁路模式：跳过所有安全检查
+
+    # -- 旁路开关 -------------------------------------------------
+
+    def set_bypass(self, enabled: bool) -> None:
+        """启用/禁用旁路模式。
+
+        True  → 所有 can_walk/can_pick/can_place 返回 True，
+                transition() 直接迁移不校验白名单。
+        False → 恢复正常安全检查（默认）。
+        """
+        with self._lock:
+            self._bypass = enabled
+            logger.warning("SafetyStateMachine: 旁路模式 %s — 所有安全检查%s",
+                           "启用" if enabled else "关闭",
+                           "已跳过" if enabled else "已恢复")
+
+    @property
+    def bypass(self) -> bool:
+        return self._bypass
 
     # -- 只读 ----------------------------------------------------
 
@@ -78,23 +98,31 @@ class SafetyStateMachine:
 
     def can_transition(self, target: RobotState) -> bool:
         """检查是否可以迁移到 target 状态."""
+        if self._bypass:
+            return True
         with self._lock:
             return target in ALLOWED_TRANSITIONS.get(self._state, set())
 
     def can_walk(self) -> bool:
         """当前是否允许走路 — 状态迁移表 + 黑名单双重校验."""
+        if self._bypass:
+            return True
         with self._lock:
             return (RobotState.MOVING in ALLOWED_TRANSITIONS.get(self._state, set())
                     and self._state not in NO_WALK_STATES)
 
     def can_pick(self) -> bool:
         """当前是否允许搬起 — 状态迁移表 + 黑名单双重校验."""
+        if self._bypass:
+            return True
         with self._lock:
             return (RobotState.PICKING in ALLOWED_TRANSITIONS.get(self._state, set())
                     and self._state not in NO_PICK_STATES)
 
     def can_place(self) -> bool:
         """当前是否允许放下 — 状态迁移表 + 黑名单双重校验."""
+        if self._bypass:
+            return True
         with self._lock:
             return (RobotState.PLACING in ALLOWED_TRANSITIONS.get(self._state, set())
                     and self._state not in NO_PLACE_STATES)
@@ -104,6 +132,12 @@ class SafetyStateMachine:
     def transition(self, target: RobotState) -> bool:
         """尝试迁移到 target 状态, 返回是否成功."""
         with self._lock:
+            if self._bypass:
+                old = self._state
+                self._state = target
+                logger.info(f"StateMachine(bypass): {old.value} → {target.value}")
+                audit_logger.log_state_change(old.value, target.value)
+                return True
             allowed = ALLOWED_TRANSITIONS.get(self._state, set())
             if target in allowed:
                 old = self._state

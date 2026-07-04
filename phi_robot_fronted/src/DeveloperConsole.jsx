@@ -7,6 +7,7 @@ import ServicePanel from './ServicePanel.jsx';
 import ControlButtons from './ControlButtons.jsx';
 import LogPanel from './LogPanel.jsx';
 import FpVideoPanel from './FpVideoPanel.jsx';
+import StepDebugPanel from './StepDebugPanel.jsx';
 
 const API = '/api/dev';
 
@@ -48,6 +49,8 @@ export default function DeveloperConsole() {
   const [loading, setLoading] = useState(false);
   const [connected, setConnected] = useState(false);
   const [robotState, setRobotState] = useState({ state: 'standing', can_walk: true, can_pick: false, can_place: false });
+  const [sonicSource, setSonicSource] = useState('ROS2');
+  const [sonicLoading, setSonicLoading] = useState(false);
   const [logViewMode, setLogViewMode] = useState('log');  // 'log' | 'camera'
 
   // ── 机器人安全状态轮询 ──────────────────────────
@@ -57,7 +60,10 @@ export default function DeveloperConsole() {
       try {
         const res = await fetch('/api/robot/state');
         const data = await res.json();
-        if (active) setRobotState(data);
+        if (active) {
+          setRobotState(data);
+          if (data.sonic_input_source) setSonicSource(data.sonic_input_source);
+        }
       } catch (_) {}
     }
     poll();
@@ -77,7 +83,7 @@ export default function DeveloperConsole() {
         try {
           const s = JSON.parse(msg.data);
           setState(s);
-          if (s.mode) setMode(s.mode);
+          if (s.mode) setMode((prev) => prev === 'step_debug' ? prev : s.mode);
           if (s.logs) {
             logsRef.current = s.logs;
             setLogs(s.logs);
@@ -139,6 +145,24 @@ export default function DeveloperConsole() {
   function handlePick() { call('/manual/pick'); }
   function handlePlace() { call('/manual/place'); }
 
+  async function toggleSonicSource(gamepad) {
+    setSonicLoading(true);
+    try {
+      const res = await fetch('/api/dev/sonic/input_source', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gamepad }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setSonicSource(data.active_source || (gamepad ? 'GAMEPAD' : 'ROS2'));
+      }
+    } catch (_) {
+    } finally {
+      setSonicLoading(false);
+    }
+  }
+
   function handleAutoStart() {
     if (autoDests.length === 0) return;
     call('/auto/start', { destinations: autoDests });
@@ -174,6 +198,7 @@ export default function DeveloperConsole() {
             onChange={handleModeChange}
             options={[
               { label: '手动模式', value: 'manual' },
+              { label: '分步调试', value: 'step_debug' },
               { label: '自动模式', value: 'auto' },
             ]}
           />
@@ -214,13 +239,22 @@ export default function DeveloperConsole() {
       <div className="flex-1 flex min-h-0">
         {/* 左侧边栏 */}
         <aside className="w-72 shrink-0 border-r border-[#2a2a2a] overflow-y-auto p-3 flex flex-col gap-3" style={{ background: '#0b0b10' }}>
-          <RobotPanel manual={manual} robot={robot} services={services} />
+          <RobotPanel
+            manual={manual} robot={robot} services={services}
+            sonicSource={sonicSource} sonicLoading={sonicLoading}
+            onToggleSonicSource={toggleSonicSource}
+          />
           <BoxPanel box={box} holdingBox={manual?.holding_box} />
           <ServicePanel />
         </aside>
 
         {/* 右侧主区域 */}
         <main className="flex-1 flex flex-col min-h-0 p-3 gap-3">
+          {/* 分步调试模式 — 独立面板 */}
+          {mode === 'step_debug' ? (
+            <StepDebugPanel robotState={robotState} />
+          ) : (
+          <>
           {/* 任务状态 + 预设位置 / 自动模式 */}
           <Card size="small" title="任务状态" className="shrink-0">
             {mode === 'auto' ? (
@@ -402,6 +436,8 @@ export default function DeveloperConsole() {
             <LogPanel logs={displayLogs} onClear={handleClearLogs} />
           ) : (
             <FpVideoPanel />
+          )}
+          </>
           )}
         </main>
       </div>

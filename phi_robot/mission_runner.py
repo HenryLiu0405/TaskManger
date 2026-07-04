@@ -88,8 +88,6 @@ class MissionRunner:
         self._hook = hook
         self._cancel_event = cancel_event
         self._step_callback = step_callback
-        self._replan_counts: dict[int, int] = {}
-        self._max_replans_per_task = 2
 
     async def run(self, mission_id: str) -> MissionRecord:
         """
@@ -217,10 +215,9 @@ class MissionRunner:
                         self._service.mark_step_succeeded(mission_id, result_dict)
                     else:
                         error_code = tool_result.error_code or "UNKNOWN_ERROR"
-                        task_idx = step.task_index
 
-                        # 通过钩子获取重规划策略
-                        action, new_steps = (
+                        # 通过钩子获取错误处理策略
+                        action, _ = (
                             self._hook.apply_replan_policy(record, result_dict)
                             if self._hook
                             else ("continue", None)
@@ -235,23 +232,8 @@ class MissionRunner:
                             self._service.store.update(mission_id, record)
                             break
                         elif action == "retry":
-                            # 同步骤重试，不推进 step_index，不消耗 replan 预算
+                            # 同步骤重试，不推进 step_index
                             continue
-                        elif action == "replan":
-                            current_replans = self._replan_counts.get(task_idx, 0)
-                            if current_replans < self._max_replans_per_task:
-                                self._replan_counts[task_idx] = current_replans + 1
-                                # 如果钩子返回了新步骤（含修正后的 target），替换当前 step
-                                if new_steps:
-                                    record.plan[record.current_step_index] = new_steps[0]
-                                    self._service.store.update(mission_id, record)
-                                # 重规划：不推进步骤，下次迭代重新执行当前步骤
-                                continue
-                            else:
-                                # 预算耗尽，标记失败并继续
-                                self._service.mark_step_failed(
-                                    mission_id, error_code, tool_result.message
-                                )
                         else:
                             # "continue"：标记失败，继续下一步
                             self._service.mark_step_failed(
