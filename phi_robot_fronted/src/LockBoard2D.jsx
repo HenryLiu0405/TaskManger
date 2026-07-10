@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback } from 'react';
+import { useRef, useState, useCallback, useEffect, memo } from 'react';
 
 const NODES = [
   { id: '1', x: 21, y: 21 },
@@ -16,6 +16,82 @@ const NODE_R = 6;
 const HIT_R = 9;
 const NODE_BY_ID = Object.fromEntries(NODES.map((n) => [n.id, n]));
 
+// Moon greyish-white for unconnected nodes; cyan on hover; mint when locked.
+const MOON = '#c7d1e0';
+const MOON_SOFT = '#a9b4c8';
+
+/* One grid node. Memoized so a path append only re-renders the couple of
+   nodes whose state actually changed (new latest / newly locked / hover),
+   not all nine — keeps dragging smooth. Handlers must be stable (they are:
+   useCallback in the parent + useCallback'd props from App). */
+const LockNode = memo(function LockNode({ node, locked, latest, hovered, isRunning, onDown, onEnter, onLeave }) {
+  const ringR = locked || hovered ? 10 : 8;
+  const ringStroke = locked ? '#5cd6ee' : hovered ? '#7fe3f2' : MOON_SOFT;
+  const ringOpacity = locked ? 0.4 : hovered ? 0.5 : 0.34;
+  const ringWidth = locked || hovered ? 1.8 : 1;
+
+  const dotR = hovered && !locked ? NODE_R + 1 : NODE_R;
+  const dotFill = locked ? '#5cd6ee' : hovered ? 'rgba(127,227,242,0.22)' : 'rgba(183,195,216,0.12)';
+  const dotStroke = locked ? '#5cd6ee' : hovered ? '#7fe3f2' : MOON;
+  const dotSw = locked || hovered ? 2.2 : 1.5;
+
+  return (
+    <g>
+      {/* Hit area (invisible) */}
+      <circle
+        cx={node.x}
+        cy={node.y}
+        r={12}
+        fill="transparent"
+        style={{ cursor: isRunning ? 'default' : 'pointer' }}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          onDown(node.id);
+        }}
+        onPointerEnter={() => onEnter(node.id)}
+        onPointerLeave={onLeave}
+      />
+      {/* Glow ring */}
+      <circle
+        cx={node.x}
+        cy={node.y}
+        r={ringR}
+        fill="none"
+        stroke={ringStroke}
+        strokeWidth={ringWidth}
+        opacity={ringOpacity}
+        className={latest ? 'lock-board__node--latest' : ''}
+        style={{ pointerEvents: 'none' }}
+      />
+      {/* Main dot */}
+      <circle
+        cx={node.x}
+        cy={node.y}
+        r={dotR}
+        fill={dotFill}
+        stroke={dotStroke}
+        strokeWidth={dotSw}
+        className={locked ? 'lock-board__node--locked' : undefined}
+        style={{ pointerEvents: 'none' }}
+      />
+      {/* Label */}
+      <text
+        x={node.x}
+        y={node.y}
+        textAnchor="middle"
+        dominantBaseline="central"
+        fill={locked ? '#04121a' : '#e4eaf4'}
+        fontSize="5.5"
+        fontWeight="700"
+        fontFamily="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+        style={{ pointerEvents: 'none', userSelect: 'none' }}
+      >
+        {node.id}
+      </text>
+    </g>
+  );
+});
+
 function LockBoard2D({
   path = [],
   isRunning = false,
@@ -26,68 +102,99 @@ function LockBoard2D({
   className = '',
 }) {
   const svgRef = useRef(null);
+  const previewRef = useRef(null);   // preview <line>, updated imperatively
+  const rectRef = useRef(null);      // cached board rect (read once per drag)
+  const rafRef = useRef(0);          // pending animation frame
+  const lastPtRef = useRef(null);    // latest pointer position to process
   const [hoveredId, setHoveredId] = useState(null);
-  const [mousePos, setMousePos] = useState(null);
 
   const lockedSet = new Set(path);
   const latestId = path[path.length - 1] ?? null;
 
-  const svgCoords = useCallback((e) => {
+  const drawingRef = useRef(isDrawing);
+  drawingRef.current = isDrawing;
+
+  const readRect = useCallback(() => {
     const svg = svgRef.current;
-    if (!svg) return null;
-    const r = svg.getBoundingClientRect();
-    return { x: ((e.clientX - r.left) / r.width) * 100, y: ((e.clientY - r.top) / r.height) * 100 };
+    rectRef.current = svg ? svg.getBoundingClientRect() : null;
+    return rectRef.current;
   }, []);
 
-  const hitNode = useCallback((pos) => {
-    if (!pos) return null;
+  const hitNodeXY = useCallback((x, y) => {
     for (const n of NODES) {
-      if (Math.hypot(n.x - pos.x, n.y - pos.y) < HIT_R) return n.id;
+      if (Math.hypot(n.x - x, n.y - y) < HIT_R) return n.id;
     }
     return null;
+  }, []);
+
+  // Runs at most once per frame (rAF-coalesced). The cursor-tracking preview
+  // line is updated via DOM attributes so moving the pointer triggers NO React
+  // re-render — only crossing into a new node (setHoveredId / append) does.
+  const processMove = useCallback(
+    (clientX, clientY) => {
+      const r = rectRef.current || readRect();
+      if (!r || r.width === 0) return;
+      const x = ((clientX - r.left) / r.width) * 100;
+      const y = ((clientY - r.top) / r.height) * 100;
+      const id = hitNodeXY(x, y);
+      setHoveredId(id); // React bails out when the value is unchanged
+      if (drawingRef.current) {
+        const line = previewRef.current;
+        if (line) {
+          line.setAttribute('x2', x);
+          line.setAttribute('y2', y);
+        }
+        if (id) onAppendNode(id);
+      }
+    },
+    [readRect, hitNodeXY, onAppendNode],
+  );
+
+  const handleSvgMove = useCallback(
+    (e) => {
+      lastPtRef.current = { x: e.clientX, y: e.clientY };
+      if (rafRef.current) return;
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = 0;
+        const pt = lastPtRef.current;
+        if (pt) processMove(pt.x, pt.y);
+      });
+    },
+    [processMove],
+  );
+
+  const endDraw = useCallback(() => {
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = 0;
+    }
+    if (drawingRef.current) onDrawEnd();
+  }, [onDrawEnd]);
+
+  useEffect(() => () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
   }, []);
 
   const handleNodeDown = useCallback(
     (nodeId) => {
       if (isRunning) return;
+      readRect(); // cache rect once at draw start — avoids per-move layout reads
       onDrawStart();
       onAppendNode(nodeId);
     },
-    [isRunning, onDrawStart, onAppendNode],
+    [isRunning, readRect, onDrawStart, onAppendNode],
   );
 
   const handleNodeEnter = useCallback(
     (nodeId) => {
       setHoveredId(nodeId);
-      if (!isDrawing) return;
+      if (!drawingRef.current) return;
       onAppendNode(nodeId);
     },
-    [isDrawing, onAppendNode],
+    [onAppendNode],
   );
 
   const handleNodeLeave = useCallback(() => setHoveredId(null), []);
-
-  const drawingRef = useRef(isDrawing);
-  drawingRef.current = isDrawing;
-
-  const handleSvgMove = useCallback(
-    (e) => {
-      const pos = svgCoords(e);
-      setMousePos(pos);
-      const id = hitNode(pos);
-      setHoveredId(id);
-      if (drawingRef.current && id) {
-        onAppendNode(id);
-      }
-    },
-    [svgCoords, hitNode, onAppendNode],
-  );
-
-  const handleSvgUp = useCallback(() => {
-    if (!isDrawing) return;
-    onDrawEnd();
-    setMousePos(null);
-  }, [isDrawing, onDrawEnd]);
 
   const connections = path.slice(1).map((toId, i) => ({
     from: NODE_BY_ID[path[i]],
@@ -95,23 +202,7 @@ function LockBoard2D({
     key: `${path[i]}-${toId}`,
   }));
 
-  const showPreview = isDrawing && latestId && mousePos;
   const previewFrom = latestId ? NODE_BY_ID[latestId] : null;
-
-  /* ── Palette (mirrors index.css :root) ── */
-  const C = {
-    idleDotFill: 'rgba(8,12,20,0.85)',
-    idleDotStroke: 'rgba(64,110,142,0.45)',
-    hoverDotFill: 'rgba(0,229,255,0.06)',
-    hoverDotStroke: 'rgba(0,229,255,0.55)',
-    lockedDotFill: 'rgba(0,229,255,0.12)',
-    lockedDotStroke: '#00e5ff',
-    idleLabel: 'rgba(255,255,255,0.12)',
-    lockedLabel: '#ffffff',
-    connectionLine: 'rgba(0,229,255,0.45)',
-    previewLine: 'rgba(0,229,255,0.35)',
-    gridDot: 'rgba(64,110,142,0.2)',
-  };
 
   return (
     <div
@@ -122,101 +213,76 @@ function LockBoard2D({
         viewBox="0 0 100 100"
         style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none' }}
         onPointerMove={handleSvgMove}
-        onPointerUp={handleSvgUp}
-        onPointerLeave={handleSvgUp}
+        onPointerUp={endDraw}
+        onPointerLeave={endDraw}
       >
+        <defs>
+          {/* userSpaceOnUse so axis-aligned (horizontal/vertical) lines,
+              whose bounding box is zero-area, still get a valid gradient */}
+          <linearGradient id="lock-line" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="100" y2="100">
+            <stop offset="0%" stopColor="#5cd6ee" />
+            <stop offset="100%" stopColor="#5cd6ee" />
+          </linearGradient>
+        </defs>
+
         {/* Subtle grid guide */}
-        <g opacity="1">
+        <g opacity="0.18">
           {[21, 50, 79].map((cy) =>
             [21, 50, 79].map((cx) => (
-              <circle key={`g${cx}-${cy}`} cx={cx} cy={cy} r="0.6" fill={C.gridDot} />
+              <circle key={`g${cx}-${cy}`} cx={cx} cy={cy} r="0.9" fill="#7fb3d6" />
             )),
           )}
         </g>
 
-        {/* Connections */}
-        {connections.map(({ from, to, key }) => (
-          <line
-            key={key}
-            x1={from.x}
-            y1={from.y}
-            x2={to.x}
-            y2={to.y}
-            stroke={C.connectionLine}
-            strokeWidth="2"
-            strokeLinecap="round"
-          />
-        ))}
+        {/* Connections — one CSS drop-shadow on the group replaces the
+            per-line SVG gaussian-blur glow */}
+        <g className="lock-board__wires">
+          {connections.map(({ from, to, key }) => (
+            <line
+              key={key}
+              x1={from.x}
+              y1={from.y}
+              x2={to.x}
+              y2={to.y}
+              stroke="url(#lock-line)"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              opacity="0.95"
+            />
+          ))}
+        </g>
 
-        {/* Preview line */}
-        {showPreview && previewFrom && (
+        {/* Preview line — x2/y2 are updated imperatively on pointer move
+            (see processMove) so tracking the cursor causes no React re-render */}
+        {isDrawing && previewFrom && (
           <line
+            ref={previewRef}
             x1={previewFrom.x}
             y1={previewFrom.y}
-            x2={mousePos.x}
-            y2={mousePos.y}
-            stroke={C.previewLine}
-            strokeWidth="2"
+            x2={previewFrom.x}
+            y2={previewFrom.y}
+            stroke="#7fe3f2"
+            strokeWidth="1.5"
             strokeLinecap="round"
-            strokeDasharray="2 4"
+            strokeDasharray="2 3"
+            opacity="0.5"
           />
         )}
 
-        {/* Nodes */}
-        {NODES.map((n) => {
-          const locked = lockedSet.has(n.id);
-          const latest = n.id === latestId;
-          const hovered = hoveredId === n.id && !locked;
-
-          // Main dot
-          const dotR = locked ? NODE_R : hovered ? NODE_R + 1 : NODE_R;
-          const dotFill = locked ? C.lockedDotFill : hovered ? C.hoverDotFill : C.idleDotFill;
-          const dotStroke = locked ? C.lockedDotStroke : hovered ? C.hoverDotStroke : C.idleDotStroke;
-          const dotSw = locked ? 2.5 : hovered ? 2 : 2;
-
-          return (
-            <g key={n.id}>
-              {/* Hit area (invisible) */}
-              <circle
-                cx={n.x}
-                cy={n.y}
-                r={12}
-                fill="transparent"
-                style={{ cursor: isRunning ? 'default' : 'crosshair' }}
-                onPointerDown={(e) => {
-                  e.stopPropagation();
-                  handleNodeDown(n.id);
-                }}
-                onPointerEnter={() => handleNodeEnter(n.id)}
-                onPointerLeave={handleNodeLeave}
-              />
-              {/* Main dot */}
-              <circle
-                cx={n.x}
-                cy={n.y}
-                r={dotR}
-                fill={dotFill}
-                stroke={dotStroke}
-                strokeWidth={dotSw}
-                style={{ pointerEvents: 'none' }}
-              />
-              {/* Label */}
-              <text
-                x={n.x}
-                y={n.y}
-                textAnchor="middle"
-                dominantBaseline="central"
-                fill={locked ? C.lockedLabel : C.idleLabel}
-                fontSize="5.5"
-                fontWeight="400"
-                fontFamily="Helvetica Neue, Arial, sans-serif"
-                style={{ pointerEvents: 'none', userSelect: 'none' }}
-              >
-                {n.id}
-              </text>
-            </g>
-          );
-        })}
+        {/* Nodes — memoized; only the changed ones re-render on append */}
+        {NODES.map((n) => (
+          <LockNode
+            key={n.id}
+            node={n}
+            locked={lockedSet.has(n.id)}
+            latest={n.id === latestId}
+            hovered={hoveredId === n.id && !lockedSet.has(n.id)}
+            isRunning={isRunning}
+            onDown={handleNodeDown}
+            onEnter={handleNodeEnter}
+            onLeave={handleNodeLeave}
+          />
+        ))}
       </svg>
     </div>
   );

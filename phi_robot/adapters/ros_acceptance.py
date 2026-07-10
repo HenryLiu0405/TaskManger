@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
-from geometry_msgs.msg import Twist
+
 from nav_msgs.msg import Odometry
 from robot_interfaces.srv import ExecuteTrajectory
 from sensor_msgs.msg import CompressedImage
@@ -213,7 +213,6 @@ class RosAcceptanceAdapter:
         self._odom_x: float = 0.0
         self._odom_y: float = 0.0
         self._odom_yaw: float = 0.0
-        self._scan_start_yaw: float | None = None
 
         def _on_odom(msg: Odometry) -> None:
             self._odom_x = msg.pose.pose.position.x
@@ -225,8 +224,6 @@ class RosAcceptanceAdapter:
             self._odom_yaw = math.atan2(siny_cosp, cosy_cosp)
         self._node.create_subscription(Odometry, "/odom", _on_odom, 10)
 
-        # /cmd_vel publisher — 旋转扫描时接管速度控制
-        self._cmd_vel_pub = self._node.create_publisher(Twist, "/cmd_vel", 10)
 
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         _fp_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -737,48 +734,6 @@ class RosAcceptanceAdapter:
         self._emit_diag(make_odom_snapshot(self._current_step_id, x, y, yaw))
         return (x, y, yaw)
 
-    def _rotate_relative(self, angle_deg: float) -> None:
-        """旋转到从扫描起始朝向算起的绝对偏移角度。
-
-        发 /cmd_vel angular.z=±0.5 rad/s，通过 /odom 做闭环控制，
-        到达目标 yaw（误差 < 2°）后停止。
-
-        Args:
-            angle_deg: 从 _scan_start_yaw 算起的绝对偏移角度（度）。
-                      0° = 保持起始朝向不转。
-                      正值 = 左转，负值 = 右转。
-        """
-        if angle_deg == 0:
-            return
-
-        # 目标朝向 = 扫描起始朝向 + 偏移量
-        start_yaw = self._scan_start_yaw if self._scan_start_yaw is not None else self._odom_yaw
-        target_yaw = start_yaw + math.radians(angle_deg)
-        target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))  # normalize
-
-        self.pause_navigation()
-        try:
-            deadline = time.time() + 10.0  # 最多转 10 秒
-            twist = Twist()
-            while time.time() < deadline:
-                # 每轮根据当前误差重新算方向，防止 overshoot 后失控
-                current_error = target_yaw - self._odom_yaw
-                current_error = math.atan2(math.sin(current_error), math.cos(current_error))
-                if abs(current_error) < math.radians(2.0):  # 2° 内到位
-                    break
-                twist.angular.z = 0.5 if current_error > 0.0 else -0.5
-                self._cmd_vel_pub.publish(twist)
-                self._emit_diag(make_rotate_cmd(
-                    self._current_step_id, target_yaw, self._odom_yaw,
-                    current_error, twist.angular.z,
-                ))
-                time.sleep(0.05)
-
-            # 停转
-            self._cmd_vel_pub.publish(Twist())
-        finally:
-            self.resume_navigation()
-
     def _spin_executor(self):
         try:
             self._executor.spin()
@@ -945,6 +900,10 @@ class RosAcceptanceAdapter:
         req = ExecuteTrajectory.Request()
         req.trajectory_json = trajectory
 
+        # 先重置到达标志，再发起导航 — 防止短距离导航在 reset 之前就完成，
+        # ROS2 spin 线程已把 _nav_reached 设为 True 然后被 reset 覆盖为 False
+        self._nav_reached = False
+
         print(f"\n  [ros] >>> {self._path_plan_service}  "
               f"target=({tx:.1f}, {ty:.1f})", flush=True)
 
@@ -970,6 +929,18 @@ class RosAcceptanceAdapter:
                                      f"start_navigation returned success=false for ({tx:.1f}, {ty:.1f})",
                                      request_id, goal_id, step_id)
 
+        # 等待 nav_monitor 发布 /nav_reached=true（ZMQ bridge 回传达到通知）
+        nav_timeout = 600.0  # 最长等 10 分钟
+        arrived = self._wait_nav_reached(timeout=nav_timeout)
+        if not arrived:
+            return self._error_result("NAV_TIMEOUT",
+                                     f"nav_reached not received within {nav_timeout:.0f}s for ({tx:.1f}, {ty:.1f})",
+                                     request_id, goal_id, step_id)
+
+        # 通知 gateway 到达 — 搬箱走路(carry_walking)需要此调用切到 goal_reached_locked
+        # 正常走路(normal_planner)时 gateway 会忽略，无副作用
+        self._notify_arrival()
+
         ready = self._wait_until_ready("move_to")
         if not ready:
             return self._error_result("PATH_PLAN_NOT_READY",
@@ -986,6 +957,20 @@ class RosAcceptanceAdapter:
             "goal_id": goal_id,
             "step_id": step_id,
         }
+
+    def _wait_nav_reached(self, timeout: float = 600.0) -> bool:
+        """Wait for /nav_reached topic to become True (Nav2 → bridge → workstation).
+
+        Returns True when arrived, False on timeout.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._nav_reached:
+                logger.info("nav_reached=True received, navigation complete")
+                return True
+            time.sleep(0.2)
+        logger.warning("_wait_nav_reached timed out after %.0fs", timeout)
+        return False
 
     @staticmethod
     def _build_trajectory(tx: float, ty: float, yaw: float | None = None) -> str:
@@ -1256,7 +1241,7 @@ class RosAcceptanceAdapter:
         req.request_id = f"{request_id}-{step_id}"
         req.command = "carry"
         req.object_pose.header = pose_est.header
-        req.object_pose.header.frame_id = "torso"  # gateway 要求 frame_id="torso"，FP 输出 "torso_link" 是同一刚体不同命名，写死覆写
+        req.object_pose.header.frame_id = "pelvis"  # gateway CARRY_TARGET_FRAME=pelvis，FP publish_in_pelvis_frame=true
         req.object_pose.pose = pose_est.pose       # position + orientation
 
         print(f"\n  [ros] >>> /submit_carry_task  "

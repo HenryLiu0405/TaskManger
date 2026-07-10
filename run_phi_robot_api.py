@@ -107,6 +107,11 @@ if __name__ == "__main__":
         default=False,
         help="绕过安全状态机，允许自由调用 move_to/pick/place 不限顺序",
     )
+    parser.add_argument(
+        "--camera-host",
+        default=os.environ.get("WAIC_CAMERA_HOST", "192.168.3.168"),
+        help="RealSense 摄像头 IP (默认从环境变量 WAIC_CAMERA_HOST 读取，fallback 192.168.3.168)",
+    )
 
     args = parser.parse_args()
     adapter = None
@@ -128,6 +133,7 @@ if __name__ == "__main__":
             stand_service=args.stand_service,
             request_replay_service=args.request_replay_service,
             notify_goal_reached_service=args.notify_goal_reached_service,
+            camera_host=args.camera_host,
         )
         print("ROS2 验收模式:")
         print(f"  路径规划: {args.path_plan_service}")

@@ -1,27 +1,35 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import { ConfigProvider } from 'antd';
+import { ConfigProvider, theme } from 'antd';
 
 import App from './App.jsx';
 import './index.css';
 
-const theme = {
+// Lunar Command — cool cyan signal accent over deep-space glass.
+const lunarTheme = {
+  algorithm: theme.darkAlgorithm,
   token: {
-    colorPrimary: "#ffffff",
-    borderRadius: 0,
-    fontFamily: '"Helvetica Neue", Arial, sans-serif',
-    colorBgBase: "#000000",
-    colorTextBase: "#ffffff",
-    colorSuccess: "rgba(255,255,255,0.7)",
-    colorInfo: "rgba(255,255,255,0.5)",
-    colorWarning: "rgba(255,255,255,0.5)",
-    colorError: "rgba(255,255,255,0.3)",
+    colorPrimary: "#5cd6ee",
+    colorInfo: "#5cd6ee",
+    colorSuccess: "#46e6b8",
+    colorError: "#ff5d76",
+    colorTextBase: "#e9eef7",
+    colorBgBase: "#04060d",
+    borderRadius: 12,
+    fontFamily: "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+  },
+  components: {
+    Button: {
+      controlHeight: 44,
+      contentFontSize: 15,
+      fontWeight: 600,
+    },
   },
 };
 
 ReactDOM.createRoot(document.getElementById('app')).render(
   <React.StrictMode>
-    <ConfigProvider theme={theme}>
+    <ConfigProvider theme={lunarTheme}>
       <App />
     </ConfigProvider>
   </React.StrictMode>,

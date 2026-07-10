@@ -169,6 +169,16 @@ class StepDebugController:
             return {
                 "ok": True,
                 "plan": self._plan_steps,
+                "raw_steps": [
+                    {
+                        "step_id": s.step_id,
+                        "task_index": s.task_index,
+                        "tool": s.tool,
+                        "args": s.args,
+                        "status": "pending",
+                    }
+                    for s in plan
+                ],
                 "total_steps": len(plan),
             }
 
@@ -226,6 +236,297 @@ class StepDebugController:
             "step_id": step.step_id,
             "message": f"执行 {step.step_id}: {step.tool}",
         }
+
+    def auto_run(self) -> dict[str, Any]:
+        """自动顺序执行所有剩余步骤（后台线程）。
+
+        与手动单步不同：线程内顺序调 adapter.execute()（同步阻塞），
+        天然保证「上一步真正完成才执行下一步」。
+        pick 步前自动进入 FP 单目标模式。
+        失败即停，用户可随时通过 abort 终止。
+        """
+        with self._lock:
+            if not self._plan_steps:
+                return {"ok": False, "message": "未加载 plan"}
+            if self._state not in (ST_STEP_READY, ST_STEP_DONE):
+                return {
+                    "ok": False,
+                    "message": (
+                        f"当前状态 {self._state} 不可启动自动执行，"
+                        "请先加载 plan 或完成当前步"
+                    ),
+                }
+            if self._current_index >= len(self._plan):
+                return {"ok": False, "message": "所有步骤已执行完毕"}
+
+            # pick 步前置条件检查（与手动执行一致）
+            step = self._plan[self._current_index]
+            if step.tool == "pick" and not self._select_target_active:
+                return {
+                    "ok": False,
+                    "message": (
+                        "当前步为搬箱子 (pick)，需先进入单物体识别模式。"
+                        "请点击「锁定单目标」按钮后重试自动执行。"
+                    ),
+                }
+
+            self._state = ST_EXECUTING
+            self._collector.clear()
+            self._stop_flag.clear()
+            self._execution_id += 1
+
+        self._auto_thread = threading.Thread(
+            target=self._run_auto,
+            args=(self._execution_id,),
+            daemon=True,
+        )
+        self._auto_thread.start()
+
+        return {
+            "ok": True,
+            "status": "auto_started",
+            "total_steps": len(self._plan),
+            "current_index": self._current_index,
+        }
+
+    def _run_auto(self, exec_id: int) -> None:
+        """自动循环体（后台线程）：顺序执行剩余步骤，失败即停。
+
+        不新建子线程 —— 直接在 _run_auto 线程内顺序调
+        adapter.execute()（同步阻塞），一步完成才执行下一步。
+        """
+        try:
+            while self._current_index < len(self._plan):
+                # 每步前检查中止 / epoch 失效
+                if self._stop_flag.is_set() or exec_id != self._execution_id:
+                    logger.info(
+                        "_run_auto: 中止 (stop=%s, epoch=%d/%d)",
+                        self._stop_flag.is_set(), exec_id, self._execution_id,
+                    )
+                    return
+
+                # 暂停等待（手动暂停 / 恢复）
+                while self._state == ST_PAUSED and not self._stop_flag.is_set():
+                    time.sleep(0.5)
+                if self._stop_flag.is_set():
+                    return
+
+                step = self._plan[self._current_index]
+
+                # ── pick 步自动进入 FP 单目标模式 ─────────
+                if step.tool == "pick" and not self._select_target_active:
+                    pick_x, pick_y = self._extract_slot_nav2_xy()
+                    logger.info(
+                        "_run_auto: 自动进入 FP 单目标模式 "
+                        "(pick_x=%.2f, pick_y=%.2f)", pick_x, pick_y,
+                    )
+                    # SSE 反馈：正在锁定
+                    with self._lock:
+                        if exec_id == self._execution_id:
+                            self._step_logs.append(StepLog(
+                                step_id=step.step_id,
+                                tool="select_target",
+                                status="running",
+                                message=f"正在锁定单目标 ({pick_x:.2f}, {pick_y:.2f})...",
+                                timestamp=StepLog.now(),
+                            ))
+                    if not self._auto_toggle_select_target():
+                        with self._lock:
+                            if exec_id == self._execution_id:
+                                self._step_logs.append(StepLog(
+                                    step_id=step.step_id,
+                                    tool="select_target",
+                                    status="error",
+                                    error_code="FP_LOCK_FAILED",
+                                    message=f"锁定失败: 未在 ({pick_x:.2f}, {pick_y:.2f}) 匹配到物体",
+                                    timestamp=StepLog.now(),
+                                ))
+                                self._plan_steps[self._current_index][
+                                    "status"
+                                ] = "failed"
+                                self._plan_steps[self._current_index][
+                                    "error_code"
+                                ] = "FP_LOCK_FAILED"
+                                self._state = ST_STEP_FAILED
+                        return
+                    # SSE 反馈：锁定成功
+                    with self._lock:
+                        if exec_id == self._execution_id:
+                            obj_id = self._adapter._fp_target_object_id
+                            self._step_logs.append(StepLog(
+                                step_id=step.step_id,
+                                tool="select_target",
+                                status="ok",
+                                message=f"已锁定单目标 object_id={obj_id}",
+                                timestamp=StepLog.now(),
+                            ))
+
+                # ── 标记 running ──────────────────────────
+                with self._lock:
+                    if exec_id != self._execution_id:
+                        return
+                    self._plan_steps[self._current_index]["status"] = "running"
+
+                # ── 执行（同步阻塞，真正等机器人完成） ────
+                t_start = time.monotonic()
+                try:
+                    result = self._adapter.execute(
+                        tool=step.tool,
+                        args=step.args,
+                        request_id="step_debug_auto",
+                        goal_id="step_debug_auto",
+                        step_id=step.step_id,
+                    )
+                except Exception as e:
+                    logger.exception("_run_auto: adapter.execute 异常: %s", e)
+                    result = {
+                        "status": "error",
+                        "error_code": "ADAPTER_EXCEPTION",
+                        "message": str(e),
+                    }
+
+                elapsed = time.monotonic() - t_start
+                is_ok = result.get("status") == "ok"
+
+                # ── 更新状态机 ────────────────────────────
+                with self._lock:
+                    if self._stop_flag.is_set() or exec_id != self._execution_id:
+                        return
+
+                    log = StepLog(
+                        step_id=step.step_id,
+                        tool=step.tool,
+                        status="ok" if is_ok else "error",
+                        error_code=result.get("error_code", "") or "",
+                        message=result.get("message", ""),
+                        elapsed_s=round(elapsed, 2),
+                        timestamp=StepLog.now(),
+                    )
+                    self._step_logs.append(log)
+
+                    if is_ok:
+                        self._plan_steps[self._current_index][
+                            "status"
+                        ] = "completed"
+                        self._current_index += 1
+
+                        # ── pick 完成后立即退出 FP 单目标模式 ──
+                        # 搬起结束 → 恢复多目标识别，后续 move_to 和 place 不需要
+                        if step.tool == "pick" and self._select_target_active:
+                            try:
+                                if hasattr(self._adapter, "select_target_public"):
+                                    self._adapter.select_target_public(
+                                        select=False, step_id="auto_after_pick"
+                                    )
+                            except Exception as e:
+                                logger.error(
+                                    "_run_auto pick 后退出 SelectTarget 失败: %s", e
+                                )
+                            self._select_target_active = False
+                            logger.info("_run_auto: pick 完成，已退出单目标模式")
+                            # SSE 反馈：已退出
+                            self._step_logs.append(StepLog(
+                                step_id=step.step_id,
+                                tool="select_target_exit",
+                                status="ok",
+                                message="已退出单目标模式（恢复多物体识别）",
+                                timestamp=StepLog.now(),
+                            ))
+
+                        if self._current_index >= len(self._plan):
+                            self._state = ST_IDLE
+                            logger.info("_run_auto: 全部步骤完成 (%d 步)", len(self._plan))
+                        else:
+                            self._plan_steps[self._current_index][
+                                "status"
+                            ] = "current"
+                            self._state = ST_STEP_DONE
+                            logger.info(
+                                "_run_auto: %s 完成 → 前进到 %s (%d/%d)",
+                                step.step_id,
+                                self._plan[self._current_index].step_id,
+                                self._current_index + 1,
+                                len(self._plan),
+                            )
+                    else:
+                        self._plan_steps[self._current_index]["status"] = "failed"
+                        self._plan_steps[self._current_index]["error_code"] = (
+                            result.get("error_code", "")
+                        )
+                        self._plan_steps[self._current_index]["replan_target"] = (
+                            result.get("replan_target")
+                        )
+                        self._state = ST_STEP_FAILED
+                        logger.warning(
+                            "_run_auto: %s 失败 (%s): %s",
+                            step.step_id, log.error_code, log.message,
+                        )
+                        return  # 失败即停
+
+            # ── 全部完成：自动退出 FP 单目标模式 ─────────
+            if self._select_target_active:
+                try:
+                    if hasattr(self._adapter, "select_target_public"):
+                        self._adapter.select_target_public(
+                            select=False, step_id="auto_done"
+                        )
+                except Exception as e:
+                    logger.error(
+                        "_run_auto 退出 SelectTarget 失败: %s", e
+                    )
+                self._select_target_active = False
+
+        except Exception as e:
+            logger.exception("_run_auto: 未预期异常")
+            with self._lock:
+                if exec_id == self._execution_id:
+                    self._state = ST_STEP_FAILED
+
+    def _auto_toggle_select_target(self) -> bool:
+        """自动进入 FP 单目标模式（线程内调用，不经过 HTTP）。
+
+        Returns:
+            True 表示锁定成功，False 表示失败。
+        """
+        pick_x, pick_y = self._extract_slot_nav2_xy()
+        if pick_x is None:
+            logger.error("_auto_toggle_select_target: 无法提取 slot 坐标")
+            return False
+
+        if not hasattr(self._adapter, "select_target_public"):
+            logger.error(
+                "_auto_toggle_select_target: adapter 不支持 SelectTarget"
+            )
+            return False
+
+        result = self._adapter.select_target_public(
+            select=True,
+            pick_x=pick_x,
+            pick_y=pick_y,
+            material_points_xy=[pick_x, pick_y],
+            step_id="auto",
+        )
+
+        matched_id = result.get("matched_object_id", -1) if result else -1
+        if result and result.get("success") and matched_id >= 0:
+            self._select_target_active = True
+            logger.info(
+                "_auto_toggle_select_target: 自动锁定成功, object_id=%s",
+                matched_id,
+            )
+            return True
+        else:
+            msg = (
+                result.get("message", "未知错误")
+                if result
+                else "SelectTarget 服务不可用"
+            )
+            if result and result.get("success") and matched_id < 0:
+                msg = f"FP 服务返回成功但未匹配到物体 (matched_object_id={matched_id})"
+            logger.error(
+                "_auto_toggle_select_target: 自动锁定失败: %s", msg
+            )
+            return False
 
     def retry_step(self) -> dict[str, Any]:
         """重试当前步骤（状态机表现同 execute_current_step）。"""
@@ -420,16 +721,19 @@ class StepDebugController:
             step_id="manual",
         )
 
-        if result and result.get("success"):
+        matched_id = result.get("matched_object_id", -1) if result else -1
+        if result and result.get("success") and matched_id >= 0:
             self._select_target_active = True
             return {
                 "ok": True,
                 "active": True,
-                "object_id": result.get("matched_object_id"),
+                "object_id": matched_id,
                 "message": result.get("message", "已锁定"),
             }
         else:
             msg = result.get("message", "锁定失败") if result else "SelectTarget 服务不可用"
+            if result and result.get("success") and matched_id < 0:
+                msg = f"FP 服务返回成功但未匹配到物体 (matched_object_id={matched_id})"
             return {"ok": False, "active": False, "message": msg}
 
     def abort(self) -> dict[str, Any]:
@@ -521,6 +825,14 @@ class StepDebugController:
                     "nav_reached": nav_reached,  # 供前端确认
                 }
             return {"ok": False, "message": "adapter 不支持暂停"}
+
+    def resume_robot(self) -> dict[str, Any]:
+        """恢复 Nav2 导航（发送 /nav_pause=false）。"""
+        with self._lock:
+            if hasattr(self._adapter, "resume_navigation"):
+                self._adapter.resume_navigation()
+                return {"ok": True, "message": "已发送恢复信号"}
+            return {"ok": False, "message": "adapter 不支持恢复"}
 
     def stand_robot(self) -> dict[str, Any]:
         """切换机器人为站立模式"""

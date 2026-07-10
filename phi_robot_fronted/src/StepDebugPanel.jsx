@@ -9,17 +9,8 @@ import {
 
 const API = '/api/dev/step_debug';
 
-const GRID_PRESETS = [
-  { label: 'nw', x: 2.5, y: 2.5 },
-  { label: 'n',  x: 3.5, y: 2.5 },
-  { label: 'ne', x: 4.5, y: 2.5 },
-  { label: 'w',  x: 2.5, y: 1.5 },
-  { label: 'c',  x: 3.5, y: 1.5 },
-  { label: 'e',  x: 4.5, y: 1.5 },
-  { label: 'sw', x: 2.5, y: 0.5 },
-  { label: 's',  x: 3.5, y: 0.5 },
-  { label: 'se', x: 4.5, y: 0.5 },
-];
+// 目标点坐标从后端 /api/scene_coords 拉取（Nav2 map 世界坐标）。
+// 改坐标只需编辑 TaskManger/phi_robot/scene_coords.json + 重启后端。
 
 // ── 状态对应的按钮启用逻辑 ──────────────────────────
 const STATE_BUTTONS = {
@@ -291,6 +282,7 @@ function DiagEventRow({ ev }) {
 
 export default function StepDebugPanel({ robotState }) {
   const [dests, setDests] = useState([]);
+  const [gridPresets, setGridPresets] = useState([]);   // [{label,x,y,theta}] 从 /api/scene_coords
   const [loading, setLoading] = useState(false);
   const [state, setState] = useState('idle');
   const [plan, setPlan] = useState([]);
@@ -302,10 +294,18 @@ export default function StepDebugPanel({ robotState }) {
   const [showDropVis, setShowDropVis] = useState(false);
   const [selectTargetActive, setSelectTargetActive] = useState(false);
   const [dropDetectorEnabled, setDropDetectorEnabled] = useState(false);
+  const [loadTaskCollapsed, setLoadTaskCollapsed] = useState(false);
+  const [planCollapsed, setPlanCollapsed] = useState(false);
+  const [controlCollapsed, setControlCollapsed] = useState(false);
+  const [dropCollapsed, setDropCollapsed] = useState(false);
+  const [diagCollapsed, setDiagCollapsed] = useState(false);
+  const [logCollapsed, setLogCollapsed] = useState(false);
   const [droppedBoxId, setDroppedBoxId] = useState(-1);
   const [droppedBoxPose, setDroppedBoxPose] = useState(null);
   const [dropPhase, setDropPhase] = useState('');  // idle | detecting | paused | standing | identifying | ready
   const [navReached, setNavReached] = useState(null);  // 🆕 Nav2 /nav_reached 状态: true=到达, false=导航中
+  const [robotPaused, setRobotPaused] = useState(false);  // 🆕 /nav_pause 暂停状态，控制按钮 toggle
+  const [autoMode, setAutoMode] = useState(false);  // 自动执行模式
 
   const diagEndRef = useRef(null);
   const poseTimerRef = useRef(null);
@@ -322,6 +322,22 @@ export default function StepDebugPanel({ robotState }) {
   const currentStep = plan[currentIndex];
   const isPickStep = currentStep?.tool === 'pick';
   const pickDisabled = isPickStep && !selectTargetActive;
+
+  // ── 场景坐标（一次拉取）─────────────────────────────
+  useEffect(() => {
+    fetch('/api/scene_coords')
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.grid_cells) {
+          setGridPresets(
+            Object.entries(d.grid_cells).map(([label, c]) => ({
+              label, x: c.x, y: c.y, theta: c.theta,
+            }))
+          );
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   // ── SSE ────────────────────────────────────────────
   useEffect(() => {
@@ -367,6 +383,18 @@ export default function StepDebugPanel({ robotState }) {
     };
   }, []);
 
+  // ── 自动执行完成检测 ─────────────────────────────
+  useEffect(() => {
+    if (autoMode && (state === 'idle' || state === 'step_failed' || state === 'aborted')) {
+      setAutoMode(false);
+      if (state === 'idle') {
+        message.success(`自动执行完成！共 ${plan.length} 步全部成功`);
+      } else if (state === 'step_failed') {
+        message.error(`自动执行中断：第 ${currentIndex + 1} 步失败`);
+      }
+    }
+  }, [state, autoMode]);
+
   // ── 自动滚屏 ───────────────────────────────────────
   useEffect(() => {
     diagEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -405,6 +433,14 @@ export default function StepDebugPanel({ robotState }) {
   }
 
   function handleExecute() { call('/execute'); }
+  function handleAutoRun() {
+    call('/auto_run').then((r) => {
+      if (r?.ok) {
+        setAutoMode(true);
+        message.info(`自动执行已启动 (${r.current_index + 1}/${r.total_steps} 步)`);
+      }
+    });
+  }
   function handleRetry() { call('/retry'); }
   function handleSkip() { call('/skip'); }
   function handleForceSkip() {
@@ -471,6 +507,7 @@ export default function StepDebugPanel({ robotState }) {
     call('/robot/pause').then((r) => {
       if (r?.ok) {
         setDropPhase('paused');
+        setRobotPaused(true);
         // 🆕 使用 /nav_reached 状态确认暂停效果
         if (r.nav_reached != null) {
           setNavReached(r.nav_reached);
@@ -481,6 +518,18 @@ export default function StepDebugPanel({ robotState }) {
         message.success(`机器人已暂停${navMsg}`);
       } else {
         message.warning(r?.message || '暂停失败');
+      }
+    });
+  }
+
+  function handleResumeRobot() {
+    call('/robot/resume').then((r) => {
+      if (r?.ok) {
+        setRobotPaused(false);
+        setDropPhase('detecting');
+        message.success('机器人已恢复导航');
+      } else {
+        message.warning(r?.message || '恢复失败');
       }
     });
   }
@@ -535,14 +584,24 @@ export default function StepDebugPanel({ robotState }) {
   return (
     <div className="flex flex-col gap-3 h-full min-h-0">
       {/* ── 目标选择 ──────────────────────────────── */}
-      <Card size="small" title="加载任务" className="shrink-0">
+      <Card size="small" title={
+        <div className="flex items-center gap-2 cursor-pointer select-none"
+             onClick={() => setLoadTaskCollapsed(!loadTaskCollapsed)}>
+          <span className="text-xs text-[#8a8a8a]">{loadTaskCollapsed ? '▶' : '▼'}</span>
+          <span>加载任务</span>
+          {dests.length > 0 && (
+            <Tag className="text-[10px] leading-none">{dests.length} 个目标</Tag>
+          )}
+        </div>
+      } className="shrink-0">
+        {!loadTaskCollapsed && (
         <div className="flex flex-col gap-2">
           <div className="flex items-center gap-2">
             <span className="text-sm text-[#8a8a8a] shrink-0">
               <PushpinOutlined className="mr-1" />目标位置
             </span>
             <Space wrap size={4}>
-              {GRID_PRESETS.map((p) => (
+              {gridPresets.map((p) => (
                 <Button
                   key={p.label}
                   size="small"
@@ -583,6 +642,7 @@ export default function StepDebugPanel({ robotState }) {
             加载 Plan
           </Button>
         </div>
+        )}
       </Card>
 
       {/* ── FP 单目标切换 ──────────────────────────── */}
@@ -620,10 +680,11 @@ export default function StepDebugPanel({ robotState }) {
       {/* ── 步骤列表 ──────────────────────────────── */}
       <Card
         size="small"
-        title={`任务计划 (${plan.length} 步)`}
-        className="shrink-0"
-        extra={
-          <div className="flex items-center gap-2">
+        title={
+          <div className="flex items-center gap-2 cursor-pointer select-none"
+               onClick={() => setPlanCollapsed(!planCollapsed)}>
+            <span className="text-xs text-[#8a8a8a]">{planCollapsed ? '▶' : '▼'}</span>
+            <span>任务计划 ({plan.length} 步)</span>
             <Tag color={connected ? 'success' : 'error'} className="text-xs">
               {connected ? '● SSE' : '○ 断开'}
             </Tag>
@@ -639,8 +700,9 @@ export default function StepDebugPanel({ robotState }) {
             </Tag>
           </div>
         }
+        className="shrink-0"
       >
-        {plan.length === 0 ? (
+        {!planCollapsed && (plan.length === 0 ? (
           <div className="text-sm text-[#8a8a8a]">请先加载目标位置并点击"加载 Plan"</div>
         ) : (
           <div className="overflow-y-auto min-h-0" style={{ maxHeight: 112 }}>
@@ -671,11 +733,19 @@ export default function StepDebugPanel({ robotState }) {
               );
             })}
           </div>
-        )}
+        ))}
       </Card>
 
       {/* ── 控制按钮 ──────────────────────────────── */}
-      <Card size="small" title="控制" className="shrink-0">
+      <Card size="small" title={
+        <div className="flex items-center gap-2 cursor-pointer select-none"
+             onClick={() => setControlCollapsed(!controlCollapsed)}>
+          <span className="text-xs text-[#8a8a8a]">{controlCollapsed ? '▶' : '▼'}</span>
+          <span>控制</span>
+          {autoMode && <Tag color="processing" className="text-[10px] leading-none">自动中</Tag>}
+        </div>
+      } className="shrink-0">
+        {!controlCollapsed && (
         <Space wrap size={8}>
           <Tooltip title={
             pickDisabled
@@ -685,18 +755,32 @@ export default function StepDebugPanel({ robotState }) {
             <Button
               size="small" type="primary"
               icon={<PlayCircleOutlined />}
-              disabled={!btns.exec || !canWalk || pickDisabled}
+              disabled={!btns.exec || !canWalk || pickDisabled || autoMode}
               loading={loading && btns.exec}
               onClick={handleExecute}
             >
               {state === 'step_done' ? '下一步' : '执行'}
             </Button>
+            <Tooltip title={pickDisabled ? '请先锁定单目标' : '自动执行所有剩余步骤，失败即停'}>
+              <Button
+                size="small"
+                icon={<DoubleRightOutlined />}
+                disabled={(!btns.exec || !canWalk || pickDisabled) && !autoMode}
+                loading={autoMode}
+                onClick={handleAutoRun}
+                style={autoMode ? {} : { color: '#52c41a', borderColor: '#52c41a' }}
+              >
+                {autoMode
+                  ? `自动中… ${currentIndex + 1}/${plan.length}`
+                  : '自动执行'}
+              </Button>
+            </Tooltip>
           </Tooltip>
           <Tooltip title={pickDisabled ? '请先锁定单目标' : '重试当前步'}>
             <Button
               size="small"
               icon={<ReloadOutlined />}
-              disabled={!btns.retry || pickDisabled}
+              disabled={!btns.retry || pickDisabled || autoMode}
               loading={loading && btns.retry}
               onClick={handleRetry}
             >
@@ -706,7 +790,7 @@ export default function StepDebugPanel({ robotState }) {
           <Button
             size="small"
             icon={<StepForwardOutlined />}
-            disabled={!btns.skip}
+            disabled={!btns.skip || autoMode}
             onClick={handleSkip}
           >
             跳过
@@ -714,7 +798,7 @@ export default function StepDebugPanel({ robotState }) {
           <Button
             size="small"
             icon={<DoubleRightOutlined />}
-            disabled={!btns.fskip}
+            disabled={!btns.fskip || autoMode}
             danger
             onClick={handleForceSkip}
           >
@@ -760,11 +844,19 @@ export default function StepDebugPanel({ robotState }) {
             重新标定
           </Button>
         </Space>
+        )}
       </Card>
 
       {/* ── 掉箱处理 ──────────────────────────────── */}
-      <Card size="small" title={`掉箱处理${dropPhase ? ' · ' + dropPhase : ''}`} className="shrink-0"
+      <Card size="small" title={
+        <div className="flex items-center gap-2 cursor-pointer select-none"
+             onClick={() => setDropCollapsed(!dropCollapsed)}>
+          <span className="text-xs text-[#8a8a8a]">{dropCollapsed ? '▶' : '▼'}</span>
+          <span>掉箱处理{dropPhase ? ' · ' + dropPhase : ''}</span>
+        </div>
+      } className="shrink-0"
         style={{ borderColor: dropPhase === 'ready' ? '#52c41a' : '#faad14' }}>
+        {!dropCollapsed && (
         <Space wrap size={8}>
           <Tooltip title={dropDetectorEnabled ? '关闭掉箱检测并隐藏可视化画面' : '开启掉箱检测并弹出可视化画面'}>
             <Button
@@ -778,17 +870,20 @@ export default function StepDebugPanel({ robotState }) {
               {dropDetectorEnabled ? '关闭掉箱检测' : '1.开启掉箱检测'}
             </Button>
           </Tooltip>
-          <Tooltip title={navReached != null
-            ? (navReached ? '🟢 /nav_reached: 到达锁定，可做后续动作' : '🟡 /nav_reached: 导航中')
-            : '发 /nav_pause=true 暂停机器人（速度归零，状态保持）'}>
+          <Tooltip title={robotPaused
+            ? '发 /nav_pause=false 恢复机器人导航'
+            : (navReached != null
+              ? (navReached ? '🟢 /nav_reached: 到达锁定，可做后续动作' : '🟡 /nav_reached: 导航中')
+              : '发 /nav_pause=true 暂停机器人（速度归零，状态保持）')}>
             <Button
               size="small"
-              icon={<PauseCircleOutlined />}
-              onClick={handlePauseRobot}
-              disabled={dropPhase !== 'detecting'}
+              icon={robotPaused ? <CaretRightOutlined /> : <PauseCircleOutlined />}
+              onClick={robotPaused ? handleResumeRobot : handlePauseRobot}
+              disabled={!robotPaused && dropPhase !== 'detecting'}
+              type={robotPaused ? 'primary' : 'default'}
               style={navReached === true ? { color: '#52c41a', borderColor: '#52c41a' } : undefined}
             >
-              2.暂停机器人{navReached != null ? (navReached ? ' ✓已到' : ' …导航中') : ''}
+              {robotPaused ? '2.恢复机器人' : `2.暂停机器人${navReached != null ? (navReached ? ' ✓已到' : ' …导航中') : ''}`}
             </Button>
           </Tooltip>
           <Tooltip title="调用 /set_stand 让机器人放下手臂">
@@ -828,22 +923,28 @@ export default function StepDebugPanel({ robotState }) {
             <Tag color="green">箱子 #{droppedBoxId}{droppedBoxPose ? ` (${droppedBoxPose.x.toFixed(2)}, ${droppedBoxPose.y.toFixed(2)})` : ''}</Tag>
           )}
         </Space>
+        )}
       </Card>
 
       {/* ── 当前步骤诊断事件 ────────────────────────── */}
       <Card
         size="small"
-        title={<>
-          诊断事件 ({diagEvents.length} 条)
-          {dropStatus && (
-            <Tag color={dropStatus.box_present ? 'green' : 'red'} className="ml-2 text-[10px] leading-none">
-              {dropStatus.box_present ? '🟢 箱子在' : '🔴 箱子掉落!'}
-            </Tag>
-          )}
-        </>}
+        title={
+          <div className="flex items-center gap-2 cursor-pointer select-none"
+               onClick={() => setDiagCollapsed(!diagCollapsed)}>
+            <span className="text-xs text-[#8a8a8a]">{diagCollapsed ? '▶' : '▼'}</span>
+            <span>诊断事件 ({diagEvents.length} 条)</span>
+            {dropStatus && (
+              <Tag color={dropStatus.box_present ? 'green' : 'red'} className="text-[10px] leading-none">
+                {dropStatus.box_present ? '🟢 箱子在' : '🔴 箱子掉落!'}
+              </Tag>
+            )}
+          </div>
+        }
         className="flex-1 min-h-0 flex flex-col"
         styles={{ body: { flex: 1, minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' } }}
       >
+        {!diagCollapsed && (
         <div className="flex-1 overflow-y-auto font-mono min-h-0">
           {diagEvents.length === 0 ? (
             <div className="text-sm text-[#8a8a8a]">等待步骤执行...</div>
@@ -854,10 +955,18 @@ export default function StepDebugPanel({ robotState }) {
           )}
           <div ref={diagEndRef} />
         </div>
+        )}
       </Card>
 
       {/* ── 步骤日志摘要 ────────────────────────────── */}
-      <Card size="small" title={`操作日志 (${stepLogs.length} 条)`} className="shrink-0">
+      <Card size="small" title={
+        <div className="flex items-center gap-2 cursor-pointer select-none"
+             onClick={() => setLogCollapsed(!logCollapsed)}>
+          <span className="text-xs text-[#8a8a8a]">{logCollapsed ? '▶' : '▼'}</span>
+          <span>操作日志 ({stepLogs.length} 条)</span>
+        </div>
+      } className="shrink-0">
+        {!logCollapsed && (
         <div className="max-h-40 overflow-y-auto font-mono text-xs">
           {stepLogs.length === 0 ? (
             <div className="text-[#8a8a8a]">暂无记录</div>
@@ -888,6 +997,7 @@ export default function StepDebugPanel({ robotState }) {
             ))
           )}
         </div>
+        )}
       </Card>
 
       {/* ── FP 实时画面弹窗 ──────────────────────────── */}

@@ -455,6 +455,145 @@ class PhiRobotAPIServer:
                 ),
             })
 
+        # ── 多机器人切换 ──────────────────────────────────
+
+        @self.app.route("/api/robot/active", methods=["GET"])
+        def get_active_robot():
+            """查询当前受控机器人 + 本进程真实 domain（用于验证切换生效）。
+
+            runtime_domain == domain_id 才说明工作站 domain 已跟随被控机器人。
+            """
+            from . import robot_profile
+            try:
+                profile = robot_profile.get_active()
+            except Exception as e:
+                logger.exception("读取机器人档案失败")
+                return jsonify({"error": str(e)}), 500
+            if not profile:
+                return jsonify({"error": "no active robot in robots.json"}), 500
+            rt = robot_profile.runtime_domain()
+            lock = robot_profile.read_lock()
+            return jsonify({
+                "active_id": profile["id"],
+                "label": profile.get("label", profile["id"]),
+                "ip": profile.get("ip"),
+                "domain_id": profile.get("domain_id"),
+                "camera_host": profile.get("camera_host"),
+                "runtime_domain": rt,
+                "domain_synced": rt == profile.get("domain_id"),
+                "switching": robot_profile.is_switching(),
+                "switch_target": lock.get("target"),
+                "switch_error": bool(lock.get("error")),
+            })
+
+        @self.app.route("/api/robot/list", methods=["GET"])
+        def list_robots():
+            """列出所有可选机器人档案（供前端切换器渲染）。"""
+            from . import robot_profile
+            try:
+                data = robot_profile.load_profiles()
+            except Exception as e:
+                return jsonify({"error": str(e)}), 500
+            robots = [
+                {"id": rid, "label": r.get("label", rid), "ip": r.get("ip"),
+                 "domain_id": r.get("domain_id")}
+                for rid, r in data.get("robots", {}).items()
+            ]
+            return jsonify({"active": data.get("active"), "robots": robots})
+
+        @self.app.route("/api/scene_coords", methods=["GET"])
+        def get_scene_coords():
+            """返回场景坐标配置（Nav2 map 世界坐标）：单物料点 + 9 目标点 + 边界。
+
+            供前端渲染目标点/物料点按钮，消除前端硬编码。改坐标只需编辑
+            scene_coords.json + 重启，前端自动跟随。
+            """
+            from . import mission_planner
+            try:
+                coords = mission_planner.load_scene_coords(reload=True)
+            except Exception as e:
+                logger.exception("读取 scene_coords.json 失败")
+                return jsonify({"error": str(e)}), 500
+            return jsonify(coords)
+
+        @self.app.route("/api/robot/switch", methods=["POST"])
+        def switch_robot():
+            """切换受控机器人。
+
+            写 robots.json.active + 切换锁，spawn 脱离进程 switch_robot.sh，
+            立即返回 switching:true。脚本会重启含本进程在内的 4 个工作站单元。
+            """
+            from . import robot_profile
+            import subprocess
+            data = request.json or {}
+            robot_id = data.get("robot_id")
+            if not robot_id:
+                return jsonify({"ok": False, "message": "robot_id is required"}), 400
+
+            # 已在切换中 → 拒绝并发
+            if robot_profile.is_switching():
+                return jsonify({"ok": False, "message": "切换正在进行中，请稍候"}), 409
+
+            profile = robot_profile.get_robot(robot_id)
+            if not profile:
+                return jsonify({"ok": False, "message": f"unknown robot_id: {robot_id}"}), 404
+
+            current = robot_profile.get_active()
+            if current and current["id"] == robot_id and \
+                    robot_profile.runtime_domain() == profile.get("domain_id"):
+                return jsonify({"ok": True, "switching": False,
+                                "message": f"已在控制 {profile.get('label', robot_id)}"})
+
+            try:
+                robot_profile.set_active(robot_id)
+                robot_profile.write_lock({
+                    "target": robot_id,
+                    "from": current["id"] if current else None,
+                    "ts": datetime.now().isoformat(),
+                })
+                audit_logger.log_system(
+                    f"robot_switch {current['id'] if current else '-'} → {robot_id}",
+                    event="robot_switch",
+                    to=robot_id,
+                    frm=current["id"] if current else None,
+                )
+                script = os.path.join(
+                    os.environ.get("WAIC_ROOT", "/home/hairo/waic"),
+                    "switch_robot.sh",
+                )
+                # 脱离本进程：脚本会重启 waic-taskmanger 杀掉当前进程
+                subprocess.Popen(
+                    ["/bin/bash", script, robot_id],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                logger.exception("切换机器人失败")
+                robot_profile.clear_lock()
+                return jsonify({"ok": False, "message": str(e)}), 500
+
+            return jsonify({
+                "ok": True,
+                "switching": True,
+                "target": robot_id,
+                "label": profile.get("label", robot_id),
+                "domain_id": profile.get("domain_id"),
+                "message": f"正在切换到 {profile.get('label', robot_id)}，工作站服务重启中…",
+            })
+
+        @self.app.route("/api/robot/switch/status", methods=["GET"])
+        def switch_status():
+            """轮询切换状态：lock 存在=切换中；不存在=完成（以 /api/robot/active 判定成功）。"""
+            from . import robot_profile
+            lock = robot_profile.read_lock()
+            return jsonify({
+                "switching": robot_profile.is_switching(),
+                "target": lock.get("target"),
+                "error": bool(lock.get("error")),
+                "message": lock.get("message", ""),
+            })
+
         # ── SONIC 输入源切换 ──────────────────────────────
 
         @self.app.route("/api/dev/sonic/input_source", methods=["GET"])
@@ -613,6 +752,12 @@ class PhiRobotAPIServer:
             result = self.step_debug.execute_current_step()
             return jsonify(result)
 
+        @self.app.route("/api/dev/step_debug/auto_run", methods=["POST"])
+        def step_debug_auto_run():
+            """自动顺序执行所有剩余步骤（后台线程）"""
+            result = self.step_debug.auto_run()
+            return jsonify(result)
+
         @self.app.route("/api/dev/step_debug/retry", methods=["POST"])
         def step_debug_retry():
             """重试当前步骤"""
@@ -700,6 +845,16 @@ class PhiRobotAPIServer:
                 return jsonify(result)
             except Exception as e:
                 logger.exception("pause_robot 失败")
+                return jsonify({"ok": False, "message": str(e)})
+
+        @self.app.route("/api/dev/step_debug/robot/resume", methods=["POST"])
+        def step_debug_resume_robot():
+            """恢复机器人导航"""
+            try:
+                result = self.step_debug.resume_robot()
+                return jsonify(result)
+            except Exception as e:
+                logger.exception("resume_robot 失败")
                 return jsonify({"ok": False, "message": str(e)})
 
         @self.app.route("/api/dev/step_debug/robot/stand", methods=["POST"])

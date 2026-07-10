@@ -1,7 +1,6 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 const STEPS_PER_BLOCK = 4;
-const BRAILLE = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const ZONE_ID_BY_NODE = {
   '1': 'nw', '2': 'n', '3': 'ne',
@@ -28,87 +27,79 @@ function callText(step, posInBlock) {
   return `▶ ${tool} ${step.tool}`;
 }
 
-function resultLine(step, posInBlock, elapsed, spinner) {
-  const s = step.status;
-  if (s === 'completed') {
-    let action;
-    if (step.tool === 'move_to') action = posInBlock === 0 ? '到达备货槽位' : '到达目标位置';
-    else if (step.tool === 'pick') action = '抓取完成';
-    else if (step.tool === 'place') action = '放置完成';
-    else action = '完成';
-    return `  ✓ ${action} · ${elapsed}`;
-  }
-  if (s === 'running') {
-    let action;
-    if (step.tool === 'move_to') action = '移动中';
-    else if (step.tool === 'pick') action = '抓取中';
-    else if (step.tool === 'place') action = '放置中';
-    else action = '执行中';
-    return `  ◇ ${action} · ${spinner} ${elapsed}`;
-  }
-  if (s === 'failed') return `  ✗ 失败`;
-  return `  ○ 等待执行`;
+function runningLabel(step) {
+  if (step.tool === 'move_to') return '移动中';
+  if (step.tool === 'pick') return '抓取中';
+  if (step.tool === 'place') return '放置中';
+  return '执行中';
 }
 
-/* ── Typewriter ── */
-function Typewriter({ text, speed = 22, delay = 0, onDone }) {
-  const [n, setN] = useState(0);
+function doneLabel(step, posInBlock) {
+  if (step.tool === 'move_to') return posInBlock === 0 ? '到达备货槽位' : '到达目标位置';
+  if (step.tool === 'pick') return '抓取完成';
+  if (step.tool === 'place') return '放置完成';
+  return '完成';
+}
+
+/* ── Breathing dots — CSS-only running indicator (no character mutation) ── */
+function RunDots() {
+  return (
+    <span className="step-dots" aria-hidden="true">
+      <i /><i /><i />
+    </span>
+  );
+}
+
+/* ── Result line — rendered once, no typewriter ── */
+function ResultLine({ step, posInBlock, elapsed, status }) {
+  if (status === 'completed') {
+    return <>{`  ✓ ${doneLabel(step, posInBlock)} · ${elapsed}`}</>;
+  }
+  if (status === 'running') {
+    return (
+      <>
+        {`  ◇ ${runningLabel(step)} `}
+        <RunDots />
+        {` ${elapsed}`}
+      </>
+    );
+  }
+  if (status === 'failed') return <>{'  ✗ 失败'}</>;
+  return <>{'  ○ 等待执行'}</>;
+}
+
+/* ── Thinking phase — staged fade reveals, no per-character typing ── */
+function ThinkingPhase({ nodeCount, stepCount, pathStr, onDone }) {
+  const [stage, setStage] = useState(0); // 0=analyzing · 1=result · 2=planned
   const doneRef = useRef(onDone);
   doneRef.current = onDone;
 
   useEffect(() => {
-    setN(0);
-    let ok = true;
-    let iv;
-    const to = setTimeout(() => {
-      if (!ok) return;
-      let i = 0;
-      iv = setInterval(() => { i++; setN(i); if (i >= text.length) { clearInterval(iv); doneRef.current?.(); } }, speed);
-    }, delay);
-    return () => { ok = false; clearTimeout(to); clearInterval(iv); };
-  }, [text, speed, delay]);
-
-  return <>{text.slice(0, n)}</>;
-}
-
-/* ── Thinking Phase ── */
-function ThinkingPhase({ nodeCount, stepCount, pathStr, onDone }) {
-  const [stage, setStage] = useState(0); // 0=analyzing, 1=plan, 2=done
-
-  // Stage 0 → 1 after analyze line types out
-  const handleAnalyzeDone = useCallback(() => {
-    setTimeout(() => setStage(1), 400);
+    const t1 = setTimeout(() => setStage(1), 500);
+    const t2 = setTimeout(() => setStage(2), 1000);
+    const t3 = setTimeout(() => doneRef.current?.(), 1500);
+    return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
   }, []);
-
-  // Stage 1 → 2 after plan line appears
-  useEffect(() => {
-    if (stage === 1) {
-      const t = setTimeout(() => setStage(2), 600);
-      return () => clearTimeout(t);
-    }
-  }, [stage]);
-
-  // Notify parent when thinking is complete
-  const handlePlanDone = useCallback(() => {
-    setTimeout(() => onDone?.(), 300);
-  }, [onDone]);
 
   return (
     <div className="step-detail-panel__thinking">
       <div className="step-detail-panel__think-line">
-        {stage === 0 && (
-          <Typewriter text="▶ 分析任务需求..." speed={35} onDone={handleAnalyzeDone} />
+        {stage === 0 ? (
+          <span>▶ 分析任务需求 <RunDots /></span>
+        ) : (
+          <span className="step-detail-panel__think-done">
+            ▶ 分析任务需求 <span className="text-done">✓</span>
+          </span>
         )}
-        {stage >= 1 && <span className="step-detail-panel__think-done">▶ 分析任务需求... <span className="text-done">✓</span></span>}
       </div>
       {stage >= 1 && (
-        <div className="step-detail-panel__think-result">
-          <Typewriter text={`  ${nodeCount} 节点 · ${stepCount} 步骤 · 路径 ${pathStr}`} speed={18} />
+        <div className="step-detail-panel__think-result reveal">
+          {`  ${nodeCount} 节点 · ${stepCount} 步骤 · 路径 ${pathStr}`}
         </div>
       )}
       {stage >= 2 && (
-        <div className="step-detail-panel__think-done-line">
-          <Typewriter text="  ✓ 规划完成 · 0.3s" speed={25} onDone={handlePlanDone} />
+        <div className="step-detail-panel__think-done-line reveal">
+          {'  ✓ 规划完成 · 0.3s'}
         </div>
       )}
     </div>
@@ -116,66 +107,21 @@ function ThinkingPhase({ nodeCount, stepCount, pathStr, onDone }) {
 }
 
 /* ── Step row (call line + result line) ── */
-function StepRow({ step, posInBlock, status, isPast, timing, tick, showCallTypewriter }) {
-  const [callDone, setCallDone] = useState(!showCallTypewriter);
-  const [resultDone, setResultDone] = useState(false);
-  const prevStatusRef = useRef(status);
-
-  // Reset resultDone when status changes
-  useEffect(() => {
-    if (status !== prevStatusRef.current) {
-      prevStatusRef.current = status;
-      setResultDone(false);
-    }
-  }, [status]);
-
+function StepRow({ step, posInBlock, status, timing }) {
   const now = performance.now() / 1000;
   const elapsed = timing?.start
     ? `${Math.max(0, (timing.end || now) - timing.start).toFixed(1)}s`
     : '0.0s';
-  const spinner = BRAILLE[tick % BRAILLE.length];
 
-  const call = callText(step, posInBlock);
-  const result = resultLine(step, posInBlock, elapsed, spinner);
   const isRunning = status === 'running';
-  const isCompleted = status === 'completed';
-  const isPending = status === 'pending';
-  const isFailed = status === 'failed';
-  const hasResult = isCompleted || isRunning || isFailed;
 
   return (
     <div className={`step-detail-panel__step${isRunning ? ' step-detail-panel__step--active' : ''}`}>
-      {/* Call line */}
       <div className={`step-detail-panel__call step-detail-panel__call--${status}`}>
-        {showCallTypewriter && !callDone ? (
-          <>
-            <Typewriter key={`call-${step.step_id}`} text={call} speed={18} onDone={() => setCallDone(true)} />
-            <span className="step-detail-panel__cursor" />
-          </>
-        ) : (
-          call
-        )}
+        {callText(step, posInBlock)}
       </div>
-      {/* Result line */}
       <div className={`step-detail-panel__result step-detail-panel__result--${status}`}>
-        {hasResult ? (
-          resultDone ? (
-            // After typewriter completes, show live-updating text (needed for running timer)
-            result
-          ) : (
-            <>
-              <Typewriter
-                key={`res-${step.step_id}-${status}`}
-                text={result}
-                speed={isRunning ? 18 : 12}
-                onDone={() => setResultDone(true)}
-              />
-              {isRunning && <span className="step-detail-panel__cursor" />}
-            </>
-          )
-        ) : (
-          <span>{result}</span>
-        )}
+        <ResultLine step={step} posInBlock={posInBlock} elapsed={elapsed} status={status} />
       </div>
     </div>
   );
@@ -189,16 +135,20 @@ function StepDetailPanel({ steps, path, currentStepIndex }) {
   const [tick, setTick] = useState(0);
   const [thinkingDone, setThinkingDone] = useState(false);
 
-  // 100ms tick
+  // Live timer tick — runs ONLY while a step is executing, so the panel
+  // isn't re-rendering 10×/s during the thinking phase or after completion.
+  const hasRunning = !!steps && steps.some((s) => s.status === 'running');
   useEffect(() => {
-    const iv = setInterval(() => setTick(t => t + 1), 100);
+    if (!hasRunning) return undefined;
+    const iv = setInterval(() => setTick((t) => t + 1), 100);
     return () => clearInterval(iv);
-  }, []);
+  }, [hasRunning]);
+  void tick;
 
   // Track step timings
   const now = performance.now() / 1000;
   if (steps) {
-    steps.forEach(step => {
+    steps.forEach((step) => {
       if (!timingsRef.current[step.step_id]) {
         timingsRef.current[step.step_id] = { start: null, end: null };
       }
@@ -215,7 +165,6 @@ function StepDetailPanel({ steps, path, currentStepIndex }) {
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    // Find nearest scrollable ancestor (the wrapper now handles scrolling)
     let p = el.parentElement;
     while (p) {
       const s = window.getComputedStyle(p);
@@ -237,7 +186,7 @@ function StepDetailPanel({ steps, path, currentStepIndex }) {
       const nodeId = path?.[bi] || '?';
       const zoneId = ZONE_ID_BY_NODE[nodeId] || '?';
       const blockSteps = steps.slice(i, i + STEPS_PER_BLOCK);
-      const allDone = blockSteps.every(s => s.status === 'completed');
+      const allDone = blockSteps.every((s) => s.status === 'completed');
       const blockNow = performance.now() / 1000;
       const totalS = blockSteps.reduce((sum, s) => {
         const t = timingsRef.current[s.step_id];
@@ -265,8 +214,12 @@ function StepDetailPanel({ steps, path, currentStepIndex }) {
         )}
 
         {/* Blocks */}
-        {thinkingDone && blocks.map(block => (
-          <div key={block.index} className="step-detail-panel__block">
+        {thinkingDone && blocks.map((block) => (
+          <div
+            key={block.index}
+            className="step-detail-panel__block reveal"
+            style={{ animationDelay: `${Math.min(block.index * 0.08, 0.4)}s` }}
+          >
             {/* Block separator */}
             <div className={`step-detail-panel__block-sep${block.allDone ? ' step-detail-panel__block-sep--done' : ''}`}>
               ═══ Block {block.index + 1}/{blocks.length} · Node {block.nodeId} · {block.zoneId} ═══
@@ -274,13 +227,9 @@ function StepDetailPanel({ steps, path, currentStepIndex }) {
 
             {block.steps.map((step, si) => {
               const idx = globalIdx++;
+              void idx;
               const status = step.status || 'pending';
-              const isPast = status === 'completed' || status === 'failed' || idx < currentStepIndex;
-              const isCurrent = idx === currentStepIndex;
               const timing = timingsRef.current[step.step_id] || { start: null, end: null };
-
-              // Typewriter for call line: only the first time this step becomes non-pending
-              const showTypewriter = isCurrent;
 
               return (
                 <StepRow
@@ -288,10 +237,7 @@ function StepDetailPanel({ steps, path, currentStepIndex }) {
                   step={step}
                   posInBlock={si}
                   status={status}
-                  isPast={isPast}
                   timing={timing}
-                  tick={tick}
-                  showCallTypewriter={showTypewriter}
                 />
               );
             })}

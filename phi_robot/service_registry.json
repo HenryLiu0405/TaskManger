@@ -1,6 +1,7 @@
 {
   "compose_file": "/home/hairo/waic/docker-compose.yml",
   "compose_profile": "test",
+  "orin_host": "${WAIC_ORIN_HOST}",
   "services": [
     {
       "id": "navigation",
@@ -26,14 +27,13 @@
       "description": "ros2_manager_gateway_cpp — 接收 /cmd_vel，提供 lift/lay_down 等服务（真机 Orin）",
       "compose_service": null,
       "check": {
-        "method": "ros2_service",
-        "target": "/get_locomotion_mode",
-        "timeout_sec": 0.1
+        "method": "systemd",
+        "target": "waic-gateway@${APP_DOMAIN}"
       },
       "manage": {
         "method": "systemd",
-        "unit": "waic-gateway",
-        "ssh_host": "unitree@192.168.50.79"
+        "unit": "waic-gateway@${APP_DOMAIN}",
+        "ssh_host": "${orin_host}"
       },
       "depends_on": []
     },
@@ -45,12 +45,12 @@
       "compose_service": null,
       "check": {
         "method": "systemd",
-        "target": "waic-sonic-real"
+        "target": "waic-sonic-real@${APP_DOMAIN}"
       },
       "manage": {
         "method": "systemd",
-        "unit": "waic-sonic-real",
-        "ssh_host": "unitree@192.168.50.79"
+        "unit": "waic-sonic-real@${APP_DOMAIN}",
+        "ssh_host": "${orin_host}"
       },
       "depends_on": ["robot-gateway"]
     },
@@ -67,7 +67,7 @@
       "manage": {
         "method": "systemd",
         "unit": "waic-fastlio",
-        "ssh_host": "unitree@192.168.50.79"
+        "ssh_host": "${orin_host}"
       },
       "depends_on": []
     },
@@ -79,12 +79,12 @@
       "compose_service": null,
       "check": {
         "method": "systemd",
-        "target": "waic-zmq-bridge"
+        "target": "waic-zmq-bridge@${APP_DOMAIN}"
       },
       "manage": {
         "method": "systemd",
-        "unit": "waic-zmq-bridge",
-        "ssh_host": "unitree@192.168.50.79"
+        "unit": "waic-zmq-bridge@${APP_DOMAIN}",
+        "ssh_host": "${orin_host}"
       },
       "depends_on": []
     },
@@ -101,7 +101,7 @@
       "manage": {
         "method": "systemd",
         "unit": "waic-action-bridge",
-        "ssh_host": "unitree@192.168.50.79"
+        "ssh_host": "${orin_host}"
       },
       "depends_on": ["fastlio"]
     },
@@ -180,7 +180,7 @@
           "service": "/foundationpose/activate",
           "type": "foundationpose_ros2/srv/Activate",
           "data": "{activate: true}",
-          "setup_bash": "/home/hairo/fp_ws/install/setup.bash",
+          "setup_bash": "/home/hairo/waic/fp_ws/install/setup.bash",
           "retries": 15,
           "delay": 2.0
         }

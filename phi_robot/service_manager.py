@@ -6,6 +6,7 @@ ServiceManager — 容器生命周期管理器
 """
 
 from __future__ import annotations
+import os
 import subprocess
 import json
 import time
@@ -15,6 +16,17 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
 
 logger = logging.getLogger("phi_robot.service_manager")
+
+
+def _expand_env(value: str) -> str:
+    """展开字符串里的 ${VAR} / $VAR 环境变量（未定义则保持原样）。
+
+    用于 service_registry.json 里的 ${WAIC_ORIN_HOST} / ${APP_DOMAIN} 等占位符，
+    使 registry 随多机器人切换（active_robot.env）而指向正确的 Orin / bridge unit。
+    """
+    if not isinstance(value, str) or "$" not in value:
+        return value
+    return os.path.expandvars(value)
 
 
 @dataclass
@@ -41,6 +53,23 @@ class Registry:
     def from_file(cls, path: str) -> "Registry":
         with open(path) as f:
             data = json.load(f)
+        # 变量替换：
+        #  1) ${orin_host} → data["orin_host"]（历史兼容），
+        #     其中 data["orin_host"] 自身可含 ${WAIC_ORIN_HOST} 环境变量。
+        #  2) manage.unit / ssh_host 里的 ${WAIC_ORIN_HOST} / ${APP_DOMAIN}
+        #     等环境变量按当前进程 os.environ 解析（多机器人切换时随 domain 变化）。
+        orin_host = _expand_env(data.get("orin_host", ""))
+        for s in data["services"]:
+            mgr = s.get("manage")
+            if not mgr:
+                continue
+            if mgr.get("ssh_host") == "${orin_host}":
+                mgr["ssh_host"] = orin_host
+            # 环境变量替换（unit 名 / ssh_host 里的 ${APP_DOMAIN} 等）
+            if "unit" in mgr:
+                mgr["unit"] = _expand_env(mgr["unit"])
+            if "ssh_host" in mgr:
+                mgr["ssh_host"] = _expand_env(mgr["ssh_host"])
         services = [ServiceDef(**s) for s in data["services"]]
         return cls(
             compose_file=data["compose_file"],

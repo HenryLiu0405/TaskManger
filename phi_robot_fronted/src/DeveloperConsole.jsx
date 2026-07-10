@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { InputNumber, Button, Space, Tag, Card, Segmented } from 'antd';
-import { SendOutlined, PushpinOutlined } from '@ant-design/icons';
+import { InputNumber, Button, Space, Tag, Card, Segmented, Popconfirm, message } from 'antd';
+import { SendOutlined, PushpinOutlined, RobotOutlined } from '@ant-design/icons';
 import RobotPanel from './RobotPanel.jsx';
 import BoxPanel from './BoxPanel.jsx';
 import ServicePanel from './ServicePanel.jsx';
@@ -11,30 +11,8 @@ import StepDebugPanel from './StepDebugPanel.jsx';
 
 const API = '/api/dev';
 
-const PRESETS = [
-  { label: 'nw', x: 2.5, y: 2.5 },
-  { label: 'n',  x: 3.5, y: 2.5 },
-  { label: 'ne', x: 4.5, y: 2.5 },
-  { label: 'w',  x: 2.5, y: 1.5 },
-  { label: 'c',  x: 3.5, y: 1.5 },
-  { label: 'e',  x: 4.5, y: 1.5 },
-  { label: 'sw', x: 2.5, y: 0.5 },
-  { label: 's',  x: 3.5, y: 0.5 },
-  { label: 'se', x: 4.5, y: 0.5 },
-  { label: '顶右', x: 2.0, y: 1.5 },
-  { label: '顶中', x: 1.25, y: 1.5 },
-  { label: '顶左', x: 0.5, y: 1.5 },
-  { label: '中右', x: 2.0, y: 1.0 },
-  { label: '中中', x: 1.25, y: 1.0 },
-  { label: '中左', x: 0.5, y: 1.0 },
-  { label: '底右', x: 2.0, y: 0.5 },
-  { label: '底中', x: 1.25, y: 0.5 },
-  { label: '底左', x: 0.5, y: 0.5 },
-  { label: '原点', x: 0.5, y: 2.5 },
-];
-
-const GRID_PRESETS = PRESETS.filter((p) => /^[a-z]+$/.test(p.label));
-const STOCK_PRESETS = PRESETS.filter((p) => !/^[a-z]+$/.test(p.label) && p.label !== '原点');
+// 坐标从后端 /api/scene_coords 拉取（Nav2 map 世界坐标）。
+// 改坐标只需编辑 TaskManger/phi_robot/scene_coords.json + 重启后端，前端自动跟随。
 
 export default function DeveloperConsole() {
   const [mode, setMode] = useState('manual');
@@ -52,6 +30,86 @@ export default function DeveloperConsole() {
   const [sonicSource, setSonicSource] = useState('ROS2');
   const [sonicLoading, setSonicLoading] = useState(false);
   const [logViewMode, setLogViewMode] = useState('log');  // 'log' | 'camera'
+
+  // ── 多机器人切换状态 ─────────────────────────────
+  const [robotList, setRobotList] = useState([]);          // [{id,label,ip,domain_id}]
+  const [activeRobot, setActiveRobot] = useState(null);    // {active_id,label,ip,domain_id,runtime_domain,domain_synced,switching,...}
+  const [switching, setSwitching] = useState(false);
+  // 场景坐标（从 /api/scene_coords 拉）：gridPresets=9 目标点，stockPreset=单物料点
+  const [gridPresets, setGridPresets] = useState([]);      // [{label,x,y,theta}]
+  const [stockPreset, setStockPreset] = useState(null);    // {x,y,theta}
+
+  // 拉取场景坐标（一次）
+  useEffect(() => {
+    fetch('/api/scene_coords')
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.grid_cells) {
+          setGridPresets(
+            Object.entries(d.grid_cells).map(([label, c]) => ({
+              label, x: c.x, y: c.y, theta: c.theta,
+            }))
+          );
+        }
+        if (d.stock_point) setStockPreset(d.stock_point);
+      })
+      .catch(() => {});
+  }, []);
+
+  // 拉取可选机器人列表（一次）
+  useEffect(() => {
+    fetch('/api/robot/list')
+      .then((r) => r.json())
+      .then((d) => { if (d.robots) setRobotList(d.robots); })
+      .catch(() => {});
+  }, []);
+
+  // 轮询当前受控机器人 + 切换状态
+  useEffect(() => {
+    let active = true;
+    async function pollActive() {
+      try {
+        const res = await fetch('/api/robot/active');
+        const data = await res.json();
+        if (!active) return;
+        setActiveRobot(data);
+        setSwitching(!!data.switching);
+      } catch (_) {
+        // 切换重启期间后端会短暂 500/断连 → 视为切换中
+        if (active) setSwitching(true);
+      }
+    }
+    pollActive();
+    const timer = setInterval(pollActive, 1000);
+    return () => { active = false; clearInterval(timer); };
+  }, []);
+
+  async function handleSwitchRobot(robotId) {
+    if (switching) return;
+    if (activeRobot && activeRobot.active_id === robotId && activeRobot.domain_synced) {
+      message.info('已在控制该机器人');
+      return;
+    }
+    setSwitching(true);
+    try {
+      const res = await fetch('/api/robot/switch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ robot_id: robotId }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        message.warning(data.message || '正在切换，服务重启中…', 4);
+      } else {
+        setSwitching(false);
+        message.error(data.message || '切换失败');
+      }
+    } catch (_) {
+      // 请求本身可能因重启中断 → 保持切换中，由轮询恢复
+      message.warning('切换请求已发出，服务重启中…', 4);
+    }
+  }
+
 
   // ── 机器人安全状态轮询 ──────────────────────────
   useEffect(() => {
@@ -126,11 +184,13 @@ export default function DeveloperConsole() {
   }
 
   function handleModeChange(val) {
+    if (switching) return;
     setMode(val);
     call('/mode', { mode: val });
   }
 
   function handleNext() {
+    if (switching) return;
     const body = {};
     if (targetX != null && targetY != null) {
       body.target = { x: targetX, y: targetY };
@@ -140,10 +200,10 @@ export default function DeveloperConsole() {
     });
   }
 
-  function handlePause() { call('/manual/pause'); }
-  function handleStop() { call('/manual/stop'); }
-  function handlePick() { call('/manual/pick'); }
-  function handlePlace() { call('/manual/place'); }
+  function handlePause() { if (switching) return; call('/manual/pause'); }
+  function handleStop() { if (switching) return; call('/manual/stop'); }
+  function handlePick() { if (switching) return; call('/manual/pick'); }
+  function handlePlace() { if (switching) return; call('/manual/place'); }
 
   async function toggleSonicSource(gamepad) {
     setSonicLoading(true);
@@ -164,12 +224,13 @@ export default function DeveloperConsole() {
   }
 
   function handleAutoStart() {
+    if (switching) return;
     if (autoDests.length === 0) return;
     call('/auto/start', { destinations: autoDests });
   }
-  function handleAutoPause() { call('/auto/pause'); }
-  function handleAutoResume() { call('/auto/resume'); }
-  function handleAutoStop() { call('/auto/stop'); }
+  function handleAutoPause() { if (switching) return; call('/auto/pause'); }
+  function handleAutoResume() { if (switching) return; call('/auto/resume'); }
+  function handleAutoStop() { if (switching) return; call('/auto/stop'); }
 
   function handleClearLogs() {
     skipCountRef.current = logsRef.current.length;
@@ -196,6 +257,7 @@ export default function DeveloperConsole() {
           <Segmented
             value={mode}
             onChange={handleModeChange}
+            disabled={switching}
             options={[
               { label: '手动模式', value: 'manual' },
               { label: '分步调试', value: 'step_debug' },
@@ -204,6 +266,42 @@ export default function DeveloperConsole() {
           />
         </div>
         <div className="flex items-center gap-3">
+          {/* 机器人切换器 */}
+          <Space size={4}>
+            <RobotOutlined style={{ color: '#d4a853' }} />
+            {robotList.map((r) => {
+              const isActive = activeRobot?.active_id === r.id && activeRobot?.domain_synced;
+              return (
+                <Popconfirm
+                  key={r.id}
+                  title={`切换到 ${r.label}?`}
+                  description={`将重启工作站服务（domain ${r.domain_id} · ${r.ip}），约 10-20 秒`}
+                  okText="确认切换"
+                  cancelText="取消"
+                  disabled={switching || isActive}
+                  onConfirm={() => handleSwitchRobot(r.id)}
+                >
+                  <Button
+                    size="small"
+                    type={isActive ? 'primary' : 'default'}
+                    disabled={switching}
+                    title={`${r.ip} · domain ${r.domain_id}`}
+                  >
+                    {r.label}
+                    <span className="text-[10px] opacity-70 ml-1">d{r.domain_id}</span>
+                  </Button>
+                </Popconfirm>
+              );
+            })}
+          </Space>
+          {/* 当前受控机器人 */}
+          <Tag color={switching ? 'warning' : activeRobot?.domain_synced ? 'success' : 'error'}>
+            {switching
+              ? `⚠ 切换到 ${activeRobot?.switch_target || '…'} 中…`
+              : activeRobot
+                ? `控制中: ${activeRobot.label} (${activeRobot.ip}·d${activeRobot.runtime_domain})`
+                : '机器人未知'}
+          </Tag>
           <Tag color={connected ? 'success' : 'error'}>
             {connected ? '● 已连接' : '○ 断开'}
           </Tag>
@@ -234,6 +332,25 @@ export default function DeveloperConsole() {
           </Tag>
         </div>
       </header>
+
+      {/* ── 切换中横幅 ─────────────────────────────── */}
+      {switching && (
+        <div
+          className="shrink-0 text-center py-1.5 text-sm font-bold"
+          style={{ background: '#4a3a10', color: '#d4a853', borderBottom: '1px solid #d4a853' }}
+        >
+          ⚠ 正在切换到 {activeRobot?.switch_target || '目标机器人'}，工作站服务重启中，请勿操作（约 10-20 秒）…
+        </div>
+      )}
+      {!switching && activeRobot && !activeRobot.domain_synced && (
+        <div
+          className="shrink-0 text-center py-1.5 text-sm font-bold"
+          style={{ background: '#4a1010', color: '#ff7875', borderBottom: '1px solid #d44a4a' }}
+        >
+          ⚠ 工作站 domain ({activeRobot.runtime_domain}) 与目标机器人 {activeRobot.label} (d{activeRobot.domain_id}) 不一致 —
+          {activeRobot.switch_error ? ' 上次切换失败，请检查 systemctl 状态' : ' 请重新切换'}
+        </div>
+      )}
 
       {/* ── 主体: 左侧栏 + 右侧主区域 ─────────────── */}
       <div className="flex-1 flex min-h-0">
@@ -277,7 +394,7 @@ export default function DeveloperConsole() {
                     <PushpinOutlined className="mr-1" />目标位置（点击加入序列）
                   </div>
                   <Space wrap size={4}>
-                    {GRID_PRESETS.map((p) => (
+                    {gridPresets.map((p) => (
                       <Button
                         key={p.label}
                         size="small"
@@ -290,15 +407,16 @@ export default function DeveloperConsole() {
                     ))}
                   </Space>
                 </div>
-                {/* 取货点 — 系统自动分配 */}
+                {/* 取货点 — 固定单点，人工补料 */}
                 <div className="mb-2">
-                  <div className="text-sm text-[#8a8a8a] mb-1">取货点（系统按顺序自动分配）</div>
+                  <div className="text-sm text-[#8a8a8a] mb-1">取货点（固定，人工补料）</div>
                   <Space wrap size={4}>
-                    {STOCK_PRESETS.map((p) => (
-                      <Button key={p.label} size="small" disabled>
-                        {p.label}
+                    {stockPreset && (
+                      <Button size="small" disabled>
+                        物料
+                        <span className="text-sm text-[#8a8a8a] ml-1">({stockPreset.x},{stockPreset.y})</span>
                       </Button>
-                    ))}
+                    )}
                   </Space>
                 </div>
                 {/* 目标序列展示 */}
@@ -339,7 +457,7 @@ export default function DeveloperConsole() {
                     <PushpinOutlined className="mr-1" />预设位置
                   </div>
                   <Space wrap size={4}>
-                    {PRESETS.map((p) => (
+                    {[...gridPresets, ...(stockPreset ? [{ label: '物料', x: stockPreset.x, y: stockPreset.y }] : [])].map((p) => (
                       <Button
                         key={p.label}
                         size="small"
@@ -360,7 +478,7 @@ export default function DeveloperConsole() {
                   <InputNumber size="small" style={{ width: 80 }} placeholder="0.5" step={0.5} value={targetX} onChange={setTargetX} />
                   <span className="text-sm text-[#8a8a8a]">Y</span>
                   <InputNumber size="small" style={{ width: 80 }} placeholder="3.5" step={0.5} value={targetY} onChange={setTargetY} />
-                  <Button size="small" type="primary" icon={<SendOutlined />} onClick={handleNext} disabled={targetX == null || targetY == null || robotState?.can_walk === false} loading={loading}>
+                  <Button size="small" type="primary" icon={<SendOutlined />} onClick={handleNext} disabled={switching || targetX == null || targetY == null || robotState?.can_walk === false} loading={loading}>
                     导航
                   </Button>
                 </div>

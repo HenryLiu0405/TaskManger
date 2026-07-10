@@ -1,36 +1,67 @@
 """
 phi_robot 任务规划生成器
 将九宫格路径展开为可执行的 PlanStep 列表
+
+坐标来源：TaskManger/phi_robot/scene_coords.json（rviz2 量取的 Nav2 map 世界坐标）。
+坐标已是 Nav2 map 系 → 不再做 real_to_nav2 仿射；plan 直接使用配置坐标。
+改坐标只需编辑 scene_coords.json 后重启 TaskManger。
 """
 
 from __future__ import annotations
+import json
 import math
+import os
 from typing import List, Dict, Any, Tuple
 from .models import PlanStep, GridCell, StockSlot
 
 
-# ── 坐标变换 ──────────────────────────────────────────────────────────
-# 真实场地坐标系 → Nav2 map 坐标系（仿射变换，由四个角点标定确定）
-#   真实            →   Nav2 map
-#   (0, 3)   左上   →   (-0.46, -2.30)
-#   (0, 0)   左下   →   (-0.63,  0.67)
-#   (5, 3)   右上   →   ( 4.54, -2.30)
-#   (5, 0)   右下   →   ( 4.37,  0.67)
+# ── 坐标配置加载（scene_coords.json，Nav2 map 系）────────────────────────
+_SCENE_COORDS_PATH = os.path.join(os.path.dirname(__file__), "scene_coords.json")
+_scene_cache: Dict[str, Any] | None = None
 
 
-def real_to_nav2(x: float, y: float) -> tuple[float, float]:
-    """真实场地坐标 (米) → Nav2 map 坐标 (米)"""
-    nav2_x = 1.0 * x + 0.0567 * y - 0.63
-    nav2_y = 0.0 * x - 0.99 * y + 0.67
-    return (nav2_x, nav2_y)
+def load_scene_coords(reload: bool = False) -> Dict[str, Any]:
+    """读取并缓存 scene_coords.json（Nav2 map 世界坐标）。
+
+    Args:
+        reload: True 时强制重新读盘（改坐标后无需重启进程即可生效）。
+    """
+    global _scene_cache
+    if _scene_cache is None or reload:
+        with open(_SCENE_COORDS_PATH, "r", encoding="utf-8") as f:
+            _scene_cache = json.load(f)
+    return _scene_cache
 
 
-# ── approach 点计算 ────────────────────────────────────────────────────
-# Nav2 地图边界（由四个角点标定确定）
-_MAP_X_MIN = -0.7
-_MAP_X_MAX = 4.6
-_MAP_Y_MIN = -2.4
-_MAP_Y_MAX = 0.7
+def get_grid_cells(version: str = "scene-v1") -> Dict[str, GridCell]:
+    """从配置返回九宫格目标点表（Nav2 map 坐标）。"""
+    coords = load_scene_coords()
+    return {
+        pos: GridCell(pos, float(c["x"]), float(c["y"]), 0.0, float(c.get("theta", 0.0)))
+        for pos, c in coords["grid_cells"].items()
+    }
+
+
+def get_stock_point(version: str = "stock-v1") -> StockSlot:
+    """从配置返回唯一物料点（Nav2 map 坐标）。
+
+    物料点已从九宫格改为单个固定点：人工每次把圆柱放到该点供机器人取料。
+    theta 存进 StockSlot.z 之外无字段，故通过 load_scene_coords 单独取朝向。
+    """
+    coords = load_scene_coords()
+    sp = coords["stock_point"]
+    return StockSlot(0, float(sp["x"]), float(sp["y"]), 0.0, order_index=0, consumed=False)
+
+
+def get_stock_theta(version: str = "stock-v1") -> float:
+    """物料点朝向（弧度）。"""
+    return float(load_scene_coords()["stock_point"].get("theta", math.pi / 2))
+
+
+def _map_bounds() -> tuple[float, float, float, float]:
+    """从配置返回 Nav2 地图边界 (x_min, x_max, y_min, y_max)。"""
+    b = load_scene_coords()["map_bounds"]
+    return (float(b["x_min"]), float(b["x_max"]), float(b["y_min"]), float(b["y_max"]))
 
 
 def compute_approach(
@@ -40,12 +71,12 @@ def compute_approach(
     """
     从物体在 Nav2 map 系下的位姿，计算机器人接近位姿。
 
-    机器人停在物体前方 offset 米处，朝向 +Y（π/2），
-    为搬起/放下动作留出操作距离。
+    机器人停在物体前方 offset 米处，朝向由 obj_nav2 的 yaw 决定
+    （沿该朝向反向后退 offset），为搬起/放下动作留出操作距离。
 
     Args:
-        obj_nav2: 物体在 Nav2 map 系下的 (x, y, yaw)，yaw 为弧度
-        offset: 机器人停在物体前方的距离（米），默认 0.1
+        obj_nav2: 物体在 Nav2 map 系下的 (x, y, yaw)，yaw 为弧度（机器人最终朝向）
+        offset: 机器人停在物体前方的距离（米）
 
     Returns:
         (app_x, app_y, app_yaw) — Nav2 map 系下的接近位姿
@@ -53,79 +84,23 @@ def compute_approach(
     Raises:
         ValueError: 如果接近点超出地图边界
     """
-    ox, oy, oyaw = obj_nav2
-    _ = oyaw  # 保留参数兼容性；朝向统一用 π/2
+    ox, oy, app_yaw = obj_nav2
 
-    app_yaw = math.pi / 2   # 机器人最终朝向 y 轴正方向
+    # 沿最终朝向反向后退 offset：机器人停在点前方、面向该点
     app_x = ox - offset * math.cos(app_yaw)
     app_y = oy - offset * math.sin(app_yaw)
 
-    if not (_MAP_X_MIN <= app_x <= _MAP_X_MAX):
+    x_min, x_max, y_min, y_max = _map_bounds()
+    if not (x_min <= app_x <= x_max):
         raise ValueError(
-            f"approach x={app_x:.2f} out of map bounds [{_MAP_X_MIN}, {_MAP_X_MAX}]"
+            f"approach x={app_x:.2f} out of map bounds [{x_min}, {x_max}]"
         )
-    if not (_MAP_Y_MIN <= app_y <= _MAP_Y_MAX):
+    if not (y_min <= app_y <= y_max):
         raise ValueError(
-            f"approach y={app_y:.2f} out of map bounds [{_MAP_Y_MIN}, {_MAP_Y_MAX}]"
+            f"approach y={app_y:.2f} out of map bounds [{y_min}, {y_max}]"
         )
 
     return (app_x, app_y, app_yaw)
-
-
-# 九宫格编号到坐标的映射（单位：米，真实场地坐标系）
-#   Y=2.5 (北)
-#   ┌────┬────┬────┐
-#   │ nw │ n  │ ne │
-#   ├────┼────┼────┤
-#   │ w  │ c  │ e  │
-#   ├────┼────┼────┤
-#   │ sw │ s  │ se │
-#   └────┴────┴────┘  Y=0.5 (南)
-GRID_CELLS: Dict[str, GridCell] = {
-    "nw": GridCell("nw", 2.5, 2.5, 0.0, 0.0),
-    "n":  GridCell("n",  3.5, 2.5, 0.0, 0.0),
-    "ne": GridCell("ne", 4.5, 2.5, 0.0, 0.0),
-    "w":  GridCell("w",  2.5, 1.5, 0.0, 0.0),
-    "c":  GridCell("c",  3.5, 1.5, 0.0, 0.0),
-    "e":  GridCell("e",  4.5, 1.5, 0.0, 0.0),
-    "sw": GridCell("sw", 2.5, 0.5, 0.0, 0.0),
-    "s":  GridCell("s",  3.5, 0.5, 0.0, 0.0),
-    "se": GridCell("se", 4.5, 0.5, 0.0, 0.0),
-}
-
-# 备货槽位坐标表（真实场地坐标系）
-#   3列 × 3行 物料区，slot 按 order_index 0→8 消耗
-#   ┌─────┬──────┬─────┐  Y=1.5 (北)
-#   │ A1  │  A2  │ A3  │
-#   │ 2.0 │ 1.25 │ 0.5 │
-#   ├─────┼──────┼─────┤
-#   │ A4  │  A5  │ A6  │  Y=1.0
-#   ├─────┼──────┼─────┤
-#   │ A7  │  A8  │ A9  │  Y=0.5 (南)
-#   └─────┴──────┴─────┘
-STOCK_SLOTS: List[StockSlot] = [
-    StockSlot(0, 2.0, 1.5, 0.0, order_index=0, consumed=False),   # A1
-    StockSlot(1, 1.25, 1.5, 0.0, order_index=1, consumed=False),   # A2
-    StockSlot(2, 0.5, 1.5, 0.0, order_index=2, consumed=False),    # A3
-    StockSlot(3, 2.0, 1.0, 0.0, order_index=3, consumed=False),    # A4
-    StockSlot(4, 1.25, 1.0, 0.0, order_index=4, consumed=False),   # A5
-    StockSlot(5, 0.5, 1.0, 0.0, order_index=5, consumed=False),    # A6
-    StockSlot(6, 2.0, 0.5, 0.0, order_index=6, consumed=False),    # A7
-    StockSlot(7, 1.25, 0.5, 0.0, order_index=7, consumed=False),   # A8
-    StockSlot(8, 0.5, 0.5, 0.0, order_index=8, consumed=False),    # A9
-]
-
-
-def get_grid_cells(version: str = "scene-v1") -> Dict[str, GridCell]:
-    """按场景版本返回九宫格坐标表"""
-    # 当前只有 v1，后续版本在此扩展
-    return GRID_CELLS
-
-
-def get_stock_slots(version: str = "stock-v1") -> List[StockSlot]:
-    """按库存布局版本返回备货槽位表"""
-    # 当前只有 v1，后续版本在此扩展
-    return STOCK_SLOTS
 
 
 class MissionPlanner:
@@ -168,7 +143,8 @@ class MissionPlanner:
             raise ValueError(f"任务数不能超过 {max_tasks}（当前 {len(destination_order)}）")
 
         grid_cells = get_grid_cells(scene_version)
-        stock_slots = get_stock_slots(stock_layout_version)
+        stock_point = get_stock_point(stock_layout_version)   # 单一固定物料点
+        stock_theta = get_stock_theta(stock_layout_version)   # 物料点朝向（弧度）
 
         for position in destination_order:
             if position not in grid_cells:
@@ -178,20 +154,18 @@ class MissionPlanner:
         self._step_counter = 0
 
         for task_index, destination_position in enumerate(destination_order):
-            if task_index >= len(stock_slots):
-                raise ValueError(f"任务 {task_index} 超出槽位数量 {len(stock_slots)}")
+            # 物料点已改为单一固定点：所有 task 共用同一取料点（人工补料）
 
-            stock_slot = stock_slots[task_index]
-
-            # 第 1 步: 移动到备货槽位 approach 点
-            nav2_x, nav2_y = real_to_nav2(stock_slot.x, stock_slot.y)
+            # 第 1 步: 移动到物料点 approach 点
+            # 坐标已是 Nav2 map 系（scene_coords.json），不再做 real_to_nav2
+            nav2_x, nav2_y = stock_point.x, stock_point.y
             try:
                 app_x, app_y, app_yaw = compute_approach(
-                    (nav2_x, nav2_y, 0.0), offset=0.6
+                    (nav2_x, nav2_y, stock_theta), offset=0.6
                 )
             except ValueError as e:
                 raise ValueError(
-                    f"slot {stock_slot.slot_id} approach 点越界: {e}"
+                    f"物料点 approach 点越界: {e}"
                 ) from e
             plan.append(
                 PlanStep(
@@ -199,7 +173,7 @@ class MissionPlanner:
                     task_index=task_index,
                     tool="move_to",
                     args={
-                        "target": {"x": app_x, "y": app_y, "z": stock_slot.z, "theta": app_yaw},
+                        "target": {"x": app_x, "y": app_y, "z": stock_point.z, "theta": app_yaw},
                         "action": "start",
                         "timeout_s": 30,
                         "request_id": request_id,
@@ -227,16 +201,16 @@ class MissionPlanner:
                 )
             )
 
-            # 第 3 步: 移动到目标放置位（直接到格子，不需要 approach offset）
+            # 第 3 步: 移动到目标放置位（直接到格子，坐标已是 Nav2 map 系）
             goal_cell = grid_cells[destination_position]
-            nav2_gx, nav2_gy = real_to_nav2(goal_cell.x, goal_cell.y)
+            nav2_gx, nav2_gy = goal_cell.x, goal_cell.y
             plan.append(
                 PlanStep(
                     step_id=self._next_step_id(),
                     task_index=task_index,
                     tool="move_to",
                     args={
-                        "target": {"x": nav2_gx, "y": nav2_gy, "z": goal_cell.z, "theta": math.pi / 2},
+                        "target": {"x": nav2_gx, "y": nav2_gy, "z": goal_cell.z, "theta": goal_cell.theta},
                         "action": "start",
                         "timeout_s": 30,
                         "request_id": request_id,

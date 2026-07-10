@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import gsap from 'gsap';
 import PhiRobotAPIClient from './api.js';
 import UnifiedConsole from './UnifiedConsole.jsx';
@@ -18,6 +18,7 @@ function App() {
   const [path, setPath] = useState([]);
   const [missionStatus, setMissionStatus] = useState(null);
   const [lastError, setLastError] = useState(null);
+  const [planId, setPlanId] = useState(0);
 
   useEffect(() => {
     document.title = 'phi_robot 九宫格锁屏式 Demo';
@@ -36,21 +37,72 @@ function App() {
     }
   }, [isRunning, isDrawing]);
 
-  function appendNode(nodeId) {
+  const appendNode = useCallback((nodeId) => {
     setPath((currentPath) => {
       if (currentPath.includes(nodeId)) return currentPath;
       return [...currentPath, nodeId];
     });
-  }
+  }, []);
 
-  function handleDrawStart() {
+  const handleDrawStart = useCallback(() => {
     if (isRunning) return;
     setIsDrawing(true);
-  }
+  }, [isRunning]);
 
-  function handleDrawEnd() {
-    setIsDrawing(false);
-  }
+  const handleDrawEnd = useCallback(() => setIsDrawing(false), []);
+
+  // SSE 订阅：监听 StepDebugController 状态变更，同步到主页 UI
+  useEffect(() => {
+    if (planId === 0) return; // 尚未加载计划
+
+    const es = new EventSource('/api/dev/step_debug/stream');
+
+    es.addEventListener('state', (msg) => {
+      try {
+        const payload = JSON.parse(msg.data);
+
+        // 映射 step_debug state → mission status
+        const stateStatusMap = {
+          step_ready: 'ready',
+          executing: 'running',
+          step_done: 'running',
+          paused: 'paused',
+          step_failed: 'failed',
+          idle: 'completed',
+          aborted: 'aborted',
+        };
+
+        setMissionStatus((prev) => {
+          if (!prev || !prev.steps) return prev;
+          const ci = payload.current_index;
+          const updatedSteps = prev.steps.map((step, i) => {
+            let status = 'pending';
+            if (i < ci) {
+              status = 'completed';
+            } else if (i === ci) {
+              if (payload.state === 'step_failed') status = 'failed';
+              else if (payload.state === 'executing') status = 'running';
+              else status = 'current';
+            }
+            return { ...step, status };
+          });
+
+          return {
+            ...prev,
+            status: stateStatusMap[payload.state] || prev.status,
+            current_step_index: ci,
+            steps: updatedSteps,
+          };
+        });
+
+        setIsRunning(
+          payload.state === 'executing' || payload.state === 'step_done'
+        );
+      } catch (_) { /* ignore malformed SSE */ }
+    });
+
+    return () => es.close();
+  }, [planId]);
 
   async function startMission() {
     if (path.length === 0) {
@@ -59,60 +111,34 @@ function App() {
     }
 
     setLastError(null);
-    const destinationOrder = path.map((nodeId) => ZONE_ID_BY_NODE[nodeId]);
+    const destinations = path.map((nodeId) => ZONE_ID_BY_NODE[nodeId]);
 
     try {
-      const submitted = await api.submitMission(destinationOrder);
-      setMissionStatus({ ...submitted, current_step_index: 0, total_steps: destinationOrder.length });
+      const res = await fetch('/api/dev/step_debug/load', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ destinations }),
+      });
+      const data = await res.json();
 
-      try {
-        const runResult = await api.runMission(submitted.mission_id);
-        setMissionStatus((prev) => ({ ...prev, ...runResult }));
-
-        api.startPolling((status) => {
-          setMissionStatus(status);
-          if (status.status === 'paused') {
-            setIsRunning(false);
-            api.stopPolling();
-          }
-        }, 500);
-
-        setIsRunning(true);
-        setIsDrawing(false);
-      } catch (err) {
-        if (err && err.status === 409) {
-          const wantView = window.confirm(`${err.message}\n\nMission already running. OK to view, Cancel to abort.`);
-          if (wantView) {
-            try {
-              const status = await api.getMissionStatus(submitted.mission_id);
-              setMissionStatus(status);
-              api.startPolling((status) => {
-                setMissionStatus(status);
-                if (status.status === 'paused') {
-                  setIsRunning(false);
-                  api.stopPolling();
-                }
-              }, 500);
-              setIsRunning(status.status !== 'paused');
-            } catch (e) {
-              setLastError(e.message || 'Failed to get mission status');
-            }
-          } else {
-            try {
-              await api.abortMission(submitted.mission_id);
-              setLastError('Abort request sent');
-              setIsRunning(false);
-              setMissionStatus(null);
-            } catch (e) {
-              setLastError(e.message || 'Failed to abort');
-            }
-          }
-        } else {
-          setLastError(err.message || 'Failed to start mission');
-        }
+      if (!data.ok) {
+        setLastError(data.message || 'Failed to load plan');
+        return;
       }
+
+      // 计划已加载到 StepDebugController，等待操作员在 debug.html 执行
+      setMissionStatus({
+        status: 'ready',
+        current_step_index: 0,
+        total_steps: data.total_steps,
+        steps: data.raw_steps,
+      });
+      setIsRunning(false);
+      setIsDrawing(false);
+      // 触发 SSE 连接
+      setPlanId((prev) => prev + 1);
     } catch (err) {
-      setLastError(err.message || 'Failed to start mission');
+      setLastError(err.message || 'Failed to load plan');
     }
   }
 
