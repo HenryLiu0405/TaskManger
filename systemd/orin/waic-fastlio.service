@@ -12,7 +12,7 @@ Environment="CYCLONEDDS_URI=<CycloneDDS><Domain><General><NetworkInterfaceAddres
 StandardInput=null
 KillSignal=SIGINT
 ExecStartPre=/bin/bash -c 'xhost +SI:localuser:unitree 2>/dev/null || true'
-ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec bash /home/unitree/fastlio_ws_new/launch_full_navigation.sh'
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec bash /home/unitree/G1-LioNav/launch_full_navigation.sh'
 Restart=on-failure
 RestartSec=5
 

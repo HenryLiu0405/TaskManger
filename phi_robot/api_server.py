@@ -25,6 +25,7 @@ from .dev_console import DevConsoleController
 from .step_debug import StepDebugController
 from .robot_state import safety_fsm, RobotState
 from .audit import audit_logger
+from .adapters.realsense_camera import RealsenseGrabber
 
 logger = logging.getLogger("phi_robot.api")
 
@@ -116,6 +117,7 @@ class PhiRobotAPIServer:
         self.port = port
         self.service = MissionService()
         self.adapter = adapter if adapter is not None else UnitreeSimBackend()
+        self.rs_grabber = RealsenseGrabber()
         self.active_runners: Dict[str, MissionRunner] = {}
         self.mission_hooks: Dict[str, APIHook] = {}
         self._cancel_events: Dict[str, threading.Event] = {}
@@ -815,6 +817,16 @@ class PhiRobotAPIServer:
                 logger.exception("reset_fp 失败")
                 return jsonify({"ok": False, "message": str(e)})
 
+        @self.app.route("/api/dev/step_debug/auto_drop_recovery", methods=["POST"])
+        def step_debug_auto_drop_recovery():
+            """自动化掉箱处理（仅自动执行模式）"""
+            try:
+                result = self.step_debug.auto_drop_recovery()
+                return jsonify(result)
+            except Exception as e:
+                logger.exception("auto_drop_recovery 失败")
+                return jsonify({"ok": False, "message": str(e)})
+
         # ── 掉箱处理（手动重规划） ──
 
         @self.app.route("/api/dev/step_debug/drop_detector/enable", methods=["POST"])
@@ -865,6 +877,36 @@ class PhiRobotAPIServer:
                 return jsonify(result)
             except Exception as e:
                 logger.exception("stand_robot 失败")
+                return jsonify({"ok": False, "message": str(e)})
+
+        @self.app.route("/api/dev/step_debug/robot/step_back", methods=["POST"])
+        def step_debug_step_back_robot():
+            """让机器人后退两步"""
+            try:
+                result = self.step_debug.step_back_robot()
+                return jsonify(result)
+            except Exception as e:
+                logger.exception("step_back_robot 失败")
+                return jsonify({"ok": False, "message": str(e)})
+
+        @self.app.route("/api/dev/step_debug/recover_stuck", methods=["POST"])
+        def step_debug_recover_stuck():
+            """回到物料点：将计划回退到最近一次走到物料点的步骤"""
+            try:
+                result = self.step_debug.reset_to_stock_point()
+                return jsonify(result)
+            except Exception as e:
+                logger.exception("reset_to_stock_point 失败")
+                return jsonify({"ok": False, "message": str(e)})
+
+        @self.app.route("/api/dev/step_debug/go_origin", methods=["POST"])
+        def step_debug_go_origin():
+            """导航到机器人原点"""
+            try:
+                result = self.step_debug.go_to_robot_origin()
+                return jsonify(result)
+            except Exception as e:
+                logger.exception("go_to_robot_origin 失败")
                 return jsonify({"ok": False, "message": str(e)})
 
         @self.app.route("/api/dev/step_debug/dropped/identify", methods=["POST"])
@@ -1086,6 +1128,37 @@ class PhiRobotAPIServer:
                                        + placeholder + b'\r\n')
                             last_data_time = time.time()
                     time.sleep(0.033)  # ~30 fps cap
+
+            return Response(
+                generate(),
+                mimetype='multipart/x-mixed-replace; boundary=frame',
+                headers={
+                    'Cache-Control': 'no-cache, no-store, must-revalidate',
+                    'X-Accel-Buffering': 'no',
+                },
+            )
+
+        # ── RealSense USB 原始画面 MJPEG 流 ────────────────
+        @self.app.route("/api/rs/video/rgb/stream", methods=["GET"])
+        def rs_video_rgb_stream():
+            """RealSense 原始 RGB MJPEG 流（USB 直连工作站相机）"""
+            grabber = self.rs_grabber
+
+            def generate():
+                last_data_time = time.time()
+                while True:
+                    frame = grabber.get_frame()
+                    if frame is not None:
+                        last_data_time = time.time()
+                        yield (b'--frame\r\n'
+                               b'Content-Type: image/jpeg\r\n\r\n'
+                               + frame + b'\r\n')
+                    else:
+                        # 超过 2 秒无数据 → 停顿避免空转
+                        if time.time() - last_data_time > 2.0:
+                            time.sleep(0.1)
+                            last_data_time = time.time()
+                    time.sleep(0.033)  # ~30 fps
 
             return Response(
                 generate(),

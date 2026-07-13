@@ -186,6 +186,23 @@
         }
       },
       "depends_on": []
+    },
+    {
+      "id": "camera-obstacle",
+      "group": "server",
+      "label": "📷 障碍物检测",
+      "description": "G1 D435i 橙色圆柱检测 + 紧急刹车 (OpenCV HSV)",
+      "compose_service": null,
+      "check": {
+        "method": "systemd",
+        "target": "waic-camera-obstacle"
+      },
+      "manage": {
+        "method": "systemd",
+        "unit": "waic-camera-obstacle",
+        "user": true
+      },
+      "depends_on": []
     }
   ]
 }

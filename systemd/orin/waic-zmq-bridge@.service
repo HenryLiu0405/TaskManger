@@ -1,26 +1,28 @@
 [Unit]
-Description=WAIC ZMQ Bridge (12 workers: goal/cmd_vel/tf/tf_static/nav_pause/nav_reached)
+Description=WAIC ZMQ Bridge (app-domain %i; 12 workers: goal/cmd_vel/tf/tf_static/nav_pause/nav_reached)
 After=network.target
 
 [Service]
 Type=simple
+# %i = 应用层 Fast-DDS domain（.168 → 66, .215 → 5）。
+# Cyclone 侧固定 domain 0（机器人本地 nav），永不改。
 ExecStart=/bin/bash -c '\
 source /opt/ros/humble/setup.bash ; \
-PID_DIR=/tmp/waic-zmq-pids ; rm -rf $$PID_DIR ; mkdir -p $$PID_DIR ; \
+PID_DIR=/tmp/waic-zmq-pids-%i ; rm -rf $$PID_DIR ; mkdir -p $$PID_DIR ; \
 cleanup() { for f in $$PID_DIR/*; do kill $$(cat $$f) 2>/dev/null; done; rm -rf $$PID_DIR; }; \
 trap cleanup EXIT ; \
-python3 /home/unitree/waic_bridge/zmq_bridge.py sub rmw_fastrtps_cpp 66 /goal_pose geometry_msgs/msg/PoseStamped 5561 & echo $$! >$$PID_DIR/sub_goal ; sleep 0.3 ; \
+python3 /home/unitree/waic_bridge/zmq_bridge.py sub rmw_fastrtps_cpp %i /goal_pose geometry_msgs/msg/PoseStamped 5561 & echo $$! >$$PID_DIR/sub_goal ; sleep 0.3 ; \
 python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_cyclonedds_cpp 0 /goal_pose geometry_msgs/msg/PoseStamped 5561 & echo $$! >$$PID_DIR/pub_goal ; sleep 0.3 ; \
 python3 /home/unitree/waic_bridge/zmq_bridge.py sub rmw_cyclonedds_cpp 0 /cmd_vel geometry_msgs/msg/Twist 5562 & echo $$! >$$PID_DIR/sub_cmdvel ; sleep 0.3 ; \
-python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_fastrtps_cpp 66 /cmd_vel geometry_msgs/msg/Twist 5562 & echo $$! >$$PID_DIR/pub_cmdvel ; sleep 0.3 ; \
+python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_fastrtps_cpp %i /cmd_vel geometry_msgs/msg/Twist 5562 & echo $$! >$$PID_DIR/pub_cmdvel ; sleep 0.3 ; \
 python3 /home/unitree/waic_bridge/zmq_bridge.py sub rmw_cyclonedds_cpp 0 /tf tf2_msgs/msg/TFMessage 5564 & echo $$! >$$PID_DIR/sub_tf ; sleep 0.3 ; \
-python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_fastrtps_cpp 66 /tf tf2_msgs/msg/TFMessage 5564 & echo $$! >$$PID_DIR/pub_tf ; sleep 0.3 ; \
+python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_fastrtps_cpp %i /tf tf2_msgs/msg/TFMessage 5564 & echo $$! >$$PID_DIR/pub_tf ; sleep 0.3 ; \
 python3 /home/unitree/waic_bridge/zmq_bridge.py sub rmw_cyclonedds_cpp 0 /tf_static tf2_msgs/msg/TFMessage 5565 & echo $$! >$$PID_DIR/sub_tf_static ; sleep 0.3 ; \
-python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_fastrtps_cpp 66 /tf_static tf2_msgs/msg/TFMessage 5565 & echo $$! >$$PID_DIR/pub_tf_static ; sleep 0.3 ; \
-python3 /home/unitree/waic_bridge/zmq_bridge.py sub rmw_fastrtps_cpp 66 /nav_pause std_msgs/msg/Bool 5566 & echo $$! >$$PID_DIR/sub_nav_pause ; sleep 0.3 ; \
+python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_fastrtps_cpp %i /tf_static tf2_msgs/msg/TFMessage 5565 & echo $$! >$$PID_DIR/pub_tf_static ; sleep 0.3 ; \
+python3 /home/unitree/waic_bridge/zmq_bridge.py sub rmw_fastrtps_cpp %i /nav_pause std_msgs/msg/Bool 5566 & echo $$! >$$PID_DIR/sub_nav_pause ; sleep 0.3 ; \
 python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_cyclonedds_cpp 0 /nav_pause std_msgs/msg/Bool 5566 & echo $$! >$$PID_DIR/pub_nav_pause ; sleep 0.3 ; \
 python3 /home/unitree/waic_bridge/zmq_bridge.py sub rmw_cyclonedds_cpp 0 /nav_reached std_msgs/msg/Bool 5567 & echo $$! >$$PID_DIR/sub_nav_reached ; sleep 0.3 ; \
-python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_fastrtps_cpp 66 /nav_reached std_msgs/msg/Bool 5567 & echo $$! >$$PID_DIR/pub_nav_reached ; \
+python3 /home/unitree/waic_bridge/zmq_bridge.py pub rmw_fastrtps_cpp %i /nav_reached std_msgs/msg/Bool 5567 & echo $$! >$$PID_DIR/pub_nav_reached ; \
 while true; do for f in $$PID_DIR/*; do pid=$$(cat $$f 2>/dev/null); if [ -n "$$pid" ] && ! kill -0 $$pid 2>/dev/null; then echo "[zmq-bridge] worker $$(basename $$f) (pid=$$pid) died, exiting"; exit 1; fi; done; sleep 2; done'
 KillSignal=SIGTERM
 TimeoutStopSec=10

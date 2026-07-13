@@ -105,6 +105,7 @@ class RosAcceptanceAdapter:
         self._request_replay_client = self._node.create_client(Trigger, request_replay_service)
         self._notify_goal_reached_client = self._node.create_client(SetBool, notify_goal_reached_service)
         self._get_mode_client = self._node.create_client(Trigger, "/get_locomotion_mode")
+        self._step_back_client = self._node.create_client(Trigger, "/Step_back")
 
         # 🆕 SONIC 输入源切换（ROS2 自动 ↔ Gamepad 人工接管）
         self._set_input_source_client = self._node.create_client(
@@ -267,6 +268,8 @@ class RosAcceptanceAdapter:
         self._expected_slot_xy: tuple[float, float] | None = None
         # FP 选出的最优物体 ID（由 SelectTarget 服务 或 run_arrival_check 设置）
         self._fp_target_object_id: int | None = None
+        # 掉箱恢复路径 B：跳过 nav goal 重发，直接等 nav_reached
+        self.skip_nav_resend: bool = False
         # SelectTarget(select=true) 是否已激活单目标模式（需在搬起后/重规划前清理）
         self._select_target_active: bool = False
 
@@ -593,6 +596,32 @@ class RosAcceptanceAdapter:
         """调用 /set_stand 服务让机器人站立（放下手臂）。"""
         return self._call_set_stand("replan", "replan", "replan-stand")
 
+    def step_back_robot(self) -> dict:
+        """调用 /Step_back 服务让机器人后退两步。"""
+        t0 = time.time()
+        req = Trigger.Request()
+        print(f"\n  [ros] >>> /Step_back", flush=True)
+        future = self._step_back_client.call_async(req)
+        ok = self._wait_future(future, self._timeout_s)
+        elapsed = (time.time() - t0) * 1000
+
+        if not ok:
+            logger.error("Step_back call timed out")
+            audit_logger.log_ros2_call(service="/Step_back", duration_ms=elapsed,
+                                       success=False, message="timed out")
+            return {"ok": False, "message": "Step_back 超时"}
+
+        result = future.result()
+        print(f"  [ros] <<< Step_back success={result.success}", flush=True)
+        audit_logger.log_ros2_call(service="/Step_back", duration_ms=elapsed,
+                                   success=result.success,
+                                   message=result.message or str(result.success))
+
+        return {
+            "ok": result.success,
+            "message": result.message or ("后退完成" if result.success else "后退失败"),
+        }
+
     def identify_dropped_box(
         self, material_points_xy: list[float] | None = None,
         target_points_xy: list[float] | None = None,
@@ -618,7 +647,7 @@ class RosAcceptanceAdapter:
             pick_x=0.0, pick_y=0.0,
             material_points_xy=material_points_xy,
             target_points_xy=target_points_xy,
-            point_tolerance=0.3,
+            point_tolerance=1.0,
             step_id="replan-identify",
         )
         if result and result.get("success"):
@@ -891,6 +920,53 @@ class RosAcceptanceAdapter:
 
     def _call_path_plan(self, args, request_id, goal_id, step_id):
         t0 = time.time()
+
+        # ── 掉箱恢复路径 B：跳过 goal 重发，直接等 nav_reached ──
+        if self.skip_nav_resend:
+            self.skip_nav_resend = False  # 一次性标记，用完即清
+            logger.info(
+                "_call_path_plan: skip_nav_resend=True，"
+                "跳过 goal 发送，直接等待 nav_reached"
+            )
+            nav_timeout = 600.0
+            arrived = self._wait_nav_reached(timeout=nav_timeout)
+            if not arrived:
+                return self._error_result(
+                    "NAV_TIMEOUT",
+                    f"nav_reached not received within {nav_timeout:.0f}s "
+                    f"(skip_nav_resend mode)",
+                    request_id, goal_id, step_id,
+                )
+            # 通知 gateway 到达
+            self._notify_arrival()
+            ready = self._wait_until_ready("move_to")
+            if not ready:
+                return self._error_result(
+                    "PATH_PLAN_NOT_READY",
+                    "robot did not reach ready state after "
+                    "move_to (skip_nav_resend)",
+                    request_id, goal_id, step_id,
+                )
+            target = args.get("target", {})
+            tx = float(target.get("x", 0.0))
+            ty = float(target.get("y", 0.0))
+            theta = float(target.get("theta", math.pi / 2))
+            logger.info(
+                "_call_path_plan: nav_reached (skip_nav_resend), "
+                "elapsed=%.1fs",
+                time.time() - t0,
+            )
+            return {
+                "status": "ok",
+                "error_code": None,
+                "message": "arrived (skip_nav_resend)",
+                "pose": {"x": tx, "y": ty, "z": 0.0, "theta": theta},
+                "metrics": {},
+                "request_id": request_id,
+                "goal_id": goal_id,
+                "step_id": step_id,
+            }
+
         target = args.get("target", {})
         tx = float(target.get("x", 0.0))
         ty = float(target.get("y", 0.0))
@@ -1026,7 +1102,7 @@ class RosAcceptanceAdapter:
                             pick_y: float = 0.0,
                             material_points_xy: list[float] | None = None,
                             target_points_xy: list[float] | None = None,
-                            mode: int = 0, point_tolerance: float = 0.3,
+                            mode: int = 0, point_tolerance: float = 0.5,
                             step_id: str = "") -> dict[str, Any] | None:
         """调 FP /foundationpose/select_target 进入/退出单目标模式。
 
@@ -1104,8 +1180,42 @@ class RosAcceptanceAdapter:
             pick_x=pick_x,
             pick_y=pick_y,
             material_points_xy=material_points_xy or [],
+            point_tolerance=2.0,
             step_id=step_id,
         )
+
+    def wait_fp_pose_ready(self, min_wait_s: float = 3.0,
+                           timeout_s: float = 8.0) -> bool:
+        """等待 FP 发布有效物体位姿（state >= IDLE）。
+
+        move_to 后 FP 需要时间重新检测新位置的圆柱体，
+        此方法先等待 min_wait_s 秒，再轮询 _latest_pose_result。
+
+        Returns:
+            True 表示已有有效位姿，False 表示超时。
+        """
+        deadline = time.time() + timeout_s
+        # 最小等待缓冲：给 FP 视觉管道处理帧的时间
+        time.sleep(min_wait_s)
+        while time.time() < deadline:
+            pose = self._latest_pose_result
+            if pose is not None and pose.state >= 1:  # IDLE(1) 或 TRACKING(2)
+                logger.info(
+                    "wait_fp_pose_ready: 就绪 (state=%d, object_id=%d, "
+                    "elapsed=%.1fs)",
+                    pose.state, pose.object_id,
+                    timeout_s - (deadline - time.time()),
+                )
+                return True
+            time.sleep(0.5)
+        logger.warning(
+            "wait_fp_pose_ready: 超时 (%.1fs), "
+            "latest_pose=%s",
+            timeout_s,
+            "None" if self._latest_pose_result is None
+            else f"state={self._latest_pose_result.state}",
+        )
+        return False
 
     def call_reset_fp(self) -> dict | None:
         """调 FP /foundationpose/reset 重新标定物体（清空所有 tracker 重新检测）"""
@@ -1238,7 +1348,7 @@ class RosAcceptanceAdapter:
                 request_id, goal_id, step_id)
 
         req = SubmitCarryTask.Request()
-        req.request_id = f"{request_id}-{step_id}"
+        req.request_id = f"{request_id}-{step_id}-{int(time.time()*1000)}"
         req.command = "carry"
         req.object_pose.header = pose_est.header
         req.object_pose.header.frame_id = "pelvis"  # gateway CARRY_TARGET_FRAME=pelvis，FP publish_in_pelvis_frame=true

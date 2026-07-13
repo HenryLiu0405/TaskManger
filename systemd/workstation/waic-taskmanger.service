@@ -4,6 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
+EnvironmentFile=-/home/hairo/waic/active_robot.env
 ExecStart=/home/hairo/waic/start_taskmanger.sh
 Restart=on-failure
 RestartSec=5

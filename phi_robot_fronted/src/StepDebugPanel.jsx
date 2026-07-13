@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { Button, Space, Tag, Card, message, Tooltip, Modal } from 'antd';
+import { Button, Space, Tag, Card, message, Tooltip, Modal, Divider } from 'antd';
 import {
   PlayCircleOutlined, ReloadOutlined, StepForwardOutlined,
   DoubleRightOutlined, PauseCircleOutlined, CaretRightOutlined,
@@ -14,14 +14,14 @@ const API = '/api/dev/step_debug';
 
 // ── 状态对应的按钮启用逻辑 ──────────────────────────
 const STATE_BUTTONS = {
-  idle:           { exec: false, retry: false, skip: false, fskip: false, pause: false, resume: false, abort: true },
-  plan_loaded:    { exec: true,  retry: false, skip: false, fskip: false, pause: false, resume: false, abort: true },
+  idle:           { exec: false, retry: false, skip: true,  fskip: false, pause: false, resume: false, abort: true },
+  plan_loaded:    { exec: true,  retry: false, skip: true,  fskip: false, pause: false, resume: false, abort: true },
   step_ready:     { exec: true,  retry: false, skip: true,  fskip: false, pause: false, resume: false, abort: true },
-  executing:      { exec: false, retry: false, skip: false, fskip: false, pause: true,  resume: false, abort: true },
-  paused:         { exec: false, retry: false, skip: false, fskip: false, pause: false, resume: true,  abort: true },
+  executing:      { exec: false, retry: false, skip: true,  fskip: false, pause: true,  resume: false, abort: true },
+  paused:         { exec: false, retry: false, skip: true,  fskip: false, pause: false, resume: true,  abort: true },
   step_done:      { exec: true,  retry: true,  skip: true,  fskip: false, pause: false, resume: false, abort: true },
-  step_failed:    { exec: false, retry: true,  skip: false, fskip: true,  pause: false, resume: false, abort: true },
-  aborted:        { exec: false, retry: false, skip: false, fskip: false, pause: false, resume: false, abort: false },
+  step_failed:    { exec: false, retry: true,  skip: true,  fskip: true,  pause: false, resume: false, abort: true },
+  aborted:        { exec: false, retry: false, skip: true,  fskip: false, pause: false, resume: false, abort: false },
 };
 
 // ── 步骤状态渲染 ────────────────────────────────────
@@ -222,11 +222,17 @@ function DiagEventRow({ ev }) {
     return (
       <div className="flex gap-2 py-0.5 text-xs">
         <span className="text-[#6a6a6a] shrink-0 w-[72px]">{ts}</span>
-        <Tag color="blue" className="text-[10px] leading-none">SELECT</Tag>
+        <Tag color={data.select ? (data.success ? 'green' : 'red') : 'blue'} className="text-[10px] leading-none">SELECT</Tag>
         <span className="text-[#c8c8c8]">
-          select={String(data.select)}
-          {data.select && <> → object_id={data.matched_object_id} (pick=({data.pick_x?.toFixed(2)}, {data.pick_y?.toFixed(2)}))</>}
-          {!data.select && <> → 掉箱检测恢复</>}
+          {data.select
+            ? <>{data.success ? '✅' : '❌'} 锁定 (pick=({data.pick_x?.toFixed(2)}, {data.pick_y?.toFixed(2)}))
+                {data.success
+                  ? <> → object_id={data.matched_object_id}</>
+                  : <> 失败 object_id={data.matched_object_id}</>
+                }
+              </>
+            : <>退出 → 掉箱检测恢复</>
+          }
         </span>
       </div>
     );
@@ -288,29 +294,39 @@ export default function StepDebugPanel({ robotState }) {
   const [plan, setPlan] = useState([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [diagEvents, setDiagEvents] = useState([]);
-  const [stepLogs, setStepLogs] = useState([]);
   const [connected, setConnected] = useState(false);
-  const [showFpVideo, setShowFpVideo] = useState(false);
+  const [showFpPanel, setShowFpPanel] = useState(true);
+  const [videoSource, setVideoSource] = useState('fp');  // 'fp' | 'rs'
   const [showDropVis, setShowDropVis] = useState(false);
+  const [recoverStuckLoading, setRecoverStuckLoading] = useState(false);
+  const [goOriginLoading, setGoOriginLoading] = useState(false);
   const [selectTargetActive, setSelectTargetActive] = useState(false);
-  const [dropDetectorEnabled, setDropDetectorEnabled] = useState(false);
   const [loadTaskCollapsed, setLoadTaskCollapsed] = useState(false);
   const [planCollapsed, setPlanCollapsed] = useState(false);
   const [controlCollapsed, setControlCollapsed] = useState(false);
   const [dropCollapsed, setDropCollapsed] = useState(false);
   const [diagCollapsed, setDiagCollapsed] = useState(false);
-  const [logCollapsed, setLogCollapsed] = useState(false);
   const [droppedBoxId, setDroppedBoxId] = useState(-1);
   const [droppedBoxPose, setDroppedBoxPose] = useState(null);
   const [dropPhase, setDropPhase] = useState('');  // idle | detecting | paused | standing | identifying | ready
   const [navReached, setNavReached] = useState(null);  // 🆕 Nav2 /nav_reached 状态: true=到达, false=导航中
   const [robotPaused, setRobotPaused] = useState(false);  // 🆕 /nav_pause 暂停状态，控制按钮 toggle
   const [autoMode, setAutoMode] = useState(false);  // 自动执行模式
+  const [autoRecovering, setAutoRecovering] = useState(false);  // 自动化掉箱恢复中
+  const [lockedObjectId, setLockedObjectId] = useState(null);  // 当前锁定的物体 ID（用于 toast）
 
   const diagEndRef = useRef(null);
   const poseTimerRef = useRef(null);
+  const prevSelectTargetActive = useRef(false);  // 追踪锁定状态变化，用于 toast
 
-  // 🆕 v3: 从 diag 事件中提取最新掉箱状态
+  // ── 自动锁定 toast ─────────────────────────────────
+  useEffect(() => {
+    if (selectTargetActive && !prevSelectTargetActive.current) {
+      const id = lockedObjectId != null ? ` #${lockedObjectId}` : '';
+      message.success(`已锁定单目标${id}（自动）`);
+    }
+    prevSelectTargetActive.current = selectTargetActive;
+  }, [selectTargetActive]);
   const dropStatus = useMemo(() => {
     for (let i = diagEvents.length - 1; i >= 0; i--) {
       if (diagEvents[i].type === 'drop_status') return diagEvents[i].data;
@@ -363,8 +379,8 @@ export default function StepDebugPanel({ robotState }) {
           if (payload.state) setState(payload.state);
           if (payload.current_index != null) setCurrentIndex(payload.current_index);
           if (payload.plan) setPlan(payload.plan);
-          if (payload.step_logs) setStepLogs(payload.step_logs);
           if (payload.select_target_active != null) setSelectTargetActive(payload.select_target_active);
+          if (payload.locked_object_id != null) setLockedObjectId(payload.locked_object_id);
           if (payload.nav_reached != null) setNavReached(payload.nav_reached);  // 🆕 Nav2 导航到达状态
         } catch (_) {}
       });
@@ -387,6 +403,7 @@ export default function StepDebugPanel({ robotState }) {
   useEffect(() => {
     if (autoMode && (state === 'idle' || state === 'step_failed' || state === 'aborted')) {
       setAutoMode(false);
+      setAutoRecovering(false);  // 兜底退出恢复状态
       if (state === 'idle') {
         message.success(`自动执行完成！共 ${plan.length} 步全部成功`);
       } else if (state === 'step_failed') {
@@ -394,6 +411,20 @@ export default function StepDebugPanel({ robotState }) {
       }
     }
   }, [state, autoMode]);
+
+  // ── 掉箱恢复状态监听 ─────────────────────────────
+  useEffect(() => {
+    if (autoRecovering && (state === 'executing' || state === 'step_done')) {
+      // 恢复成功，自动流程已接管
+      setAutoRecovering(false);
+      message.success('掉箱恢复成功，继续自动执行');
+    } else if (autoRecovering && state === 'step_failed') {
+      // 恢复失败
+      setAutoRecovering(false);
+      setAutoMode(false);
+      message.error('掉箱恢复失败，已退回手动模式');
+    }
+  }, [state, autoRecovering]);
 
   // ── 自动滚屏 ───────────────────────────────────────
   useEffect(() => {
@@ -441,12 +472,48 @@ export default function StepDebugPanel({ robotState }) {
       }
     });
   }
+  function handleAutoDropRecovery() {
+    setAutoRecovering(true);
+    message.info('自动化掉箱处理已启动...');
+    call('/auto_drop_recovery').then((r) => {
+      if (!r?.ok) {
+        setAutoRecovering(false);
+        message.warning(r?.message || '掉箱恢复无法启动');
+      }
+    });
+  }
   function handleRetry() { call('/retry'); }
   function handleSkip() { call('/skip'); }
   function handleForceSkip() {
     // 前端二次确认
     message.info('正在强制跳过当前步骤...');
     call('/force_skip');
+  }
+  function handleRecoverStuck() {
+    setRecoverStuckLoading(true);
+    call('/recover_stuck').then((r) => {
+      setRecoverStuckLoading(false);
+      if (r?.ok) {
+        message.success(r.message);
+      } else {
+        message.warning(r?.message || '回退失败');
+      }
+    });
+  }
+  function handleGoOrigin() {
+    setGoOriginLoading(true);
+    call('/go_origin').then((r) => {
+      setGoOriginLoading(false);
+      if (r?.ok) {
+        message.success(r.message);
+      } else {
+        message.warning(r?.message || '导航失败');
+      }
+    });
+  }
+  function playAudio(name) {
+    const audio = new Audio(`/audio/${name}.mp3`);
+    audio.play().catch(() => {});
   }
   function handlePause() { call('/pause'); }
   function handleResume() { call('/resume'); }
@@ -477,32 +544,6 @@ export default function StepDebugPanel({ robotState }) {
   }
 
   // ── 掉箱处理 ──────────────────────────────────────
-  function handleEnableDropDetector() {
-    call('/drop_detector/enable').then((r) => {
-      if (r?.ok) {
-        setDropDetectorEnabled(true);
-        setDropPhase('detecting');
-        setShowDropVis(true);
-        message.success('掉箱检测已开启');
-      } else {
-        message.warning(r?.message || '开启失败');
-      }
-    });
-  }
-
-  function handleDisableDropDetector() {
-    call('/drop_detector/disable').then((r) => {
-      if (r?.ok) {
-        setDropDetectorEnabled(false);
-        setDropPhase('');
-        setShowDropVis(false);
-        message.info('掉箱检测已关闭');
-      } else {
-        message.warning(r?.message || '关闭失败');
-      }
-    });
-  }
-
   function handlePauseRobot() {
     call('/robot/pause').then((r) => {
       if (r?.ok) {
@@ -526,7 +567,6 @@ export default function StepDebugPanel({ robotState }) {
     call('/robot/resume').then((r) => {
       if (r?.ok) {
         setRobotPaused(false);
-        setDropPhase('detecting');
         message.success('机器人已恢复导航');
       } else {
         message.warning(r?.message || '恢复失败');
@@ -538,12 +578,24 @@ export default function StepDebugPanel({ robotState }) {
     setDropPhase('standing');
     message.info('正在切换站立模式...');
     call('/robot/stand').then((r) => {
+      setDropPhase('');
       if (r?.ok) {
-        setDropPhase('stood');
         message.success('已切换站立模式');
       } else {
-        setDropPhase('detecting');
         message.warning(r?.message || '站立失败');
+      }
+    });
+  }
+
+  function handleStepBackRobot() {
+    setDropPhase('stepping_back');
+    message.info('正在后退...');
+    call('/robot/step_back').then((r) => {
+      setDropPhase('');
+      if (r?.ok) {
+        message.success('后退完成');
+      } else {
+        message.warning(r?.message || '后退失败');
       }
     });
   }
@@ -555,11 +607,23 @@ export default function StepDebugPanel({ robotState }) {
       if (r?.ok && r.matched_object_id >= 0) {
         setDroppedBoxId(r.matched_object_id);
         setDroppedBoxPose(r.pose);
-        setDropPhase('ready');
+        setDropPhase('');
         message.success(`识别成功: 箱子 #${r.matched_object_id} ${r.pose ? `(${r.pose.x.toFixed(2)}, ${r.pose.y.toFixed(2)})` : ''}`);
       } else {
-        setDropPhase('detecting');
+        setDropPhase('');
         message.warning(r?.message || '未识别到掉落箱子');
+      }
+    });
+  }
+
+  function handleDisableDropDetector() {
+    message.info('正在关闭掉箱检测...');
+    call('/drop_detector/disable').then((r) => {
+      if (r?.ok) {
+        setShowDropVis(false);
+        message.success('掉箱检测已关闭');
+      } else {
+        message.warning(r?.message || '关闭失败');
       }
     });
   }
@@ -677,6 +741,10 @@ export default function StepDebugPanel({ robotState }) {
         )}
       </Card>
 
+      {/* ── 左右两栏：左=卡片，右=FP 实时画面 ── */}
+      <div className="flex gap-3 flex-1 min-h-0">
+        <div className="flex flex-col gap-3 flex-1 min-w-0">
+
       {/* ── 步骤列表 ──────────────────────────────── */}
       <Card
         size="small"
@@ -746,7 +814,7 @@ export default function StepDebugPanel({ robotState }) {
         </div>
       } className="shrink-0">
         {!controlCollapsed && (
-        <Space wrap size={8}>
+        <Space wrap size={12}>
           <Tooltip title={
             pickDisabled
               ? '请先点击「锁定单目标」进入单物体识别模式'
@@ -761,20 +829,41 @@ export default function StepDebugPanel({ robotState }) {
             >
               {state === 'step_done' ? '下一步' : '执行'}
             </Button>
-            <Tooltip title={pickDisabled ? '请先锁定单目标' : '自动执行所有剩余步骤，失败即停'}>
+          </Tooltip>
+          <Tooltip title={pickDisabled ? '请先锁定单目标' : '自动执行所有剩余步骤，失败即停'}>
+            <Button
+              size="small"
+              icon={<DoubleRightOutlined />}
+              disabled={(!btns.exec || !canWalk || pickDisabled) && !autoMode}
+              loading={autoMode}
+              onClick={handleAutoRun}
+              style={autoMode ? {} : { color: '#52c41a', borderColor: '#52c41a' }}
+            >
+              {autoMode
+                ? `自动中… ${currentIndex + 1}/${plan.length}`
+                : '自动执行'}
+            </Button>
+          </Tooltip>
+          <Divider type="vertical" style={{ borderColor: '#444', margin: '0 2px' }} />
+          <Tooltip title={
+              !autoMode
+                ? '仅在自动执行模式可用'
+                : currentStep?.tool === 'pick' || currentStep?.tool === 'place'
+                  ? '搬起/放下期间不可触发掉箱恢复'
+                  : '暂停→站立→reset→识别→重规划→恢复自动'
+            }>
               <Button
                 size="small"
-                icon={<DoubleRightOutlined />}
-                disabled={(!btns.exec || !canWalk || pickDisabled) && !autoMode}
-                loading={autoMode}
-                onClick={handleAutoRun}
-                style={autoMode ? {} : { color: '#52c41a', borderColor: '#52c41a' }}
+                icon={<span>🔄</span>}
+                onClick={handleAutoDropRecovery}
+                loading={autoRecovering}
+                disabled={!autoMode || autoRecovering
+                  || currentStep?.tool === 'pick'
+                  || currentStep?.tool === 'place'}
+                style={{ color: '#fa8c16', borderColor: '#fa8c16' }}
               >
-                {autoMode
-                  ? `自动中… ${currentIndex + 1}/${plan.length}`
-                  : '自动执行'}
+                {autoRecovering ? '恢复中…' : '自动化掉箱处理'}
               </Button>
-            </Tooltip>
           </Tooltip>
           <Tooltip title={pickDisabled ? '请先锁定单目标' : '重试当前步'}>
             <Button
@@ -790,7 +879,7 @@ export default function StepDebugPanel({ robotState }) {
           <Button
             size="small"
             icon={<StepForwardOutlined />}
-            disabled={!btns.skip || autoMode}
+            disabled={!btns.skip}
             onClick={handleSkip}
           >
             跳过
@@ -820,10 +909,35 @@ export default function StepDebugPanel({ robotState }) {
           >
             终止
           </Button>
+          <Tooltip title="回到物料点：将计划回退到最近一次走到物料点的步骤，重置为未执行状态">
+            <Button
+              size="small"
+              icon={<span>🔄</span>}
+              onClick={handleRecoverStuck}
+              loading={recoverStuckLoading}
+              disabled={state === 'idle' || autoMode}
+              style={{ color: '#fa8c16', borderColor: '#fa8c16' }}
+            >
+              回物料点
+            </Button>
+          </Tooltip>
+          <Tooltip title="回到原点：机器人导航到预定义的机器人原点位置">
+            <Button
+              size="small"
+              icon={<span>🏠</span>}
+              onClick={handleGoOrigin}
+              loading={goOriginLoading}
+              disabled={autoMode}
+              style={{ color: '#52c41a', borderColor: '#52c41a' }}
+            >
+              回原点
+            </Button>
+          </Tooltip>
           <Button
             size="small"
             icon={<CameraOutlined />}
-            onClick={() => setShowFpVideo(true)}
+            onClick={() => setShowFpPanel(!showFpPanel)}
+            type={showFpPanel ? 'primary' : 'default'}
           >
             FP 画面
           </Button>
@@ -843,6 +957,13 @@ export default function StepDebugPanel({ robotState }) {
           >
             重新标定
           </Button>
+          <Divider type="vertical" style={{ borderColor: '#444', margin: '0 2px' }} />
+          <Button size="small" icon={<span>🔊</span>} onClick={() => playAudio('task_start')} style={{ color: '#fa8c16', borderColor: '#fa8c16' }}>
+            任务启动
+          </Button>
+          <Button size="small" icon={<span>🔊</span>} onClick={() => playAudio('task_complete')} style={{ color: '#52c41a', borderColor: '#52c41a' }}>
+            任务完成
+          </Button>
         </Space>
         )}
       </Card>
@@ -855,21 +976,9 @@ export default function StepDebugPanel({ robotState }) {
           <span>掉箱处理{dropPhase ? ' · ' + dropPhase : ''}</span>
         </div>
       } className="shrink-0"
-        style={{ borderColor: dropPhase === 'ready' ? '#52c41a' : '#faad14' }}>
+        style={{ borderColor: droppedBoxId >= 0 ? '#52c41a' : '#faad14' }}>
         {!dropCollapsed && (
-        <Space wrap size={8}>
-          <Tooltip title={dropDetectorEnabled ? '关闭掉箱检测并隐藏可视化画面' : '开启掉箱检测并弹出可视化画面'}>
-            <Button
-              size="small"
-              icon={dropDetectorEnabled ? <StopOutlined /> : <CameraOutlined />}
-              onClick={dropDetectorEnabled ? handleDisableDropDetector : handleEnableDropDetector}
-              type={dropDetectorEnabled ? 'primary' : 'default'}
-              danger={dropDetectorEnabled}
-              style={dropDetectorEnabled ? undefined : { color: '#faad14', borderColor: '#faad14' }}
-            >
-              {dropDetectorEnabled ? '关闭掉箱检测' : '1.开启掉箱检测'}
-            </Button>
-          </Tooltip>
+        <Space wrap size={12}>
           <Tooltip title={robotPaused
             ? '发 /nav_pause=false 恢复机器人导航'
             : (navReached != null
@@ -879,11 +988,10 @@ export default function StepDebugPanel({ robotState }) {
               size="small"
               icon={robotPaused ? <CaretRightOutlined /> : <PauseCircleOutlined />}
               onClick={robotPaused ? handleResumeRobot : handlePauseRobot}
-              disabled={!robotPaused && dropPhase !== 'detecting'}
               type={robotPaused ? 'primary' : 'default'}
               style={navReached === true ? { color: '#52c41a', borderColor: '#52c41a' } : undefined}
             >
-              {robotPaused ? '2.恢复机器人' : `2.暂停机器人${navReached != null ? (navReached ? ' ✓已到' : ' …导航中') : ''}`}
+              {robotPaused ? '恢复机器人' : `暂停机器人${navReached != null ? (navReached ? ' ✓已到' : ' …导航中') : ''}`}
             </Button>
           </Tooltip>
           <Tooltip title="调用 /set_stand 让机器人放下手臂">
@@ -891,22 +999,39 @@ export default function StepDebugPanel({ robotState }) {
               size="small"
               icon={<span>🧍</span>}
               onClick={handleStandRobot}
-              disabled={dropPhase !== 'paused'}
               loading={dropPhase === 'standing'}
             >
-              3.站立模式
+              站立模式
             </Button>
           </Tooltip>
-          <Tooltip title="FP MODE_DROPPED 识别掉落箱子位姿">
+          <Tooltip title="调用 /Step_back 让机器人后退两步">
+            <Button
+              size="small"
+              icon={<span>⬅</span>}
+              onClick={handleStepBackRobot}
+              loading={dropPhase === 'stepping_back'}
+            >
+              后退一步
+            </Button>
+          </Tooltip>
+          <Tooltip title="识别掉落箱子位姿（FP MODE_DROPPED）">
             <Button
               size="small"
               icon={<span>🔍</span>}
               onClick={handleIdentifyDropped}
-              disabled={dropPhase !== 'stood' && dropPhase !== 'detecting'}
               loading={dropPhase === 'identifying'}
-              type={dropPhase === 'ready' ? 'primary' : 'default'}
+              type={droppedBoxId >= 0 ? 'primary' : 'default'}
             >
-              4.识别掉落箱
+              识别掉落箱
+            </Button>
+          </Tooltip>
+          <Tooltip title="关闭掉箱检测子进程">
+            <Button
+              size="small"
+              icon={<span>⏹</span>}
+              onClick={handleDisableDropDetector}
+            >
+              关闭掉箱检测
             </Button>
           </Tooltip>
           <Tooltip title="用掉落箱子位姿调用 Gateway 搬起">
@@ -914,9 +1039,9 @@ export default function StepDebugPanel({ robotState }) {
               size="small" danger
               icon={<PlayCircleOutlined />}
               onClick={handleReplanPick}
-              disabled={dropPhase !== 'ready'}
+              disabled={droppedBoxId < 0}
             >
-              5.重规划搬起
+              重规划搬起
             </Button>
           </Tooltip>
           {droppedBoxId >= 0 && (
@@ -958,63 +1083,41 @@ export default function StepDebugPanel({ robotState }) {
         )}
       </Card>
 
-      {/* ── 步骤日志摘要 ────────────────────────────── */}
-      <Card size="small" title={
-        <div className="flex items-center gap-2 cursor-pointer select-none"
-             onClick={() => setLogCollapsed(!logCollapsed)}>
-          <span className="text-xs text-[#8a8a8a]">{logCollapsed ? '▶' : '▼'}</span>
-          <span>操作日志 ({stepLogs.length} 条)</span>
-        </div>
-      } className="shrink-0">
-        {!logCollapsed && (
-        <div className="max-h-40 overflow-y-auto font-mono text-xs">
-          {stepLogs.length === 0 ? (
-            <div className="text-[#8a8a8a]">暂无记录</div>
-          ) : (
-            stepLogs.map((log, i) => (
-              <div key={i} className="flex gap-2 py-0.5 border-b border-[#2a2a2a] last:border-0">
-                <span className="text-[#8a8a8a] shrink-0 w-[60px]">{log.timestamp}</span>
-                <Tag
-                  color={
-                    log.status === 'ok' ? 'success' :
-                    log.status === 'error' ? 'error' :
-                    log.status === 'skipped' ? 'default' :
-                    log.status === 'force_skipped' ? 'warning' :
-                    'default'
-                  }
-                  className="text-[10px] leading-none"
-                >
-                  {log.status}
-                </Tag>
-                <span className="text-[#c8c8c8] shrink-0 w-[90px]">{log.step_id}</span>
-                <span className="text-[#d4a853] shrink-0 w-[70px]">{log.tool}</span>
-                {log.error_code && (
-                  <span className="text-[#ff4d4f]">[{log.error_code}]</span>
-                )}
-                <span className="text-[#8a8a8a]">{log.message}</span>
-                <span className="text-[#6a6a6a] ml-auto">{log.elapsed_s}s</span>
-              </div>
-            ))
-          )}
-        </div>
-        )}
-      </Card>
+        </div>{/* 左栏结束 */}
 
-      {/* ── FP 实时画面弹窗 ──────────────────────────── */}
-      <Modal
-        title="FoundationPose RGB 实时画面"
-        open={showFpVideo}
-        onCancel={() => setShowFpVideo(false)}
-        footer={null}
-        width={720}
-        styles={{ body: { padding: 8, background: '#141414' } }}
-      >
-        <img
-          src={`/api/fp/video/rgb/stream?t=${Date.now()}`}
-          alt="FP RGB"
-          style={{ width: '100%', borderRadius: 4, background: '#1a1a1a' }}
-        />
-      </Modal>
+        {/* ── 右侧实时画面（FP / RealSense 切换）── */}
+        {showFpPanel && (
+          <Card
+            size="small"
+            title={
+              <Space size={4}>
+                <Button
+                  size="small"
+                  type={videoSource === 'fp' ? 'primary' : 'default'}
+                  onClick={() => setVideoSource('fp')}
+                >FP 画面</Button>
+                <Button
+                  size="small"
+                  type={videoSource === 'rs' ? 'primary' : 'default'}
+                  onClick={() => setVideoSource('rs')}
+                >RS 画面</Button>
+              </Space>
+            }
+            className="flex-1 flex flex-col min-h-0"
+            extra={<Button size="small" type="text" onClick={() => setShowFpPanel(false)}>✕</Button>}
+            styles={{ body: { flex: 1, overflow: 'hidden', display: 'flex', padding: 4 } }}
+          >
+            <img
+              src={videoSource === 'fp'
+                ? `/api/fp/video/rgb/stream?t=${Date.now()}`
+                : `/api/rs/video/rgb/stream?t=${Date.now()}`}
+              alt={videoSource === 'fp' ? 'FP RGB' : 'RealSense RGB'}
+              style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#141414', borderRadius: 4 }}
+            />
+          </Card>
+        )}
+
+      </div>{/* 左右两栏结束 */}
 
       {/* ── 掉箱检测画面弹窗 ──────────────────────────── */}
       <Modal

@@ -4,9 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
+EnvironmentFile=-/home/hairo/waic/active_robot.env
 ExecStart=/bin/bash -c "source /opt/ros/humble/setup.bash && \
   source /home/hairo/waic/ws/install/setup.bash && \
-  export ROS_DOMAIN_ID=66 && \
+  export ROS_DOMAIN_ID=$${ROS_DOMAIN_ID:-66} && \
   exec python3 /home/hairo/waic/waic_bridge/goal_bridge.py"
 Restart=on-failure
 RestartSec=5

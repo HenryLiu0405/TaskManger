@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
+EnvironmentFile=-/home/hairo/waic/active_robot.env
 ExecStart=/home/hairo/waic/start_foundationpose.sh
 Restart=on-failure
 RestartSec=5
-Environment="FP_CAMERA_HOST=192.168.50.79"
 
 [Install]
 WantedBy=default.target

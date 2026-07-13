@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -17,8 +18,9 @@ from datetime import datetime
 from typing import Any, Optional
 
 from .models import PlanStep
-from .mission_planner import MissionPlanner
+from .mission_planner import MissionPlanner, load_scene_coords
 from .recovery_diag import DiagEvent, DiagCollector
+from .robot_state import safety_fsm, RobotState
 
 logger = logging.getLogger("phi_robot.step_debug")
 
@@ -61,6 +63,13 @@ class StepLog:
 # ═══════════════════════════════════════════════════════════════
 # StepDebugController
 # ═══════════════════════════════════════════════════════════════
+
+# 格口优先级：load_plan 时按此顺序重排 destinations（数字越小越先执行）
+_DEST_PRIORITY = {
+    "ne": 0, "e": 1, "se": 2,
+    "n":  3, "c": 4, "s":  5,
+    "nw": 6, "w": 7, "sw": 8,
+}
 
 
 class StepDebugController:
@@ -108,6 +117,9 @@ class StepDebugController:
         # ── 日志 ──
         self._step_logs: list[StepLog] = []
 
+        # ── 掉箱恢复：路径 B 跳过 nav goal 重发 ──
+        self._skip_nav_resend: bool = False
+
         # ── 注册诊断回调到 adapter ──
         if hasattr(adapter, "set_diag_callback"):
             adapter.set_diag_callback(self._on_diag_event)
@@ -133,6 +145,8 @@ class StepDebugController:
             {"ok": True, "plan": [...], "total_steps": N}
         """
         with self._lock:
+            # 按固定优先级排序，不依赖用户输入顺序
+            destinations = sorted(destinations, key=lambda d: _DEST_PRIORITY.get(d, 99))
             try:
                 planner = MissionPlanner()
                 plan = planner.plan(
@@ -320,6 +334,8 @@ class StepDebugController:
                         "_run_auto: 自动进入 FP 单目标模式 "
                         "(pick_x=%.2f, pick_y=%.2f)", pick_x, pick_y,
                     )
+                    # 等待机器人稳定 + FP 收敛到新位置
+                    time.sleep(5.0)
                     # SSE 反馈：正在锁定
                     with self._lock:
                         if exec_id == self._execution_id:
@@ -330,7 +346,27 @@ class StepDebugController:
                                 message=f"正在锁定单目标 ({pick_x:.2f}, {pick_y:.2f})...",
                                 timestamp=StepLog.now(),
                             ))
-                    if not self._auto_toggle_select_target():
+
+                    locked = self._auto_toggle_select_target()
+                    if not locked:
+                        # ★ 第一次锁定失败 → 等 1 秒重试
+                        with self._lock:
+                            if exec_id == self._execution_id:
+                                self._step_logs.append(StepLog(
+                                    step_id=step.step_id,
+                                    tool="select_target",
+                                    status="running",
+                                    message=f"首次锁定失败，等待 1 秒后重试...",
+                                    timestamp=StepLog.now(),
+                                ))
+                        if self._stop_flag.is_set() or exec_id != self._execution_id:
+                            return
+                        time.sleep(1.0)
+                        if self._stop_flag.is_set() or exec_id != self._execution_id:
+                            return
+                        locked = self._auto_toggle_select_target()
+
+                    if not locked:
                         with self._lock:
                             if exec_id == self._execution_id:
                                 self._step_logs.append(StepLog(
@@ -338,7 +374,7 @@ class StepDebugController:
                                     tool="select_target",
                                     status="error",
                                     error_code="FP_LOCK_FAILED",
-                                    message=f"锁定失败: 未在 ({pick_x:.2f}, {pick_y:.2f}) 匹配到物体",
+                                    message=f"重试锁定仍失败: 未在 ({pick_x:.2f}, {pick_y:.2f}) 匹配到物体",
                                     timestamp=StepLog.now(),
                                 ))
                                 self._plan_steps[self._current_index][
@@ -360,6 +396,9 @@ class StepDebugController:
                                 message=f"已锁定单目标 object_id={obj_id}",
                                 timestamp=StepLog.now(),
                             ))
+
+                    # ★ 等待 FP 下一帧发布过滤后的位姿，确保 adapter 收到锁定后的 pose
+                    time.sleep(0.1)
 
                 # ── 标记 running ──────────────────────────
                 with self._lock:
@@ -581,16 +620,21 @@ class StepDebugController:
         }
 
     def skip_step(self) -> dict[str, Any]:
-        """跳过当前步骤（仅 STEP_READY / STEP_DONE 状态允许）。"""
+        """跳过当前步骤，任意状态均可触发。
+
+        执行中/暂停时：置 stop_flag + 递增 execution_id 终止旧线程，
+        然后跳过当前步。
+        """
         with self._lock:
-            if self._state == ST_STEP_FAILED:
-                return {
-                    "ok": False,
-                    "message": "步骤已失败，请先重试或终止。如需强制跳过，调 force_skip。",
-                }
-            if self._state not in (ST_STEP_READY, ST_STEP_DONE):
-                return {"ok": False,
-                        "message": f"当前状态 {self._state} 不可跳过"}
+            if self._state in (ST_EXECUTING, ST_PAUSED):
+                # 终止正在执行的旧线程
+                self._stop_flag.set()
+                self._execution_id += 1
+                logger.warning(
+                    "skip_step: 强制终止执行中步骤 (state=%s), 新 execution_id=%d",
+                    self._state, self._execution_id,
+                )
+                return self._do_skip("force_skipped")
 
             return self._do_skip("skipped")
 
@@ -841,6 +885,192 @@ class StepDebugController:
                 return self._adapter.stand_robot()
             return {"ok": False, "message": "adapter 不支持站立"}
 
+    def step_back_robot(self) -> dict[str, Any]:
+        """让机器人后退两步（调用 /Step_back 服务）。"""
+        with self._lock:
+            if hasattr(self._adapter, "step_back_robot"):
+                return self._adapter.step_back_robot()
+            return {"ok": False, "message": "adapter 不支持后退"}
+
+    # ═══════════════════════════════════════════════════════════
+    # 通信预案（计划卡住 → 回物料点重试）
+    # ═══════════════════════════════════════════════════════════
+
+    def reset_to_stock_point(self) -> dict[str, Any]:
+        """将计划回退到最近一次走到物料点的步骤。
+
+        纯计划状态回退，不发送 Nav2 指令。适用于所有突发情况。
+
+        处理流程：
+            1. abort 当前执行（设 stop_flag + 递增 execution_id）
+            2. 找到最近的一个 move_to 物料点步骤
+            3. 将该步骤及之后所有步骤重置为 "pending"
+            4. 将该物料点步骤设为 "current"，状态回到 step_ready
+        """
+        with self._lock:
+            # ── 1. 校验：必须有已加载的计划 ──
+            if not self._plan_steps:
+                return {"ok": False, "message": "没有加载计划"}
+
+            # ── 2. 中止当前执行 ──
+            self._stop_flag.set()
+            self._execution_id += 1
+
+            if self._exec_thread and self._exec_thread.is_alive():
+                logger.warning(
+                    "reset_to_stock: 上一个执行线程仍在运行，已 detach"
+                )
+                self._exec_thread = None
+
+            # ── 3. 找到最近的一个 move_to 物料点步骤 ──
+            stock_index = self._find_last_stock_step(self._current_index)
+            if stock_index < 0:
+                return {"ok": False, "message": "计划中没有找到物料点步骤"}
+
+            # ── 4. 将 stock_index 及之后所有步骤重置 ──
+            for i in range(stock_index, len(self._plan_steps)):
+                self._plan_steps[i]["status"] = "pending"
+                self._plan_steps[i].pop("error_code", None)
+                self._plan_steps[i].pop("replan_target", None)
+            self._plan_steps[stock_index]["status"] = "current"
+
+            self._current_index = stock_index
+            self._state = ST_STEP_READY
+
+            # ── 5. 可选：取消当前导航 ──
+            if hasattr(self._adapter, 'pause_navigation'):
+                try:
+                    self._adapter.pause_navigation()
+                except Exception:
+                    pass
+
+            # ── 6. 退出 FP 单目标模式 ──
+            self._select_target_active = False
+
+            logger.info(
+                "reset_to_stock: 已回退到物料点步骤 step %d, 状态 step_ready",
+                stock_index,
+            )
+
+            return {
+                "ok": True,
+                "message": f"已回到物料点步骤 (step {stock_index})",
+                "stock_step_index": stock_index,
+            }
+
+    def _find_last_stock_step(self, current_index: int) -> int:
+        """从 current_index 往前找最近的一个 move_to 物料点步骤。
+
+        物料点步骤特征：tool == "move_to" 且 args 中含 slot_nav2_x。
+        """
+        for i in range(current_index, -1, -1):
+            if i >= len(self._plan):
+                continue
+            step = self._plan[i]
+            if step.tool == "move_to" and "slot_nav2_x" in step.args:
+                return i
+        # fallback: 从计划开头找第一个物料点步骤
+        for i, step in enumerate(self._plan):
+            if step.tool == "move_to" and "slot_nav2_x" in step.args:
+                return i
+        return -1
+
+    def go_to_robot_origin(self) -> dict[str, Any]:
+        """导航机器人到预定义的机器人原点。
+
+        发送 Nav2 move_to 指令，后台线程执行。
+        任何状态均可触发，有已加载计划即可。
+        """
+        coords = load_scene_coords()
+        origin = coords.get("robot_origin")
+        if not origin:
+            return {"ok": False, "message": "scene_coords.json 中未配置 robot_origin"}
+
+        with self._lock:
+            if not self._plan_steps:
+                return {"ok": False, "message": "没有加载计划"}
+
+            # 中止当前执行
+            self._stop_flag.set()
+            self._execution_id += 1
+            if self._exec_thread and self._exec_thread.is_alive():
+                logger.warning(
+                    "go_origin: 上一个执行线程仍在运行，已 detach"
+                )
+                self._exec_thread = None
+
+            origin_step = PlanStep(
+                step_id="go_robot_origin",
+                task_index=-1,
+                tool="move_to",
+                args={
+                    "target": {
+                        "x": origin["x"],
+                        "y": origin["y"],
+                        "z": 0.0,
+                        "theta": origin.get("theta", 0.0),
+                    },
+                },
+            )
+
+            self._state = ST_EXECUTING
+            origin_exec_id = self._execution_id
+
+        # 在锁外启动后台线程
+        self._exec_thread = threading.Thread(
+            target=self._run_go_origin,
+            args=(origin_step, origin_exec_id),
+            daemon=True,
+        )
+        self._exec_thread.start()
+
+        return {
+            "ok": True,
+            "message": f"正在导航到机器人原点 ({origin['x']}, {origin['y']})",
+        }
+
+    def _run_go_origin(self, move_step: PlanStep, my_exec_id: int) -> None:
+        """后台线程：导航到机器人原点。"""
+        t_start = time.monotonic()
+        try:
+            result = self._adapter.execute(
+                tool=move_step.tool,
+                args=move_step.args,
+                request_id="go_origin",
+                goal_id="go_origin",
+                step_id=move_step.step_id,
+            )
+        except Exception as e:
+            logger.exception("go_origin adapter.execute 异常: %s", e)
+            result = {
+                "status": "error",
+                "error_code": "ADAPTER_EXCEPTION",
+                "message": str(e),
+            }
+
+        elapsed = time.monotonic() - t_start
+
+        with self._lock:
+            if self._stop_flag.is_set() or my_exec_id != self._execution_id:
+                return  # 被新操作覆盖
+
+            log = StepLog(
+                step_id=move_step.step_id,
+                tool=move_step.tool,
+                status="ok" if result.get("status") == "ok" else "error",
+                error_code=result.get("error_code", "") or "",
+                message=result.get("message", ""),
+                elapsed_s=round(elapsed, 2),
+                timestamp=StepLog.now(),
+            )
+            self._step_logs.append(log)
+
+            self._state = ST_IDLE
+
+            logger.info(
+                "go_origin: 到达机器人原点 (%.1fs), 状态 idle", elapsed
+            )
+
     def identify_dropped_box(self) -> dict[str, Any]:
         """调用 FP 识别掉落箱子（MODE_DROPPED）"""
         with self._lock:
@@ -884,6 +1114,261 @@ class StepDebugController:
             return {"ok": False, "message": "adapter 不支持重规划搬起"}
 
     # ═══════════════════════════════════════════════════════════
+    # 自动化掉箱处理（auto mode 专用）
+    # ═══════════════════════════════════════════════════════════
+
+    def auto_drop_recovery(self) -> dict[str, Any]:
+        """自动化掉箱恢复入口：暂停→站立→reset→识别→重规划→恢复自动。
+
+        仅自动执行期间可用，当前步骤不可为 pick/place。
+        spawn 后台线程执行恢复序列，立即返回。
+        """
+        with self._lock:
+            # 校验：自动执行必须正在运行
+            if not self._auto_thread or not self._auto_thread.is_alive():
+                return {"ok": False,
+                        "message": "自动执行未在运行，无需掉箱恢复"}
+
+            # 校验：当前步骤不可为 pick / place（搬起/放下动作不可打断）
+            if self._current_index < len(self._plan):
+                cur_tool = self._plan[self._current_index].tool
+                if cur_tool in ("pick", "place"):
+                    return {"ok": False,
+                            "message": f"当前步骤为 {cur_tool}，不可在搬起/放下期间触发掉箱恢复"}
+
+            saved_index = self._current_index
+
+            # 中止当前自动执行线程
+            self._stop_flag.set()
+            self._execution_id += 1
+            recovery_epoch = self._execution_id
+
+            # 清空旧诊断事件，避免残留的 DiagEvent 污染恢复周期
+            self._collector.clear()
+
+            # 暂停机器人
+            try:
+                if hasattr(self._adapter, "pause_navigation"):
+                    self._adapter.pause_navigation()
+            except Exception as e:
+                logger.error("auto_drop_recovery: pause_navigation 失败: %s", e)
+
+            # 启动恢复线程
+            t = threading.Thread(
+                target=self._run_drop_recovery,
+                args=(recovery_epoch, saved_index),
+                daemon=True,
+            )
+            self._auto_thread = t
+            t.start()
+
+        return {"ok": True, "status": "recovery_started",
+                "saved_index": saved_index}
+
+    def _run_drop_recovery(self, exec_id: int, saved_index: int) -> None:
+        """自动化掉箱恢复序列（后台线程）。
+
+        序列：暂停(已做) → 等1s → 站立 → 等2s → 等3s
+              → 识别掉落箱(最多2次) → 等2s → 重规划搬起 → 退出单目标 → 恢复自动
+        """
+        log = self._append_recovery_log
+
+        def _aborted() -> bool:
+            return self._stop_flag.is_set() or exec_id != self._execution_id
+
+        try:
+            # ── 步骤 1: 等待稳定 ──
+            if _aborted():
+                return
+            time.sleep(1.0)
+
+            # ── 步骤 2: 站立模式 ──
+            if _aborted():
+                return
+            log("running", "正在切换站立模式...")
+            try:
+                if hasattr(self._adapter, "stand_robot"):
+                    self._adapter.stand_robot()
+                # ★ 同步 Python safety_fsm，否则 can_walk() 仍返回 False
+                safety_fsm.force_state(RobotState.STANDING)
+                log("ok", "站立模式完成")
+            except Exception as e:
+                log("error", f"站立模式失败: {e}")
+                self._fail_recovery(exec_id)
+                return
+
+            # ── 步骤 3: 等待站稳 + FP 稳定 ──
+            if _aborted():
+                return
+            time.sleep(3.0)
+
+            # ── 步骤 4: 后退一步（给重规划留空间）──
+            if _aborted():
+                return
+            log("running", "正在后退一步 (/Step_back)...")
+            try:
+                if hasattr(self._adapter, "step_back_robot"):
+                    sb_result = self._adapter.step_back_robot()
+                    if sb_result.get("ok"):
+                        log("ok", "后退完成")
+                    else:
+                        log("error", f"后退失败（非致命，继续流程）: {sb_result.get('message', '')}")
+                else:
+                    log("error", "adapter 不支持后退，跳过")
+            except Exception as e:
+                log("error", f"后退异常（非致命，继续流程）: {e}")
+
+            # ── 步骤 5: 等待 FP 从新位置重新收敛 ──
+            if _aborted():
+                return
+            time.sleep(3.0)
+
+            # ── 步骤 6: 识别掉落箱（最多重试 2 次）──
+            if _aborted():
+                return
+            log("running", "正在识别掉落箱 (FP MODE_DROPPED)...")
+            ident_result = None
+            for attempt in range(2):
+                if _aborted():
+                    return
+                try:
+                    if hasattr(self, "identify_dropped_box"):
+                        ident_result = self.identify_dropped_box()
+                except Exception as e:
+                    log("error", f"识别掉落箱异常: {e}")
+                    self._fail_recovery(exec_id)
+                    return
+
+                if ident_result and ident_result.get("ok"):
+                    break  # 成功，跳出重试循环
+
+                if attempt == 0:
+                    log("running", "首次识别失败，等待 1 秒后重试...")
+                    time.sleep(1.0)
+
+            if not ident_result or not ident_result.get("ok"):
+                msg = ident_result.get("message", "未知错误") if ident_result else "识别服务不可用"
+                log("error", f"❌ 识别失败（重试后仍失败）: {msg}")
+                self._fail_recovery(exec_id)
+                return
+
+            matched_id = ident_result.get("matched_object_id", -1)
+            pose = ident_result.get("pose")
+            pose_str = ""
+            if pose:
+                pose_str = f" ({pose.x:.2f}, {pose.y:.2f})" if hasattr(pose, 'x') else ""
+            log("ok", f"✅ 识别成功: 箱子 #{matched_id}{pose_str}")
+
+            # ── 步骤 7: 等待 ──
+            if _aborted():
+                return
+            time.sleep(2.0)
+
+            # ── 步骤 8: 重规划搬起 ──
+            if _aborted():
+                return
+            log("running", "正在执行重规划搬起...")
+            try:
+                replan_result = self.replan_pick()
+            except Exception as e:
+                log("error", f"重规划搬起异常: {e}")
+                self._fail_recovery(exec_id)
+                return
+
+            if not replan_result or not replan_result.get("ok"):
+                msg = replan_result.get("message", "未知错误") if replan_result else "搬起服务不可用"
+                log("error", f"❌ 搬起失败: {msg}")
+                self._fail_recovery(exec_id)
+                return
+
+            log("ok", "✅ 重规划搬起完成")
+
+            # ── 步骤 9: 退出单目标模式 ──
+            if _aborted():
+                return
+            try:
+                if (hasattr(self._adapter, "select_target_public")
+                        and self._select_target_active):
+                    self._adapter.select_target_public(
+                        select=False, step_id="recovery_exit"
+                    )
+            except Exception as e:
+                logger.error("recovery: 退出 SelectTarget 失败: %s", e)
+            self._select_target_active = False
+
+            # ── 步骤 10: 判断恢复路径 ──
+            if _aborted():
+                return
+
+            saved_step = self._plan[saved_index] if saved_index < len(self._plan) else None
+            saved_tool = saved_step.tool if saved_step else ""
+
+            if saved_tool == "move_to":
+                # 路径 B：已在 move_to 中 → 恢复行走，不重发导航目标
+                resume_index = saved_index
+                self._skip_nav_resend = True
+                log("ok", "路径B: 恢复行走 → 继续等待 nav_reached")
+            else:
+                # 路径 A（saved 为 pick 或其它）：发新导航目标
+                resume_index = self._find_resume_index(saved_index)
+                self._skip_nav_resend = False
+                log("ok", f"路径A: 发送导航目标 → resume_index={resume_index}")
+
+            # ── 恢复导航 ──
+            try:
+                if hasattr(self._adapter, "resume_navigation"):
+                    self._adapter.resume_navigation()
+            except Exception as e:
+                logger.error("recovery: resume_navigation 失败: %s", e)
+
+            # ── 在 adapter 上设置 skip_nav_resend 标记 ──
+            if hasattr(self._adapter, "skip_nav_resend"):
+                self._adapter.skip_nav_resend = self._skip_nav_resend
+
+            # ── 重启自动执行 ──
+            with self._lock:
+                if exec_id != self._execution_id:
+                    return
+                self._current_index = resume_index
+                self._plan_steps[resume_index]["status"] = "current"
+                self._state = ST_STEP_READY
+                self._stop_flag.clear()
+
+            # 内联重启 _run_auto（同一线程，不额外 spawn）
+            self._run_auto(exec_id)
+
+        except Exception as e:
+            logger.exception("_run_drop_recovery: 未预期异常")
+            self._fail_recovery(exec_id)
+
+    def _find_resume_index(self, saved_index: int) -> int:
+        """从 saved_index 往前找最近 pick 步，返回其下一步（move_to to place）。"""
+        for i in range(saved_index, -1, -1):
+            if i < len(self._plan) and self._plan[i].tool == "pick":
+                return i + 1
+        # fallback：找不到 pick → 返回原 index
+        return saved_index
+
+    def _append_recovery_log(self, status: str, message: str) -> None:
+        """推送掉箱恢复诊断日志到 _step_logs（SSE 可见）。"""
+        with self._lock:
+            self._step_logs.append(StepLog(
+                step_id="drop_recovery",
+                tool="drop_recovery",
+                status=status,
+                message=message,
+                timestamp=StepLog.now(),
+            ))
+
+    def _fail_recovery(self, exec_id: int) -> None:
+        """恢复失败：设置状态为 STEP_FAILED，退出自动模式。"""
+        with self._lock:
+            if exec_id == self._execution_id:
+                self._state = ST_STEP_FAILED
+        # ★ 恢复失败后同步 FSM，确保手动操作不受阻
+        safety_fsm.force_state(RobotState.STANDING)
+
+    # ═══════════════════════════════════════════════════════════
     # 查询
     # ═══════════════════════════════════════════════════════════
 
@@ -893,12 +1378,16 @@ class StepDebugController:
             nav_reached = None
             if hasattr(self._adapter, "nav_reached"):
                 nav_reached = self._adapter.nav_reached
+            locked_object_id = None
+            if self._select_target_active and hasattr(self._adapter, "_fp_target_object_id"):
+                locked_object_id = self._adapter._fp_target_object_id
             return {
                 "mode": "step_debug",
                 "state": self._state,
                 "plan": self._plan_steps,
                 "current_index": self._current_index,
                 "select_target_active": self._select_target_active,
+                "locked_object_id": locked_object_id,
                 "nav_reached": nav_reached,  # 🆕 Nav2 导航到达状态
                 "diag_events": self._collector.snapshot(),
                 "step_logs": [

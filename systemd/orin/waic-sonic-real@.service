@@ -1,0 +1,25 @@
+[Unit]
+Description=WAIC SONIC Policy (真机物理, app-domain %i)
+After=network.target
+
+[Service]
+Type=simple
+StandardInput=null
+WorkingDirectory=/home/unitree/GR00T-WholeBodyControl-phi/gear_sonic_deploy
+ExecStartPre=-/usr/bin/rm -f /tmp/waic-sonic-real-cmd-%i.fifo
+ExecStartPre=/usr/bin/mkfifo /tmp/waic-sonic-real-cmd-%i.fifo
+ExecStart=/bin/bash -c '\
+  source scripts/setup_env.sh && \
+  export ROS_DOMAIN_ID=%i && \
+  export HAS_ROS2=1 && \
+  ./deploy.sh --input-type ros2_manager --output-type all real < /tmp/waic-sonic-real-cmd-%i.fifo & \
+  DEPLOY_PID=$$!; \
+  exec 3>/tmp/waic-sonic-real-cmd-%i.fifo; \
+  echo Y >&3; \
+  wait $$DEPLOY_PID'
+KillSignal=SIGKILL
+SendSIGKILL=no
+TimeoutStopSec=1
+
+[Install]
+WantedBy=default.target

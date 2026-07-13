@@ -1,0 +1,17 @@
+[Unit]
+Description=WAIC G1 Motion Gateway C++ (app-domain %i)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/unitree/GR00T-WholeBodyControl-phi/gear_sonic_deploy
+Environment=ROS_DOMAIN_ID=%i
+Environment=ROS_LOCALHOST_ONLY=0
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+StandardInput=null
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && exec ./run_ros2_manager_gateway_cpp.sh foreground'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
