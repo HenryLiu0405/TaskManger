@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""监听 /start_navigation → 提取坐标 → 发布 /goal_pose → 等 /navigation_complete 才返回"""
-import json, math, threading, rclpy
+"""监听 /start_navigation → 发布 /goal_pose → 立即返回（纯转发）"""
+import json, math, rclpy
 from rclpy.node import Node
-from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Bool
 from robot_interfaces.srv import ExecuteTrajectory
 
 
@@ -14,15 +12,7 @@ class GoalBridge(Node):
         self.srv = self.create_service(
             ExecuteTrajectory, '/start_navigation', self.callback)
         self.pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
-        self._complete = threading.Event()
-        self.create_subscription(
-            Bool, '/navigation_complete', self._on_navigation_complete, 10)
-        self.get_logger().info('GoalBridge: /start_navigation → /goal_pose, waits for /navigation_complete')
-
-    def _on_navigation_complete(self, msg: Bool) -> None:
-        if msg.data:
-            self._complete.set()
-            self.get_logger().info('navigation_complete received, releasing service response')
+        self.get_logger().info('GoalBridge: /start_navigation → /goal_pose')
 
     def callback(self, request, response):
         try:
@@ -30,7 +20,6 @@ class GoalBridge(Node):
             x = float(data.get('target_x', 0.0))
             y = float(data.get('target_y', 0.0))
             yaw = float(data.get('yaw', math.pi / 2))
-            self._complete.clear()
             msg = PoseStamped()
             msg.header.frame_id = 'map'
             msg.pose.position.x = x
@@ -38,14 +27,8 @@ class GoalBridge(Node):
             msg.pose.orientation.z = math.sin(yaw * 0.5)
             msg.pose.orientation.w = math.cos(yaw * 0.5)
             self.pub.publish(msg)
-            self.get_logger().info(f'Goal to fastlio_ws: ({x}, {y}, yaw={yaw:.3f}), waiting for arrive...')
-
-            if self._complete.wait(timeout=180.0):
-                response.success = True
-                self.get_logger().info(f'Arrived: ({x}, {y})')
-            else:
-                response.success = False
-                self.get_logger().error(f'Navigation timeout: ({x}, {y})')
+            self.get_logger().info(f'Goal to fastlio_ws: ({x:.2f}, {y:.2f}, yaw={yaw:.3f})')
+            response.success = True
         except Exception as e:
             self.get_logger().error(str(e))
             response.success = False
@@ -54,15 +37,7 @@ class GoalBridge(Node):
 
 def main():
     rclpy.init()
-    node = GoalBridge()
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
-    try:
-        executor.spin()
-    finally:
-        executor.remove_node(node)
-        node.destroy_node()
-        rclpy.shutdown()
+    rclpy.spin(GoalBridge())
 
 
 if __name__ == '__main__':
