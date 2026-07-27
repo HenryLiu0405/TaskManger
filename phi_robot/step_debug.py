@@ -432,12 +432,30 @@ class StepDebugController:
                     if self._stop_flag.is_set() or exec_id != self._execution_id:
                         return
 
+                    # ── pick 成功时附加位姿和动作信息 ──
+                    if step.tool == "pick" and is_ok:
+                        msg_parts = [result.get("message", "")]
+                        px = result.get("pose_x")
+                        py = result.get("pose_y")
+                        pz = result.get("pose_z")
+                        if px is not None:
+                            msg_parts.insert(0, f"位姿=({px:.3f},{py:.3f},{pz:.3f})")
+                        action = result.get("selected_action")
+                        if action:
+                            msg_parts.append(f"action={action}")
+                        dist = result.get("distance")
+                        if dist is not None:
+                            msg_parts.append(f"dist={dist:.3f}m")
+                        rich_message = " | ".join(msg_parts)
+                    else:
+                        rich_message = result.get("message", "")
+
                     log = StepLog(
                         step_id=step.step_id,
                         tool=step.tool,
                         status="ok" if is_ok else "error",
                         error_code=result.get("error_code", "") or "",
-                        message=result.get("message", ""),
+                        message=rich_message,
                         elapsed_s=round(elapsed, 2),
                         timestamp=StepLog.now(),
                     )
@@ -1442,12 +1460,30 @@ class StepDebugController:
             if self._stop_flag.is_set() or my_exec_id != self._execution_id:
                 return  # 已被 abort 或新执行已启动，不更新状态
 
+            # ── pick 成功时附加位姿和动作信息 ──
+            if step.tool == "pick" and is_ok:
+                msg_parts = [result.get("message", "")]
+                px = result.get("pose_x")
+                py = result.get("pose_y")
+                pz = result.get("pose_z")
+                if px is not None:
+                    msg_parts.insert(0, f"位姿=({px:.3f},{py:.3f},{pz:.3f})")
+                action = result.get("selected_action")
+                if action:
+                    msg_parts.append(f"action={action}")
+                dist = result.get("distance")
+                if dist is not None:
+                    msg_parts.append(f"dist={dist:.3f}m")
+                rich_message = " | ".join(msg_parts)
+            else:
+                rich_message = result.get("message", "")
+
             log = StepLog(
                 step_id=step.step_id,
                 tool=step.tool,
                 status="ok" if is_ok else "error",
                 error_code=result.get("error_code", "") or "",
-                message=result.get("message", ""),
+                message=rich_message,
                 elapsed_s=round(elapsed, 2),
                 timestamp=StepLog.now(),
             )

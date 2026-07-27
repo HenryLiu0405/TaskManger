@@ -58,12 +58,6 @@ def get_stock_theta(version: str = "stock-v1") -> float:
     return float(load_scene_coords()["stock_point"].get("theta", math.pi / 2))
 
 
-def _map_bounds() -> tuple[float, float, float, float]:
-    """从配置返回 Nav2 地图边界 (x_min, x_max, y_min, y_max)。"""
-    b = load_scene_coords()["map_bounds"]
-    return (float(b["x_min"]), float(b["x_max"]), float(b["y_min"]), float(b["y_max"]))
-
-
 def compute_approach(
     obj_nav2: tuple[float, float, float],
     offset: float = 0.1,
@@ -89,16 +83,6 @@ def compute_approach(
     # 沿最终朝向反向后退 offset：机器人停在点前方、面向该点
     app_x = ox - offset * math.cos(app_yaw)
     app_y = oy - offset * math.sin(app_yaw)
-
-    x_min, x_max, y_min, y_max = _map_bounds()
-    if not (x_min <= app_x <= x_max):
-        raise ValueError(
-            f"approach x={app_x:.2f} out of map bounds [{x_min}, {x_max}]"
-        )
-    if not (y_min <= app_y <= y_max):
-        raise ValueError(
-            f"approach y={app_y:.2f} out of map bounds [{y_min}, {y_max}]"
-        )
 
     return (app_x, app_y, app_yaw)
 
@@ -149,6 +133,10 @@ class MissionPlanner:
         for position in destination_order:
             if position not in grid_cells:
                 raise ValueError(f"无效的目标方位: {position}")
+
+        # 固定优先级：se → e → ne → s → c → n → sw → w → nw
+        _PRIORITY = {"se": 0, "e": 1, "ne": 2, "s": 3, "c": 4, "n": 5, "sw": 6, "w": 7, "nw": 8}
+        destination_order = sorted(destination_order, key=lambda p: _PRIORITY.get(p, 99))
 
         plan: List[PlanStep] = []
         self._step_counter = 0

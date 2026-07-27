@@ -1,19 +1,19 @@
 {
-  "active": "B",
+  "active": "A",
   "robots": {
     "A": {
       "label": "机器人A",
-      "ip": "192.168.3.168",
+      "ip": "192.168.50.79",
       "domain_id": 66,
-      "camera_host": "192.168.3.168",
-      "orin_host": "unitree@192.168.3.168"
+      "camera_host": "192.168.50.79",
+      "orin_host": "unitree@192.168.50.79"
     },
     "B": {
       "label": "机器人B",
-      "ip": "192.168.3.215",
+      "ip": "192.168.50.125",
       "domain_id": 5,
-      "camera_host": "192.168.3.215",
-      "orin_host": "unitree@192.168.3.215"
+      "camera_host": "192.168.50.125",
+      "orin_host": "unitree@192.168.50.125"
     }
   }
 }

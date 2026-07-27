@@ -1397,6 +1397,9 @@ class RosAcceptanceAdapter:
             "yaw_deg": resp.yaw_deg,
             "target_x": resp.target_x,
             "target_y": resp.target_y,
+            "pose_x": req.object_pose.pose.position.x,
+            "pose_y": req.object_pose.pose.position.y,
+            "pose_z": req.object_pose.pose.position.z,
         }
 
     def _call_set_lift(self, request_id, goal_id, step_id):

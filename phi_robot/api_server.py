@@ -1154,9 +1154,13 @@ class PhiRobotAPIServer:
                                b'Content-Type: image/jpeg\r\n\r\n'
                                + frame + b'\r\n')
                     else:
-                        # 超过 2 秒无数据 → 停顿避免空转
+                        # 超过 2 秒无数据 → 发送占位帧保活
                         if time.time() - last_data_time > 2.0:
-                            time.sleep(0.1)
+                            placeholder = _get_placeholder_jpeg()
+                            if placeholder is not None:
+                                yield (b'--frame\r\n'
+                                       b'Content-Type: image/jpeg\r\n\r\n'
+                                       + placeholder + b'\r\n')
                             last_data_time = time.time()
                     time.sleep(0.033)  # ~30 fps
 
