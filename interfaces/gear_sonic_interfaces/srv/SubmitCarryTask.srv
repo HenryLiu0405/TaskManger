@@ -1,0 +1,17 @@
+# Unique client-generated identifier. Reusing an accepted ID must not start a second motion.
+string request_id
+
+# Currently supported value: "carry".
+string command
+
+# Object pose at detection time. header.frame_id must match the configured torso frame.
+geometry_msgs/PoseStamped object_pose
+---
+bool accepted
+string selected_action
+float64 target_x
+float64 target_y
+float64 target_z
+float64 distance
+float64 yaw_deg
+string message
