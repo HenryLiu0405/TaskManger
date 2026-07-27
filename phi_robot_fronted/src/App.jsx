@@ -5,16 +5,15 @@ import UnifiedConsole from './UnifiedConsole.jsx';
 import LockBoard2D from './LockBoard2D.jsx';
 
 const ZONE_ID_BY_NODE = {
-  '1': 'nw', '2': 'n', '3': 'ne',
-  '4': 'w',  '5': 'c', '6': 'e',
-  '7': 'sw', '8': 's', '9': 'se',
+  '1': 'se', '2': 's', '3': 'sw',
+  '4': 'e',  '5': 'c', '6': 'w',
+  '7': 'ne', '8': 'n', '9': 'nw',
 };
 
 const api = new PhiRobotAPIClient();
 
 function App() {
   const [isRunning, setIsRunning] = useState(false);
-  const [isDrawing, setIsDrawing] = useState(false);
   const [path, setPath] = useState([]);
   const [missionStatus, setMissionStatus] = useState(null);
   const [lastError, setLastError] = useState(null);
@@ -30,12 +29,10 @@ function App() {
 
     if (isRunning && missionStatus) {
       gsap.to(bgImage, { opacity: 1, duration: 1.2, ease: 'power2.out' });
-    } else if (isDrawing) {
-      gsap.to(bgImage, { opacity: 0.5, duration: 0.3, ease: 'power2.out' });
     } else {
       gsap.to(bgImage, { opacity: 0.7, duration: 0.7, ease: 'power2.out' });
     }
-  }, [isRunning, isDrawing]);
+  }, [isRunning]);
 
   const appendNode = useCallback((nodeId) => {
     setPath((currentPath) => {
@@ -43,13 +40,6 @@ function App() {
       return [...currentPath, nodeId];
     });
   }, []);
-
-  const handleDrawStart = useCallback(() => {
-    if (isRunning) return;
-    setIsDrawing(true);
-  }, [isRunning]);
-
-  const handleDrawEnd = useCallback(() => setIsDrawing(false), []);
 
   // SSE 订阅：监听 StepDebugController 状态变更，同步到主页 UI
   useEffect(() => {
@@ -134,7 +124,6 @@ function App() {
         steps: data.raw_steps,
       });
       setIsRunning(false);
-      setIsDrawing(false);
       // 触发 SSE 连接
       setPlanId((prev) => prev + 1);
     } catch (err) {
@@ -203,9 +192,6 @@ function App() {
         <LockBoard2D
           path={path}
           isRunning={isRunning}
-          isDrawing={isDrawing}
-          onDrawStart={handleDrawStart}
-          onDrawEnd={handleDrawEnd}
           onAppendNode={appendNode}
         />
 

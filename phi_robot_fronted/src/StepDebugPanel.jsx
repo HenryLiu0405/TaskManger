@@ -894,14 +894,6 @@ export default function StepDebugPanel({ robotState }) {
             强制跳过
           </Button>
           <Button
-            size="small"
-            icon={state === 'paused' ? <CaretRightOutlined /> : <PauseCircleOutlined />}
-            disabled={!btns.pause && !btns.resume}
-            onClick={state === 'paused' ? handleResume : handlePause}
-          >
-            {state === 'paused' ? '恢复' : '暂停'}
-          </Button>
-          <Button
             size="small" danger
             icon={<StopOutlined />}
             disabled={!btns.abort}
@@ -927,7 +919,7 @@ export default function StepDebugPanel({ robotState }) {
               icon={<span>🏠</span>}
               onClick={handleGoOrigin}
               loading={goOriginLoading}
-              disabled={autoMode}
+              disabled
               style={{ color: '#52c41a', borderColor: '#52c41a' }}
             >
               回原点
@@ -963,6 +955,9 @@ export default function StepDebugPanel({ robotState }) {
           </Button>
           <Button size="small" icon={<span>🔊</span>} onClick={() => playAudio('task_complete')} style={{ color: '#52c41a', borderColor: '#52c41a' }}>
             任务完成
+          </Button>
+          <Button size="small" icon={<span>🌙</span>} onClick={() => playAudio('lunar_signal_weak')} style={{ color: '#7fb8d6', borderColor: '#7fb8d6' }}>
+            月球信号弱
           </Button>
         </Space>
         )}
@@ -1108,9 +1103,10 @@ export default function StepDebugPanel({ robotState }) {
             styles={{ body: { flex: 1, overflow: 'hidden', display: 'flex', padding: 4 } }}
           >
             <img
+              key={videoSource}
               src={videoSource === 'fp'
-                ? `/api/fp/video/rgb/stream?t=${Date.now()}`
-                : `/api/rs/video/rgb/stream?t=${Date.now()}`}
+                ? '/api/fp/video/rgb/stream'
+                : '/api/rs/video/rgb/stream'}
               alt={videoSource === 'fp' ? 'FP RGB' : 'RealSense RGB'}
               style={{ width: '100%', height: '100%', objectFit: 'contain', background: '#141414', borderRadius: 4 }}
             />
