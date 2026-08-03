@@ -3,6 +3,7 @@ import gsap from 'gsap';
 import PhiRobotAPIClient from './api.js';
 import UnifiedConsole from './UnifiedConsole.jsx';
 import LockBoard2D from './LockBoard2D.jsx';
+import AutonomyConsole from './AutonomyConsole.jsx';
 
 const ZONE_ID_BY_NODE = {
   '1': 'se', '2': 's', '3': 'sw',
@@ -13,6 +14,7 @@ const ZONE_ID_BY_NODE = {
 const api = new PhiRobotAPIClient();
 
 function App() {
+  const developerMode = new URLSearchParams(window.location.search).get('developer') === '1';
   const [isRunning, setIsRunning] = useState(false);
   const [path, setPath] = useState([]);
   const [missionStatus, setMissionStatus] = useState(null);
@@ -20,8 +22,10 @@ function App() {
   const [planId, setPlanId] = useState(0);
 
   useEffect(() => {
-    document.title = 'phi_robot 九宫格锁屏式 Demo';
-  }, []);
+    document.title = developerMode
+      ? 'phi_robot Developer Console'
+      : 'phi_robot Gemini Autonomy';
+  }, [developerMode]);
 
   useEffect(() => {
     const bgImage = document.getElementById('bg-image');
@@ -188,22 +192,26 @@ function App() {
           <div className="waic-brand__sub">phi</div>
         </div>
 
-        {/* LockBoard — always visible, shrinks during running */}
-        <LockBoard2D
-          path={path}
-          isRunning={isRunning}
-          onAppendNode={appendNode}
-        />
+        {!developerMode && <AutonomyConsole api={api} />}
 
-        {/* Unified Console — always visible */}
-        <UnifiedConsole
-          path={path}
-          missionStatus={missionStatus}
-          isRunning={isRunning}
-          onRunToggle={handleRunToggle}
-          onAbort={handleAbort}
-          onReset={handleReset}
-        />
+        {developerMode && (
+          <>
+            <LockBoard2D
+              path={path}
+              isRunning={isRunning}
+              onAppendNode={appendNode}
+            />
+
+            <UnifiedConsole
+              path={path}
+              missionStatus={missionStatus}
+              isRunning={isRunning}
+              onRunToggle={handleRunToggle}
+              onAbort={handleAbort}
+              onReset={handleReset}
+            />
+          </>
+        )}
 
         {/* Error bar */}
         {lastError && (

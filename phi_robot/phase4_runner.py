@@ -1,4 +1,6 @@
-"""Phase 4 regression runner for metrics and daily validation.
+"""Legacy Phase 4 regression runner for metrics and daily validation.
+
+This module is not part of the current Phase 0/1 release gate.
 
 The suite aggregates the already-validated Phase 1-3 scenarios into a single
 reproducible regression pass.  It mirrors the repository's test/report style:

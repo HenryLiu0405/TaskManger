@@ -13,6 +13,7 @@ import asyncio
 from .models import MissionRecord, MissionEvent, ToolResult
 from .mission_service import MissionService
 from .adapters.adapter_base import RobotAdapter
+from .skills import build_skill_dispatcher
 
 
 class ExecutionContext:
@@ -72,6 +73,7 @@ class MissionRunner:
         hook: Optional[MissionExecutionHook] = None,
         cancel_event: Optional[threading.Event] = None,
         step_callback: Optional[Callable] = None,
+        skill_dispatcher: Any = None,
     ):
         """
         初始化执行引擎
@@ -85,9 +87,11 @@ class MissionRunner:
         """
         self._service = service
         self._adapter = adapter
+        self._skill_dispatcher = skill_dispatcher or build_skill_dispatcher(adapter)
         self._hook = hook
         self._cancel_event = cancel_event
         self._step_callback = step_callback
+        self._attempts_by_step: Dict[str, int] = {}
 
     async def run(self, mission_id: str) -> MissionRecord:
         """
@@ -162,31 +166,10 @@ class MissionRunner:
                 self._service.mark_step_running(mission_id)
 
                 # 执行工具
+                attempt = self._attempts_by_step.get(step.step_id, 0) + 1
+                self._attempts_by_step[step.step_id] = attempt
                 try:
                     args = dict(step.args)  # shallow copy — don't mutate frozen PlanStep
-                    # 条件性注入 `current`：仅当适配器不是将 move_to 转发到外部服务时注入。
-                    # 只有当当前 move_to 会走真机时才不注入 current；否则本地模拟仍需 current。
-                    should_inject_current = True
-                    try:
-                        route_real_move_to = getattr(self._adapter, "should_route_real_move_to", None)
-                        if callable(route_real_move_to) and route_real_move_to(step.tool, args):
-                            should_inject_current = False
-                    except Exception:
-                        should_inject_current = True
-
-                    if step.tool == "move_to" and should_inject_current:
-                        # 执行前获取机器人当前位姿，注入 current 字段
-                        pose_result = await self._execute_tool(
-                            tool="get_pose",
-                            args={},
-                            request_id=record.request_id,
-                            goal_id=record.goal_id,
-                            step_id=step.step_id + "-pre",
-                        )
-                        if pose_result.get("status") == "ok":
-                            args["current"] = pose_result.get("state", {}).get("pose", {})
-                        else:
-                            args["current"] = {"x": 0.0, "y": 0.0, "z": 0.0, "theta": 0.0}
 
                     result_dict = await self._execute_tool(
                         tool=step.tool,
@@ -194,6 +177,11 @@ class MissionRunner:
                         request_id=record.request_id,
                         goal_id=record.goal_id,
                         step_id=step.step_id,
+                        mission_id=mission_id,
+                        execution_epoch=record.execution_epoch,
+                        annotations=step.annotations,
+                        skill_version=step.skill_version,
+                        attempt=attempt,
                     )
 
                     tool_result = ToolResult(
@@ -205,6 +193,10 @@ class MissionRunner:
                         request_id=result_dict.get("request_id"),
                         goal_id=result_dict.get("goal_id"),
                         step_id=step.step_id,
+                        invocation_id=result_dict.get("invocation_id"),
+                        outcome=result_dict.get("outcome", ""),
+                        error_category=result_dict.get("error_category"),
+                        verification=result_dict.get("verification", {}),
                     )
 
                     context.tool_results.append(tool_result)
@@ -212,7 +204,9 @@ class MissionRunner:
                         self._step_callback(step, tool_result)
 
                     if tool_result.status == "ok":
-                        self._service.mark_step_succeeded(mission_id, result_dict)
+                        self._service.mark_step_succeeded(
+                            mission_id, result_dict, attempt=attempt
+                        )
                     else:
                         error_code = tool_result.error_code or "UNKNOWN_ERROR"
 
@@ -223,22 +217,36 @@ class MissionRunner:
                             else ("continue", None)
                         )
 
-                        if action == "abort":
+                        unknown_outcome = result_dict.get("outcome") == "unknown"
+
+                        if action == "abort" or unknown_outcome:
+                            self._service.mark_step_failed(
+                                mission_id,
+                                error_code,
+                                tool_result.message,
+                                result_dict=result_dict,
+                                attempt=attempt,
+                            )
+                            record = self._service.get_mission(mission_id)
                             record = replace(
                                 record,
-                                status="aborted",
-                                last_error=f"{error_code}: {tool_result.message}",
+                                status="failed" if unknown_outcome else "aborted",
                             )
                             self._service.store.update(mission_id, record)
                             break
-                        elif action == "retry":
-                            # 同步骤重试，不推进 step_index
-                            continue
                         else:
-                            # "continue"：标记失败，继续下一步
+                            # Phase 1 is fail-stop and does not honor legacy
+                            # retry requests. Re-dispatching a physical step
+                            # requires a later, explicit recovery design.
                             self._service.mark_step_failed(
-                                mission_id, error_code, tool_result.message
+                                mission_id, error_code, tool_result.message,
+                                result_dict=result_dict,
+                                attempt=attempt,
                             )
+                            record = self._service.get_mission(mission_id)
+                            record = replace(record, status="failed")
+                            self._service.store.update(mission_id, record)
+                            break
 
                 except Exception as e:
                     if self._step_callback:
@@ -247,7 +255,16 @@ class MissionRunner:
                             message=str(e), step_id=step.step_id,
                         ))
                     self._service.mark_step_failed(
-                        mission_id, "INTERNAL_ERROR", str(e)
+                        mission_id, "INTERNAL_ERROR", str(e),
+                        result_dict={
+                            "status": "error",
+                            "error_code": "INTERNAL_ERROR",
+                            "message": str(e),
+                            "outcome": "failed",
+                            "error_category": "execution",
+                            "step_id": step.step_id,
+                        },
+                        attempt=attempt,
                     )
                     record = replace(record, status="failed", last_error=str(e))
                     self._service.store.update(mission_id, record)
@@ -274,6 +291,11 @@ class MissionRunner:
         request_id: str,
         goal_id: str,
         step_id: str,
+        mission_id: str = "",
+        execution_epoch: int = 1,
+        annotations: Optional[Dict[str, Any]] = None,
+        skill_version: str = "1.0",
+        attempt: int = 1,
     ) -> Dict[str, Any]:
         """执行单个工具，执行前检查取消信号"""
         if self._cancel_event and self._cancel_event.is_set():
@@ -281,15 +303,26 @@ class MissionRunner:
                 "status": "error",
                 "error_code": "CANCELLED",
                 "message": "Execution cancelled before tool call",
+                "outcome": "cancelled",
+                "error_category": "cancelled",
             }
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             None,
-            lambda: self._adapter.execute(
+            lambda: self._skill_dispatcher.execute_legacy(
                 tool,
                 args,
+                version=skill_version,
                 request_id=request_id,
                 goal_id=goal_id,
                 step_id=step_id,
+                mission_id=mission_id,
+                source="mission_runner",
+                annotations=annotations or {},
+                attempt=attempt,
+                idempotency_key=(
+                    f"mission:{mission_id or request_id}:"
+                    f"epoch-{execution_epoch}:{step_id}"
+                ),
             ),
         )

@@ -19,6 +19,71 @@ class PhiRobotAPIClient {
     return response.json();
   }
 
+  async _json(response, fallback) {
+    let body = null;
+    try {
+      body = await response.json();
+    } catch (_) {
+      // Use the transport status below.
+    }
+    if (!response.ok) {
+      const error = new Error(body?.message || body?.error || fallback || response.statusText);
+      error.status = response.status;
+      error.code = body?.error_code;
+      throw error;
+    }
+    return body;
+  }
+
+  async submitAutonomyTask(instruction, options = {}) {
+    const response = await fetch(`${this.baseURL}/autonomy/tasks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ instruction, background: true, ...options }),
+    });
+    const body = await this._json(response, 'Autonomy task submission failed');
+    this.missionId = body?.task?.mission_id || null;
+    return body;
+  }
+
+  async getAutonomyTask(missionId = this.missionId) {
+    if (!missionId) throw new Error('No autonomy mission ID provided');
+    const response = await fetch(`${this.baseURL}/autonomy/tasks/${missionId}`);
+    return this._json(response, 'Unable to read autonomy task');
+  }
+
+  async getAutonomyReplay(missionId = this.missionId) {
+    if (!missionId) throw new Error('No autonomy mission ID provided');
+    const response = await fetch(`${this.baseURL}/autonomy/tasks/${missionId}/replay`);
+    return this._json(response, 'Unable to read mission replay');
+  }
+
+  async getAutonomyMetrics(missionId = this.missionId) {
+    if (!missionId) throw new Error('No autonomy mission ID provided');
+    const response = await fetch(`${this.baseURL}/autonomy/tasks/${missionId}/metrics`);
+    return this._json(response, 'Unable to read mission metrics');
+  }
+
+  async pauseAutonomyTask(missionId = this.missionId) {
+    if (!missionId) throw new Error('No autonomy mission ID provided');
+    const response = await fetch(`${this.baseURL}/autonomy/tasks/${missionId}/pause`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    return this._json(response, 'Trusted pause request failed');
+  }
+
+  async stopAutonomyTask(missionId = this.missionId, reason = 'operator stop') {
+    if (!missionId) throw new Error('No autonomy mission ID provided');
+    const response = await fetch(`${this.baseURL}/autonomy/tasks/${missionId}/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason }),
+    });
+    return this._json(response, 'Trusted stop request failed');
+  }
+
   /**
    * 提交任务
    * @param {Array<string>} destinationOrder - 目标位置顺序 (nw, n, ne, w, c, e, sw, s, se)

@@ -9,7 +9,7 @@ from datetime import datetime
 from dataclasses import replace
 import uuid
 
-from .models import MissionRecord, PlanStep
+from .models import MissionRecord, PlanStep, ToolResult
 from .store import MissionStore
 from .mission_planner import MissionPlanner
 
@@ -64,9 +64,9 @@ class MissionService:
         # 幂等性 — 相同 request_id 复用已有 mission
         existing = self._store.get_by_request_id(request_id)
         if existing:
-            if existing.status in ("running", "paused", "pause_requested"):
+            if existing.status in ("ready", "running", "paused", "pause_requested"):
                 return existing.mission_id
-            # 终态或 ready → 重置并复用
+            # 终态 → 开启新的持久化执行 epoch 并复用 mission ID
             plan = self._planner.plan(
                 goal_id=goal_id,
                 destination_order=destination_order,
@@ -80,6 +80,7 @@ class MissionService:
                 scene_version=scene_version,
                 stock_layout_version=stock_layout_version,
                 status="ready",
+                execution_epoch=max(existing.execution_epoch, 0) + 1,
                 plan=plan,
                 current_step_index=-1,
                 current_task_index=0,
@@ -90,6 +91,7 @@ class MissionService:
                 abort_requested=False,
                 metrics={
                     "timeout_s": options.get("timeout_s", 20) if options else 20,
+                    "max_retries": options.get("max_retries", 0) if options else 0,
                 },
             )
             self._store.update(existing.mission_id, record)
@@ -114,6 +116,7 @@ class MissionService:
             scene_version=scene_version,
             stock_layout_version=stock_layout_version,
             status="ready",
+            execution_epoch=1,
             plan=plan,
             current_step_index=-1,
             current_task_index=0,
@@ -121,6 +124,7 @@ class MissionService:
             state={},
             metrics={
                 "timeout_s": options.get("timeout_s", 20) if options else 20,
+                "max_retries": options.get("max_retries", 0) if options else 0,
             },
             last_error=None,
         )
@@ -220,19 +224,33 @@ class MissionService:
                 f"任务状态为 {record.status}，无法重置"
             )
         
+        reset_plan = [
+            replace(
+                step,
+                status="pending",
+                result=None,
+                invocation_id=None,
+                attempt=0,
+            )
+            for step in record.plan
+        ]
         record = replace(
             record,
             status="ready",
+            execution_epoch=max(record.execution_epoch, 0) + 1,
+            plan=reset_plan,
             current_step_index=-1,
             current_task_index=0,
             current_stock_slot_index=0,
             state={},
-            last_error=None
+            last_error=None,
+            pause_requested=False,
+            abort_requested=False,
         )
         self._store.update(mission_id, record)
 
     def mark_step_succeeded(
-        self, mission_id: str, result_dict: dict
+        self, mission_id: str, result_dict: dict, *, attempt: int = 1
     ) -> None:
         """
         标记一个步骤成功执行
@@ -248,7 +266,17 @@ class MissionService:
         # 更新计划中的步骤状态（创建新的 PlanStep 以支持 frozen）
         if record.current_step_index >= 0 and record.current_step_index < len(record.plan):
             old_step = record.plan[record.current_step_index]
-            new_step = replace(old_step, status="completed")
+            result = ToolResult.from_dict({
+                **result_dict,
+                "step_id": old_step.step_id,
+            })
+            new_step = replace(
+                old_step,
+                status="completed",
+                result=result,
+                invocation_id=result_dict.get("invocation_id"),
+                attempt=max(old_step.attempt, attempt),
+            )
             new_plan = list(record.plan)
             new_plan[record.current_step_index] = new_step
             record = replace(record, plan=new_plan)
@@ -276,7 +304,12 @@ class MissionService:
             self._store.update(mission_id, record)
 
     def mark_step_failed(
-        self, mission_id: str, error_code: str, error_message: str
+        self,
+        mission_id: str,
+        error_code: str,
+        error_message: str,
+        result_dict: Optional[dict] = None,
+        attempt: int = 1,
     ) -> None:
         """
         标记一个步骤失败
@@ -293,7 +326,20 @@ class MissionService:
         # 更新计划中的步骤状态（创建新的 PlanStep 以支持 frozen）
         if record.current_step_index >= 0 and record.current_step_index < len(record.plan):
             old_step = record.plan[record.current_step_index]
-            new_step = replace(old_step, status="failed")
+            result = ToolResult.from_dict({
+                **(result_dict or {}),
+                "status": "error",
+                "error_code": error_code,
+                "message": error_message,
+                "step_id": old_step.step_id,
+            })
+            new_step = replace(
+                old_step,
+                status="failed",
+                result=result,
+                invocation_id=result.invocation_id,
+                attempt=max(old_step.attempt, attempt),
+            )
             new_plan = list(record.plan)
             new_plan[record.current_step_index] = new_step
             record = replace(record, plan=new_plan)

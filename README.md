@@ -2,6 +2,12 @@
 
 基于 ROS2 Humble 的 G1 人形机器人搬运控制系统。双界面架构：**主页**（九宫格选点 + 实时进度） + **调试控制台**（分步调试 + 自动执行），通过 ROS2 Service/Topic 与 Gateway（C++ 运动网关）、Navigation（路径规划）、FoundationPose（6DoF 位姿估计）对接，实现**行走、搬起箱子、携带行走、放下箱子**全流程闭环。
 
+> 自主化开发状态（2026-08-03）：仓库已加入 Phase 2–8 的离线实现切片。
+> 默认主页现为自然语言任务提交与监控台，旧九宫格/分步工具保留在
+> `?developer=1`。Gemini Robotics-ER 2 标准预览端点已配置，但真实云调用、
+> 真实语义适配器、仿真和 HIL 尚未批准或验证；现有真实 ROS 路径不会因这些
+> 离线代码自动切换。详见 `docs/autonomy/phase*/implementation.md`。
+
 ## 系统架构
 
 ```
@@ -125,15 +131,44 @@ TaskManger/
 ```
 flask>=3.0,<4.0
 flask-cors>=4.0,<5.0
+jsonschema>=4.23,<5.0
 ```
 
 `rclpy`、`std_msgs`、`sensor_msgs` 为 ROS2 Humble 自带。
+
+建议用仓库内的 `environment.yml` 创建隔离的开发环境：
+
+```bash
+conda env create -f environment.yml
+conda activate AgenticRobot
+python --version  # 必须为 3.10.x
+```
+
+`AgenticRobot` 包含后端与离线测试依赖；ROS Python 包仍由 Ubuntu 22.04
+上的 ROS2 Humble 提供。正式离线 Gate 需在目标 Ubuntu 主机上 source
+Humble 后执行 `TASKMANAGER_PYTHON="$CONDA_PREFIX/bin/python" ./scripts/check_offline.sh`。
 
 ### 前端依赖
 
 React 18 + Vite 5 + Ant Design 5
 
 ## 配置
+
+### Gemini Robotics-ER 2（自主运行时，显式启用）
+
+复制 `config/autonomy.env.example` 中的变量名到部署密钥管理器或进程环境：
+
+```bash
+export GEMINI_API_KEY='使用轮换后的新密钥'
+export GEMINI_ROBOTICS_MODEL='gemini-robotics-er-2-preview'
+export GEMINI_API_MODE='interactions'
+```
+
+普通 `gemini-flash-latest` 是通用 Gemini alias，不能当作 Robotics-ER 2
+身份；`gemini-robotics-er-2-streaming-preview` 属于 Live API 流式端点，
+不由当前非流式 Planner 适配器调用。API key 不得提交到 Git、普通日志或模型审计记录。创建
+`GeminiAutonomyRuntime` 本身不会发起网络/机器人调用；实际提交任务前仍需
+通过 replay、simulation 和相应 HIL gate。
 
 ### 1. 机器人配置 (`phi_robot/robots.json`)
 

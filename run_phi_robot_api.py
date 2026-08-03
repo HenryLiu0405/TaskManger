@@ -63,8 +63,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--path-plan-service",
-        default="/path_plan",
-        help="ROS2 路径规划服务名 (默认 /path_plan)",
+        default="/start_navigation",
+        help="ROS2 路径规划服务名 (默认 /start_navigation)",
     )
     parser.add_argument(
         "--lift-service",
@@ -122,7 +122,7 @@ if __name__ == "__main__":
         from phi_robot.adapters.move_to_passthrough import MoveToPassthroughAdapter
 
         adapter = MoveToPassthroughAdapter(move_to_url=args.move_to_url)
-        print(f"HTTP 验收模式: move_to → {args.move_to_url}  (pick/place/get_pose 跳过)")
+        print(f"HTTP 验收模式: move_to → {args.move_to_url}  (其他能力明确返回 unsupported)")
     elif args.acceptance == "ros":
         from phi_robot.adapters.ros_acceptance import RosAcceptanceAdapter
 

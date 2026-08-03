@@ -1,3 +1,4 @@
 string trajectory_json
 ---
 bool success
+string message

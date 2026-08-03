@@ -1,0 +1,21 @@
+[project]
+name = "phi-robot-task-manager"
+version = "0.1.0"
+description = "Deterministic robot task manager and skill dispatcher"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+  "flask>=3.0,<4.0",
+  "flask-cors>=4.0,<5.0",
+  "jsonschema>=4.23,<5.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/offline"]
+addopts = "-ra --strict-markers"
+markers = [
+  "offline: deterministic test that cannot access ROS, hardware, network, or subprocesses",
+]
+
+[tool.setuptools.packages.find]
+include = ["phi_robot*"]
+

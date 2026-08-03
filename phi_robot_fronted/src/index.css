@@ -32,6 +32,184 @@
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
+/* ====== Autonomous mission monitor ====== */
+.autonomy-console {
+  width: min(1180px, 96vw);
+  color: var(--debug-text, #c8c8c8);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.autonomy-console__header,
+.autonomy-command,
+.autonomy-card {
+  border: 1px solid rgba(212, 168, 83, 0.28);
+  background: rgba(11, 11, 16, 0.9);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
+}
+
+.autonomy-console__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 22px;
+  border-radius: 14px 14px 0 0;
+}
+
+.autonomy-console__header h1 {
+  margin: 4px 0 0;
+  color: #f2e7cf;
+  font-size: clamp(1.25rem, 3vw, 2rem);
+  letter-spacing: 0.04em;
+}
+
+.autonomy-console__eyebrow {
+  color: #d4a853;
+  font-size: 0.7rem;
+  letter-spacing: 0.18em;
+}
+
+.autonomy-status {
+  padding: 7px 11px;
+  border: 1px solid #555;
+  border-radius: 999px;
+  color: #aaa;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+}
+
+.autonomy-status--running,
+.autonomy-status--recovering { border-color: #d4a853; color: #e8c77f; }
+.autonomy-status--completed { border-color: #7fb87c; color: #9ed09a; }
+.autonomy-status--failed,
+.autonomy-status--intervention_required,
+.autonomy-status--reconciliation_required { border-color: #d44a4a; color: #ef7777; }
+
+.autonomy-command {
+  padding: 18px 22px;
+  border-top: 0;
+}
+
+.autonomy-command label,
+.autonomy-card h2 {
+  display: block;
+  margin: 0 0 10px;
+  color: #d4a853;
+  font-size: 0.78rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.autonomy-command__row { display: flex; gap: 10px; }
+.autonomy-command textarea {
+  flex: 1;
+  resize: vertical;
+  min-height: 62px;
+  padding: 12px;
+  border: 1px solid #34343d;
+  border-radius: 7px;
+  background: #09090d;
+  color: #f2e7cf;
+  font: inherit;
+  line-height: 1.5;
+}
+
+.autonomy-command button,
+.autonomy-actions button {
+  padding: 0 20px;
+  border: 1px solid #d4a853;
+  border-radius: 7px;
+  background: rgba(212, 168, 83, 0.12);
+  color: #e8c77f;
+  font: inherit;
+  cursor: pointer;
+}
+
+.autonomy-command button:disabled,
+.autonomy-actions button:disabled { opacity: 0.38; cursor: not-allowed; }
+.autonomy-command p,
+.operator-note { margin: 9px 0 0; color: #73737d; font-size: 0.7rem; }
+.autonomy-error { padding: 10px 14px; background: #3b1418; color: #ff9b9b; }
+
+.autonomy-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.autonomy-card { padding: 16px; border-radius: 8px; min-width: 0; }
+.autonomy-card--goal,
+.autonomy-card--world,
+.autonomy-card--metrics { grid-column: span 4; }
+.autonomy-card--plan,
+.autonomy-card--model,
+.autonomy-card--timeline { grid-column: span 8; }
+
+.autonomy-card dl { margin: 0; }
+.autonomy-card dl > div {
+  display: grid;
+  grid-template-columns: minmax(90px, 0.35fr) 1fr;
+  gap: 8px;
+  padding: 7px 0;
+  border-bottom: 1px solid #22232a;
+}
+.autonomy-card dt { color: #73737d; }
+.autonomy-card dd { margin: 0; color: #e4ded1; overflow-wrap: anywhere; }
+
+.autonomy-plan,
+.model-calls,
+.autonomy-timeline { display: grid; gap: 6px; max-height: 310px; overflow: auto; }
+.autonomy-plan__node,
+.model-calls > div,
+.autonomy-timeline > div {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid #25262d;
+  background: #0b0b10;
+}
+.autonomy-plan__node div { display: grid; }
+.autonomy-plan__node small,
+.model-calls small,
+.autonomy-timeline small { color: #696a73; }
+.autonomy-plan__node em { color: #898a94; font-size: 0.7rem; font-style: normal; }
+.node-state { width: 8px; height: 8px; border-radius: 50%; background: #555; }
+.node-state--succeeded { background: #7fb87c; box-shadow: 0 0 9px #7fb87c; }
+.node-state--dispatched { background: #d4a853; }
+.node-state--failed,
+.node-state--reconciliation_required { background: #d44a4a; }
+.node-state--superseded { background: #666; border-radius: 0; transform: rotate(45deg); }
+
+.world-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.world-facts > div { display: grid; padding: 8px; background: #0b0b10; }
+.world-facts span,
+.world-facts small { color: #656670; font-size: 0.65rem; }
+.world-facts strong { margin: 3px 0; color: #ddd5c5; }
+.autonomy-actions { display: flex; gap: 8px; margin-top: 12px; }
+.autonomy-actions button { min-height: 38px; padding: 0 12px; font-size: 0.72rem; }
+.autonomy-actions .danger { border-color: #d44a4a; background: #321216; color: #ff8a8a; }
+.autonomy-timeline time { color: #666; font-size: 0.68rem; }
+.autonomy-console__footer { padding: 14px 2px; text-align: right; }
+.autonomy-console__footer a { color: #777; font-size: 0.72rem; }
+
+@media (max-width: 860px) {
+  .autonomy-card--goal,
+  .autonomy-card--world,
+  .autonomy-card--metrics,
+  .autonomy-card--plan,
+  .autonomy-card--model,
+  .autonomy-card--timeline { grid-column: 1 / -1; }
+}
+
+@media (max-width: 640px) {
+  .autonomy-command__row { flex-direction: column; }
+  .autonomy-command button { min-height: 48px; }
+  .autonomy-console__header { align-items: flex-start; gap: 12px; }
+  .world-facts { grid-template-columns: 1fr; }
+}
+
 @layer base {
   body {
     margin: 0;

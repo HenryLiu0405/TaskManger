@@ -6,13 +6,17 @@ REST 接口实现，对标 think.md § 5.5.3 的接口契约
 from __future__ import annotations
 from typing import Optional, Dict, Any, List
 from datetime import datetime
+from pathlib import Path
 import uuid
 
 from .mission_service import MissionService
-from .mission_runner import MissionRunner, MissionExecutionHook
+from .mission_runner import MissionExecutionHook
 from .mission_event_hub import MissionEventHub
 from .models import MissionRecord, MissionEvent
 from .adapters.adapter_base import RobotAdapter
+from .skills import build_skill_dispatcher
+from .autonomy.legacy import LegacyMissionProjector
+from .autonomy.runtime import RobotRuntime
 
 
 class MissionApiService:
@@ -27,6 +31,9 @@ class MissionApiService:
         adapter: RobotAdapter,
         event_hub: Optional[MissionEventHub] = None,
         hook: Optional[MissionExecutionHook] = None,
+        skill_dispatcher: Any = None,
+        robot_runtime: Optional[RobotRuntime] = None,
+        supervisor_ledger_path: Optional[str] = None,
     ):
         """
         初始化 API 服务
@@ -41,7 +48,20 @@ class MissionApiService:
         self._adapter = adapter
         self._event_hub = event_hub or MissionEventHub(service.store)
         self._hook = hook
-        self._runners: Dict[str, MissionRunner] = {}
+        self._skill_dispatcher = skill_dispatcher or build_skill_dispatcher(adapter)
+        self._legacy_projector = LegacyMissionProjector(service)
+        if robot_runtime is None:
+            store_dir = Path(getattr(service.store, "_data_dir"))
+            robot_runtime = RobotRuntime(
+                robot_id="active",
+                adapter=adapter,
+                ledger_path=(
+                    supervisor_ledger_path or str(store_dir / "supervisor.sqlite3")
+                ),
+                dispatcher=self._skill_dispatcher,
+                observer=self._legacy_projector,
+            )
+        self._robot_runtime = robot_runtime
 
     # ========== POST /api/mission/submit ==========
     def submit_mission(
@@ -74,7 +94,6 @@ class MissionApiService:
                 scene_version=scene_version,
                 stock_layout_version=stock_layout_version,
                 destination_order=destination_order,
-                board_mapping=board_mapping,
                 options=options,
             )
             return {
@@ -118,7 +137,7 @@ class MissionApiService:
             }
 
         completed = sum(
-            1 for step in record.plan if step.status == "succeeded"
+            1 for step in record.plan if step.status == "completed"
         )
         total = len(record.plan)
 
@@ -165,18 +184,7 @@ class MissionApiService:
             }
 
         try:
-            self._service.run(mission_id)
-            
-            # 创建后台执行器（不阻塞）
-            runner = MissionRunner(
-                service=self._service,
-                adapter=self._adapter,
-                hook=self._hook,
-            )
-            self._runners[mission_id] = runner
-            
-            # 异步启动执行（不等待完成）
-            asyncio.create_task(runner.run(mission_id))
+            self._robot_runtime.start_legacy_mission(record, background=True)
             
             record = self._service.get_mission(mission_id)
             return {
@@ -204,7 +212,7 @@ class MissionApiService:
             }
         """
         try:
-            self._service.pause(mission_id)
+            self._robot_runtime.supervisor.pause(mission_id)
             return {
                 "mission_id": mission_id,
                 "status": "paused",
@@ -229,16 +237,7 @@ class MissionApiService:
             }
         """
         try:
-            self._service.resume(mission_id)
-            
-            # 重新启动执行器
-            runner = MissionRunner(
-                service=self._service,
-                adapter=self._adapter,
-                hook=self._hook,
-            )
-            self._runners[mission_id] = runner
-            asyncio.create_task(runner.run(mission_id))
+            self._robot_runtime.supervisor.start(mission_id, background=True)
             
             return {
                 "mission_id": mission_id,
@@ -265,6 +264,9 @@ class MissionApiService:
         """
         try:
             self._service.reset(mission_id)
+            self._robot_runtime.register_legacy_mission(
+                self._service.get_mission(mission_id)
+            )
             return {
                 "mission_id": mission_id,
                 "status": "ready",
@@ -299,7 +301,3 @@ class MissionApiService:
     def event_hub(self) -> MissionEventHub:
         """获取事件中心"""
         return self._event_hub
-
-
-# 为了支持异步，添加导入
-import asyncio

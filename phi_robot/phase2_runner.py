@@ -1,4 +1,4 @@
-"""Phase 2 acceptance runner.
+"""Legacy Phase 2 acceptance runner (not part of the current release gate).
 
 Validates the tool layer integration built on top of ``nanobot``'s Tool and
 ToolRegistry abstractions.

@@ -28,7 +28,11 @@ class MissionStore:
             data_dir or os.path.expanduser("~/.phi_robot/data")
         )
         self._data_dir.mkdir(parents=True, exist_ok=True)
-        self._write_lock = threading.Lock()
+        # Readers must not observe a new in-memory state before the matching
+        # durable snapshot has finished.  The re-entrant lock lets update()
+        # hold that visibility boundary while _persist() performs its atomic
+        # temporary-file rename.
+        self._write_lock = threading.RLock()
 
         # 启动时从磁盘恢复已有任务
         self._load_all()
@@ -97,6 +101,7 @@ class MissionStore:
                 scene_version=record.scene_version,
                 stock_layout_version=record.stock_layout_version,
                 status=record.status,
+                execution_epoch=record.execution_epoch,
                 plan=record.plan,
                 current_step_index=record.current_step_index,
                 current_task_index=record.current_task_index,
@@ -116,14 +121,16 @@ class MissionStore:
         return mission_id
 
     def get(self, mission_id: str) -> Optional[MissionRecord]:
-        return self._missions.get(mission_id)
+        with self._write_lock:
+            return self._missions.get(mission_id)
 
     def update(self, mission_id: str, record: MissionRecord) -> None:
-        if mission_id not in self._missions:
-            raise KeyError(f"mission_id {mission_id} 不存在")
-        record = replace(record, updated_at=datetime.now())
-        self._missions[mission_id] = record
-        self._persist(mission_id)
+        with self._write_lock:
+            if mission_id not in self._missions:
+                raise KeyError(f"mission_id {mission_id} 不存在")
+            record = replace(record, updated_at=datetime.now())
+            self._missions[mission_id] = record
+            self._persist(mission_id)
 
     def put_event(self, mission_id: str, event: MissionEvent) -> int:
         if mission_id not in self._missions:
@@ -143,21 +150,25 @@ class MissionStore:
     def get_events(
         self, mission_id: str, since_event_id: int = 0
     ) -> List[MissionEvent]:
-        if mission_id not in self._missions:
-            raise KeyError(f"mission_id {mission_id} 不存在")
-        return [e for e in self._events[mission_id] if e.event_id > since_event_id]
+        with self._write_lock:
+            if mission_id not in self._missions:
+                raise KeyError(f"mission_id {mission_id} 不存在")
+            return [e for e in self._events[mission_id] if e.event_id > since_event_id]
 
     def get_all_events(self, mission_id: str) -> List[MissionEvent]:
-        if mission_id not in self._missions:
-            raise KeyError(f"mission_id {mission_id} 不存在")
-        return list(self._events[mission_id])
+        with self._write_lock:
+            if mission_id not in self._missions:
+                raise KeyError(f"mission_id {mission_id} 不存在")
+            return list(self._events[mission_id])
 
     def get_all_missions(self) -> List[MissionRecord]:
-        return list(self._missions.values())
+        with self._write_lock:
+            return list(self._missions.values())
 
     def get_by_request_id(self, request_id: str) -> Optional[MissionRecord]:
-        mission_id = self._request_to_mission.get(request_id)
-        return self._missions.get(mission_id) if mission_id else None
+        with self._write_lock:
+            mission_id = self._request_to_mission.get(request_id)
+            return self._missions.get(mission_id) if mission_id else None
 
     def clear(self) -> None:
         """清空所有数据（用于测试）"""

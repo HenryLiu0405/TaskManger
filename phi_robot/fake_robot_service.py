@@ -383,62 +383,23 @@ class FakeRobotService:
 
 
 def contract_for(tool: str) -> dict[str, Any]:
-    """Return the tool contract for a given fake robot action."""
-    contracts = {
-        "move_to": {
-            "type": "object",
-            "properties": {
-                "target": {
-                    "type": "object",
-                    "properties": {
-                        "x": {"type": "number"},
-                        "y": {"type": "number"},
-                        "z": {"type": "number"},
-                        "theta": {"type": "number"},
-                    },
-                    "required": ["x", "y", "z"],
-                },
-                "current": {
-                    "type": "object",
-                    "properties": {
-                        "x": {"type": "number"},
-                        "y": {"type": "number"},
-                        "z": {"type": "number"},
-                        "theta": {"type": "number"},
-                    },
-                    "required": ["x", "y", "z"],
-                },
-                "action": {"type": "string", "enum": ["start"]},
-                "timeout_s": {"type": "number", "minimum": 0.001},
-            },
-            "required": ["target", "current", "action", "timeout_s"],
-        },
-        "pick": {
-            "type": "object",
-            "properties": {
-                "object_id": {"type": "string"},
-                "grip_force": {"type": "number"},
-                "timeout_s": {"type": "number", "minimum": 0.001},
-            },
-            "required": ["object_id", "timeout_s"],
-        },
-        "place": {
-            "type": "object",
-            "properties": {
-                "x": {"type": "number"},
-                "y": {"type": "number"},
-                "z": {"type": "number"},
-                "object_id": {"type": "string"},
-                "timeout_s": {"type": "number", "minimum": 0.001},
-            },
-            "required": ["x", "y", "z", "timeout_s"],
-        },
-        "get_pose": {"type": "object", "properties": {}, "required": []},
-        "get_gripper_state": {"type": "object", "properties": {}, "required": []},
-    }
-    if tool not in contracts:
+    """Return the canonical skill contract; the fake owns no second schema."""
+
+    from copy import deepcopy
+    from .skills.catalog import skill_definitions
+
+    definition = next(
+        (
+            item for item in skill_definitions()
+            if item.name == tool and item.version == "1.0"
+        ),
+        None,
+    )
+    if definition is None or tool not in {
+        "move_to", "pick", "place", "get_pose", "get_gripper_state",
+    }:
         raise KeyError(tool)
-    return contracts[tool]
+    return deepcopy(dict(definition.input_schema))
 
 
 DEFAULT_FAKE_SPEC: dict[str, Any] = {

@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 from .adapters.adapter_base import RobotAdapter
 from .audit import audit_logger
 from .robot_state import safety_fsm
+from .skills import build_skill_dispatcher
 
 logger = logging.getLogger("phi_robot.dev_console")
 
@@ -65,9 +66,10 @@ class DevConsoleController:
     MAX_LOG_ENTRIES = 500
     MAX_HISTORY = 20
 
-    def __init__(self, adapter: RobotAdapter, mission_service=None):
+    def __init__(self, adapter: RobotAdapter, mission_service=None, skill_dispatcher=None):
         self._adapter = adapter
         self._mission_service = mission_service
+        self._skill_dispatcher = skill_dispatcher or build_skill_dispatcher(adapter)
 
         # 模式
         self._mode: str = "manual"
@@ -352,23 +354,50 @@ class DevConsoleController:
             self._pause_flag.clear()
             self._defer_pause = False
             self._manual_state = self._resume_state
+            control_result = None
             if self._resume_state == MOVING:
-                self._adapter.resume_navigation()
+                control_result = self._skill_dispatcher.execute_legacy(
+                    "resume_navigation", {},
+                    request_id=f"dev-manual-resume-{uuid.uuid4().hex[:8]}",
+                    goal_id="dev-manual",
+                    step_id="resume-navigation",
+                    source="dev_console_manual",
+                )
             self._add_log("info", "resume", f"继续执行 → {self._manual_state}")
-            return {"ok": True, "message": "已继续", "paused": False}
+            return {
+                "ok": True,
+                "message": "已解除本地暂停门；导航恢复以后端回执为准",
+                "paused": False,
+                "physical_resume_confirmed": False,
+                "control_result": control_result,
+            }
 
         self._resume_state = self._manual_state
 
+        control_result = None
         if self._manual_state == MOVING:
-            self._adapter.pause_navigation()
+            control_result = self._skill_dispatcher.execute_legacy(
+                "pause_navigation", {},
+                request_id=f"dev-manual-pause-{uuid.uuid4().hex[:8]}",
+                goal_id="dev-manual",
+                step_id="pause-navigation",
+                source="dev_console_manual",
+            )
         elif self._manual_state in (PICKING, PLACING):
             self._defer_pause = True
             self._add_log("info", "pause", "动作完成时将暂停")
 
         self._pause_flag.set()
         self._manual_state = PAUSED
-        self._add_log("info", "pause", "已暂停")
-        return {"ok": True, "message": "已暂停", "paused": True}
+        self._add_log("info", "pause", "已设置本地暂停门，物理停止未确认")
+        return {
+            "ok": True,
+            "message": "已请求暂停；当前物理动作未确认停止",
+            "paused": True,
+            "pause_requested": True,
+            "physical_stop_confirmed": False,
+            "control_result": control_result,
+        }
 
     def manual_stop(self) -> dict:
         """终止 — 等当前动作完成后进入 stopped 状态（不可恢复）"""
@@ -382,9 +411,14 @@ class DevConsoleController:
         self._action_history.clear()
         self._holding_box = False
         self._target_position = None
-        self._add_log("warn", "stop", "已终止，所有状态已重置（不可恢复）")
-        audit_logger.log_system("manual_stop: 已终止，所有状态已重置")
-        return {"ok": True, "message": "已终止", "stopped": True}
+        self._add_log("warn", "stop", "已停止本地后继编排；在途物理动作未确认停止")
+        audit_logger.log_system("manual_stop: 本地后继编排已停止，物理停止未确认")
+        return {
+            "ok": True,
+            "message": "已停止后继编排；在途动作未确认停止",
+            "stopped": True,
+            "physical_stop_confirmed": False,
+        }
 
     # ── 自动模式 ──────────────────────────────────────────
 
@@ -434,18 +468,17 @@ class DevConsoleController:
             self._auto_cancel_event = threading.Event()
 
             from .mission_runner import MissionRunner
-            from .api_server import APIHook
 
-            hook = APIHook(mission_id)
             self._auto_runner = MissionRunner(
                 self._mission_service,
                 self._adapter,
-                hook=hook,
                 cancel_event=self._auto_cancel_event,
                 step_callback=self._make_step_logger(mission_id),
+                skill_dispatcher=self._skill_dispatcher,
             )
 
             def run_auto():
+                loop = None
                 try:
                     import asyncio
                     loop = asyncio.new_event_loop()
@@ -458,6 +491,9 @@ class DevConsoleController:
                     )
                 except Exception as e:
                     self._add_log("error", "auto", f"自动任务异常: {e}")
+                finally:
+                    if loop is not None:
+                        loop.close()
 
             self._auto_thread = threading.Thread(target=run_auto, daemon=True)
             self._auto_thread.start()
@@ -471,7 +507,14 @@ class DevConsoleController:
         if self._auto_mission_id and self._mission_service:
             try:
                 self._mission_service.pause(self._auto_mission_id)
-                self._adapter.pause_navigation()
+                self._skill_dispatcher.execute_legacy(
+                    "pause_navigation", {},
+                    request_id=f"dev-auto-pause-{self._auto_mission_id}",
+                    goal_id="dev-auto",
+                    step_id="pause-navigation",
+                    mission_id=self._auto_mission_id,
+                    source="dev_console_auto",
+                )
                 if self._auto_cancel_event:
                     self._auto_cancel_event.set()
                 self._add_log("info", "auto", "自动任务已请求暂停")
@@ -493,26 +536,34 @@ class DevConsoleController:
                 return {"ok": False, "message": f"任务状态为 {record.status}，非 paused"}
 
             self._mission_service.resume(self._auto_mission_id)
-            self._adapter.resume_navigation()
+            self._skill_dispatcher.execute_legacy(
+                "resume_navigation", {},
+                request_id=f"dev-auto-resume-{self._auto_mission_id}",
+                goal_id="dev-auto",
+                step_id="resume-navigation",
+                mission_id=self._auto_mission_id,
+                source="dev_console_auto",
+            )
             self._auto_cancel_event = threading.Event()
 
             from .mission_runner import MissionRunner
-            from .api_server import APIHook
 
-            hook = APIHook(self._auto_mission_id)
             self._auto_runner = MissionRunner(
                 self._mission_service,
                 self._adapter,
-                hook=hook,
                 cancel_event=self._auto_cancel_event,
                 step_callback=self._make_step_logger(self._auto_mission_id),
+                skill_dispatcher=self._skill_dispatcher,
             )
 
             def run_auto():
                 import asyncio
                 loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(self._auto_runner.run(self._auto_mission_id))
+                try:
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(self._auto_runner.run(self._auto_mission_id))
+                finally:
+                    loop.close()
 
             self._auto_thread = threading.Thread(target=run_auto, daemon=True)
             self._auto_thread.start()
@@ -533,8 +584,12 @@ class DevConsoleController:
         self._auto_runner = None
         self._auto_mission_id = None
         self._auto_cancel_event = None
-        self._add_log("warn", "auto", "自动任务已终止（不可恢复）")
-        return {"ok": True, "message": "自动任务已终止"}
+        self._add_log("warn", "auto", "自动任务后继编排已终止，在途动作未确认停止")
+        return {
+            "ok": True,
+            "message": "自动任务后继编排已终止；在途动作未确认停止",
+            "physical_stop_confirmed": False,
+        }
 
     # ── 状态查询 ──────────────────────────────────────────
 
@@ -587,11 +642,19 @@ class DevConsoleController:
         }
 
     def _get_robot_state(self) -> dict:
-        """通过适配器获取机器人实时状态"""
+        """通过统一只读 skill 获取机器人实时状态。"""
         try:
-            state_func = getattr(self._adapter, "get_robot_state", None)
-            if callable(state_func):
-                return state_func()
+            result = self._skill_dispatcher.execute_legacy(
+                "get_robot_state", {},
+                request_id=f"dev-state-{uuid.uuid4().hex[:12]}",
+                goal_id="dev-console",
+                step_id="get-robot-state",
+                source="dev_console_query",
+            )
+            if result.get("status") == "ok":
+                state = result.get("robot_state") or result.get("state")
+                if isinstance(state, dict):
+                    return state
         except Exception:
             pass
         return {
@@ -689,15 +752,40 @@ class DevConsoleController:
             # 检查暂停标志（阻塞式等待继续）
             if self._pause_flag.is_set():
                 self._add_log("info", "wait", "等待继续...")
-                self._pause_flag.wait()
+                while self._pause_flag.is_set() and not self._stop_flag.is_set():
+                    time.sleep(0.05)
 
             t0 = time.time()
-            result = self._adapter.execute(
+            action_args = dict(action.args)
+            if action.tool == "pick":
+                action_args.setdefault("object_id", "manual-object")
+                action_args.setdefault("timeout_s", 30.0)
+            elif action.tool == "place":
+                action_args.setdefault("target", {
+                    "x": float(self._current_position.get("x", 0.0)),
+                    "y": float(self._current_position.get("y", 0.0)),
+                    "z": float(self._current_position.get("z", 0.0)),
+                    "theta": float(self._current_position.get("theta", 0.0)),
+                })
+                action_args.setdefault("timeout_s", 30.0)
+            action_annotations = {}
+            if action.tool == "pick":
+                # Manual coordinates are explicit operator input. Keep them
+                # outside action args while allowing composite FP selection to
+                # validate the material point used for this invocation.
+                action_annotations = {
+                    "slot_nav2_x": float(self._current_position.get("x", 0.0)),
+                    "slot_nav2_y": float(self._current_position.get("y", 0.0)),
+                }
+            result = self._skill_dispatcher.execute_legacy(
                 action.tool,
-                action.args,
+                action_args,
                 request_id=request_id,
                 goal_id=goal_id,
                 step_id=step_id,
+                source="dev_console_manual",
+                annotations=action_annotations,
+                idempotency_key=f"dev-console:{request_id}:{step_id}",
             )
             elapsed_ms = (time.time() - t0) * 1000
 
@@ -711,7 +799,8 @@ class DevConsoleController:
 
                 if self._pause_flag.is_set():
                     self._add_log("info", action.tool, "暂停中，等待继续...")
-                    self._pause_flag.wait()
+                    while self._pause_flag.is_set() and not self._stop_flag.is_set():
+                        time.sleep(0.05)
                     if self._stop_flag.is_set():
                         audit_logger.log_action_end(tool=action.tool, request_id=request_id,
                                                     goal_id=goal_id, step_id=step_id,
@@ -745,6 +834,24 @@ class DevConsoleController:
                 else:
                     self._defer_pause = False
                     error_code = result.get("error_code", "UNKNOWN")
+
+                    if result.get("outcome") == "unknown":
+                        self._manual_state = STOPPED
+                        self._add_log(
+                            "error",
+                            action.tool,
+                            "结果未知，已阻止后继动作；请先人工核对机器人状态",
+                        )
+                        audit_logger.log_action_end(
+                            tool=action.tool,
+                            request_id=request_id,
+                            goal_id=goal_id,
+                            step_id=step_id,
+                            status="unknown",
+                            error_code=error_code,
+                            elapsed_ms=elapsed_ms,
+                        )
+                        return
 
                     # place 失败时检查 _box_released: Gateway 内部可能已完成放置
                     if action.tool == "place":

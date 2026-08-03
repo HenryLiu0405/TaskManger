@@ -8,14 +8,16 @@ This module mirrors the `nanobot` tool pattern:
 
 from __future__ import annotations
 
-import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from phi_robot.nanobot_compat import Tool, ToolRegistry, tool_parameters
 
-from phi_robot.fake_robot_service import DEFAULT_FAKE_SPEC, FakeRobotService, contract_for
+from phi_robot.fake_robot_service import DEFAULT_FAKE_SPEC, FakeRobotService
+from phi_robot.skills import build_skill_dispatcher
+from phi_robot.skills.catalog import skill_definitions
+from phi_robot.skills.models import SkillDefinition
 
 
 def _default_backend():
@@ -28,20 +30,33 @@ def _default_backend():
         return FakeRobotService.from_spec(DEFAULT_FAKE_SPEC)
 
 
-_METADATA_KEYS = frozenset({"request_id", "goal_id", "step_id"})
-_RETRYABLE_ERROR_CODES = frozenset({"GRIP_FAIL", "TIMEOUT", "INTERNAL_ERROR"})
+_METADATA_KEYS = frozenset({
+    "request_id", "mission_id", "goal_id", "step_id", "robot_id", "idempotency_key",
+})
+
+
+def _definition_for(tool_name: str) -> SkillDefinition:
+    definition = next(
+        (item for item in skill_definitions() if item.name == tool_name and item.version == "1.0"),
+        None,
+    )
+    if definition is None:
+        raise KeyError(tool_name)
+    return definition
 
 
 def robot_request_schema(tool_name: str) -> dict[str, Any]:
-    """Build the Phase 2 tool schema with the contract metadata fields included."""
+    """Generate the tool request schema from the production skill definition."""
 
-    schema = contract_for(tool_name)
+    definition = _definition_for(tool_name)
+    schema = dict(definition.input_schema)
     properties = dict(schema.get("properties", {}))
     properties.update(
         {
             "request_id": {"type": "string"},
             "goal_id": {"type": "string"},
             "step_id": {"type": "string"},
+            "mission_id": {"type": "string"},
         }
     )
     required = ["request_id", "goal_id", "step_id", *schema.get("required", [])]
@@ -49,6 +64,7 @@ def robot_request_schema(tool_name: str) -> dict[str, Any]:
         "type": "object",
         "properties": properties,
         "required": required,
+        "additionalProperties": False,
     }
 
 
@@ -82,112 +98,69 @@ class RobotToolCallRecord:
 
 @dataclass
 class RobotToolClient:
-    """Structured tool executor with timeout and retry handling."""
+    """Agent-facing adapter generated from the production skill catalog.
+
+    ``max_retries`` remains as a compatibility field but is intentionally not
+    applied.  Physical retries must be an explicit mission-level decision.
+    """
 
     backend: RobotBackend = field(default_factory=_default_backend)
-    max_retries: int = 1
-    retryable_error_codes: frozenset[str] = _RETRYABLE_ERROR_CODES
+    max_retries: int = 0
     call_log: list[RobotToolCallRecord] = field(default_factory=list)
+    _dispatcher: Any = field(default=None, init=False, repr=False)
+    _dispatcher_backend_id: int = field(default=0, init=False, repr=False)
+
+    def dispatcher(self):
+        """Return the backend-bound dispatcher used by every generated tool."""
+
+        if self._dispatcher is None or self._dispatcher_backend_id != id(self.backend):
+            self._dispatcher = build_skill_dispatcher(
+                self.backend, audit_enabled=False
+            )
+            self._dispatcher_backend_id = id(self.backend)
+        return self._dispatcher
 
     async def execute(self, tool: str, params: dict[str, Any]) -> dict[str, Any]:
         request_id = str(params.get("request_id", "req-local"))
+        mission_id = str(params.get("mission_id", ""))
         goal_id = str(params.get("goal_id", "goal-local"))
         step_id = str(params.get("step_id", "step-local"))
+        robot_id = str(params.get("robot_id", "active"))
+        idempotency_key = str(params.get("idempotency_key", ""))
         args = {key: value for key, value in params.items() if key not in _METADATA_KEYS}
+        dispatcher = self.dispatcher()
 
-        attempts = 0
-        last_response: dict[str, Any] | None = None
-        timeout_s = self._timeout_seconds(args)
-
-        while attempts <= self.max_retries:
-            attempts += 1
-            start = time.perf_counter()
-            response = await self._call_backend(
+        start = time.perf_counter()
+        loop = __import__("asyncio").get_running_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: dispatcher.execute_legacy(
                 tool,
                 args,
                 request_id=request_id,
+                mission_id=mission_id,
                 goal_id=goal_id,
                 step_id=step_id,
-                timeout_s=timeout_s,
+                robot_id=robot_id,
+                source="robot_tool_suite",
+                idempotency_key=idempotency_key,
+            ),
+        )
+        self.call_log.append(
+            RobotToolCallRecord(
+                request_id=request_id,
+                goal_id=goal_id,
+                step_id=step_id,
+                tool=tool,
+                args=dict(args),
+                status=response["status"],
+                error_code=response.get("error_code"),
+                message=str(response.get("message", "")),
+                latency_ms=(time.perf_counter() - start) * 1000.0,
+                attempt=1,
             )
-            latency_ms = (time.perf_counter() - start) * 1000.0
-            self.call_log.append(
-                RobotToolCallRecord(
-                    request_id=request_id,
-                    goal_id=goal_id,
-                    step_id=step_id,
-                    tool=tool,
-                    args=dict(args),
-                    status=response["status"],
-                    error_code=response.get("error_code"),
-                    message=str(response.get("message", "")),
-                    latency_ms=latency_ms,
-                    attempt=attempts,
-                )
-            )
-
-            if response["status"] == "ok":
-                return response
-
-            last_response = response
-            if response.get("error_code") not in self.retryable_error_codes:
-                return response
-            if attempts > self.max_retries:
-                return response
-
-        assert last_response is not None
-        return last_response
-
-    async def _call_backend(
-        self,
-        tool: str,
-        args: dict[str, Any],
-        *,
-        request_id: str,
-        goal_id: str,
-        step_id: str,
-        timeout_s: float,
-    ) -> dict[str, Any]:
-        try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.backend.execute,
-                    tool,
-                    args,
-                    request_id=request_id,
-                    goal_id=goal_id,
-                    step_id=step_id,
-                ),
-                timeout=timeout_s,
-            )
-        except TimeoutError:
-            snapshot = getattr(self.backend, "snapshot", None)
-            return {
-                "request_id": request_id,
-                "status": "error",
-                "error_code": "TIMEOUT",
-                "message": f"tool execution exceeded timeout_s={timeout_s}",
-                "state": snapshot() if callable(snapshot) else {},
-                "metrics": {"latency_ms": timeout_s * 1000.0},
-            }
-        except Exception as exc:  # pragma: no cover - defensive fallback
-            snapshot = getattr(self.backend, "snapshot", None)
-            return {
-                "request_id": request_id,
-                "status": "error",
-                "error_code": "INTERNAL_ERROR",
-                "message": str(exc),
-                "state": snapshot() if callable(snapshot) else {},
-                "metrics": {},
-            }
-
-    @staticmethod
-    def _timeout_seconds(args: dict[str, Any]) -> float:
-        timeout = args.get("timeout_s", 30)
-        try:
-            return max(float(timeout), 0.001)
-        except (TypeError, ValueError):
-            return 30.0
+        )
+        return response
 
 
 class _RobotTool(Tool):
@@ -202,6 +175,37 @@ class _RobotTool(Tool):
 
     async def execute(self, **kwargs: Any) -> Any:
         return await self.client.execute(self.tool_name, dict(kwargs))
+
+
+class CatalogRobotTool(Tool):
+    """Nanobot-compatible tool projected from one SkillRegistry entry."""
+
+    def __init__(self, client: RobotToolClient, definition: SkillDefinition):
+        self.client = client
+        self.definition = definition
+
+    @property
+    def name(self) -> str:
+        return self.definition.name
+
+    @property
+    def description(self) -> str:
+        return self.definition.description
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return robot_request_schema(self.definition.name)
+
+    @property
+    def read_only(self) -> bool:
+        return not self.definition.side_effecting
+
+    @property
+    def concurrency_safe(self) -> bool:
+        return self.definition.concurrency_safe
+
+    async def execute(self, **kwargs: Any) -> Any:
+        return await self.client.execute(self.definition.name, dict(kwargs))
 
 
 @tool_parameters(robot_request_schema("move_to"))
@@ -265,9 +269,13 @@ class RobotToolSuite:
 
     def build_registry(self) -> ToolRegistry:
         registry = ToolRegistry()
-        registry.register(MoveToTool(self.client))
-        registry.register(PickTool(self.client))
-        registry.register(PlaceTool(self.client))
-        registry.register(GetPoseTool(self.client))
-        registry.register(GetGripperStateTool(self.client))
+        skill_registry = self.client.dispatcher().registry
+        exposed = {"move_to", "pick", "place", "get_pose", "get_gripper_state"}
+        if self.client.backend.__class__.__name__ == "RosAcceptanceAdapter":
+            # Queries remain catalogued but are not advertised until a real
+            # ROS state source can satisfy their contract.
+            exposed -= {"get_pose", "get_gripper_state"}
+        for definition in skill_registry.definitions():
+            if definition.name in exposed:
+                registry.register(CatalogRobotTool(self.client, definition))
         return registry

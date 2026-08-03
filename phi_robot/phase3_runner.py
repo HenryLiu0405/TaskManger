@@ -1,4 +1,6 @@
-"""Phase 3 acceptance runner for monitoring, replanning, and heartbeat.
+"""Legacy Phase 3 runner for monitoring, replanning, and heartbeat.
+
+This module is not part of the current Phase 0/1 release gate.
 
 The runner executes deterministic scenarios against the fake robot backend and
 uses the Phase 3 monitor hook to consume safety alerts, new instructions, and

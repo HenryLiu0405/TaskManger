@@ -5,7 +5,7 @@ Bridges the RobotAdapter protocol to ROS2 services provided by colleagues:
   - move_to  → /start_navigation (trajectory_json → success)
   - pick     → /submit_carry_task (single-object pose → gateway state machine)
   - place    → /notify_goal_reached → /set_lay_down → /set_stand
-  - get_pose → returns minimal ok (no pose feedback needed)
+  - get_pose/get_gripper_state → unsupported until a reliable source is wired
 """
 
 from __future__ import annotations
@@ -30,6 +30,11 @@ from std_srvs.srv import SetBool, Trigger
 
 from ..robot_state import safety_fsm, RobotState
 from ..audit import audit_logger
+from ..foundation_pose_contract import (
+    FoundationPoseObservation,
+    FoundationPoseSelectionEpoch,
+    reject_foundation_pose_observation,
+)
 from ..recovery_diag import (
     DiagEvent,
     EVT_STEP_START,
@@ -93,6 +98,13 @@ class RosAcceptanceAdapter:
         self._timeout_s = timeout_s
         self._path_plan_service = path_plan_service
         self._camera_host = camera_host
+        self._carry_target_frame = os.getenv("WAIC_CARRY_TARGET_FRAME", "pelvis").strip() or "pelvis"
+        try:
+            stale_after_s = float(os.getenv("WAIC_FP_POSE_STALE_AFTER_S", "1.5"))
+        except ValueError:
+            logger.warning("invalid WAIC_FP_POSE_STALE_AFTER_S; using 1.5 seconds")
+            stale_after_s = 1.5
+        self._fp_pose_stale_after_s = max(stale_after_s, 0.1)
 
         if not rclpy.ok():
             rclpy.init()
@@ -268,8 +280,6 @@ class RosAcceptanceAdapter:
         self._expected_slot_xy: tuple[float, float] | None = None
         # FP 选出的最优物体 ID（由 SelectTarget 服务 或 run_arrival_check 设置）
         self._fp_target_object_id: int | None = None
-        # 掉箱恢复路径 B：跳过 nav goal 重发，直接等 nav_reached
-        self.skip_nav_resend: bool = False
         # SelectTarget(select=true) 是否已激活单目标模式（需在搬起后/重规划前清理）
         self._select_target_active: bool = False
 
@@ -278,12 +288,40 @@ class RosAcceptanceAdapter:
         # 多物体模式：遍历数组取第一个 TRACKING 物体
         # 单物体模式（SelectTarget 激活）：数组仅含锁定物体
         self._latest_pose_result = None  # PoseEstimate | None
+        self._latest_pose_received_monotonic: float = 0.0
+        self._target_selection_started_monotonic: float = 0.0
+        self._target_selection_started_ros_ns: int = 0
+        self._target_selection_pending: bool = False
         if _HAS_POSE_ESTIMATE:
             def _on_pose_results(msg: PoseEstimateArray):
-                for obj in msg.objects:
-                    if obj.state >= 1:  # IDLE(1) 或 TRACKING(2) 都接受
-                        self._latest_pose_result = obj
-                        break
+                if self._target_selection_pending:
+                    return
+                candidates = [obj for obj in msg.objects if obj.state >= 1]
+                now_monotonic = time.monotonic()
+                now_ros_ns = self._node.get_clock().now().nanoseconds
+                epoch = self._foundation_pose_epoch()
+                for obj in candidates:
+                    stamp = getattr(getattr(obj, "header", None), "stamp", None)
+                    stamp_ns = (
+                        int(getattr(stamp, "sec", 0)) * 1_000_000_000
+                        + int(getattr(stamp, "nanosec", 0))
+                    )
+                    observation = FoundationPoseObservation(
+                        object_id=getattr(obj, "object_id", None),
+                        frame_id=str(getattr(getattr(obj, "header", None), "frame_id", "") or ""),
+                        stamp_ns=stamp_ns,
+                        received_monotonic=now_monotonic,
+                    )
+                    if reject_foundation_pose_observation(
+                        observation,
+                        epoch,
+                        now_ros_ns=now_ros_ns,
+                        now_monotonic=now_monotonic,
+                    ) is not None:
+                        continue
+                    self._latest_pose_result = obj
+                    self._latest_pose_received_monotonic = now_monotonic
+                    break
             self._node.create_subscription(
                 PoseEstimateArray, '/foundationpose/pose_results', _on_pose_results, 10)
 
@@ -294,9 +332,15 @@ class RosAcceptanceAdapter:
         self._current_step_id: str = ""
         self._diag_callback: Callable[[DiagEvent], None] | None = None
 
-        logger.info("ROS2 node ready — path_plan=%s, lift=%s, lay_down=%s, stand=%s, replay=%s, notify_goal=%s",
-                    "phi_robot_acceptance", path_plan_service, lift_service, lay_down_service, stand_service,
-                    request_replay_service, notify_goal_reached_service)
+        logger.info(
+            "ROS2 node ready — path_plan=%s, lift=%s, lay_down=%s, stand=%s, replay=%s, notify_goal=%s",
+            path_plan_service,
+            lift_service,
+            lay_down_service,
+            stand_service,
+            request_replay_service,
+            notify_goal_reached_service,
+        )
 
     # ── 诊断回调（分步调试用） ──────────────────────────────
 
@@ -331,8 +375,39 @@ class RosAcceptanceAdapter:
             resp = future.result()
             source = "GAMEPAD" if gamepad else "ROS2"
             logger.warning("SONIC 输入源切换 → %s (success=%s)", source, resp.success)
-            return {"ok": resp.success, "message": resp.message,
-                    "active_source": source}
+            if not resp.success:
+                return {
+                    "ok": False,
+                    "error_code": "INPUT_SOURCE_REJECTED",
+                    "message": resp.message,
+                    "active_source": self._sonic_input_source,
+                }
+
+            confirm_deadline = time.monotonic() + 2.0
+            while (
+                self._sonic_input_source != source
+                and time.monotonic() < confirm_deadline
+            ):
+                time.sleep(0.05)
+            confirmed = self._sonic_input_source == source
+            return {
+                "ok": confirmed,
+                "error_code": None if confirmed else "VERIFICATION_FAILED",
+                "message": (
+                    resp.message
+                    if confirmed
+                    else f"input source service accepted but state did not confirm {source}"
+                ),
+                "active_source": self._sonic_input_source,
+                "verification": {
+                    "status": "passed" if confirmed else "failed",
+                    "evidence": {
+                        "requested_source": source,
+                        "active_source": self._sonic_input_source,
+                    },
+                    "message": "input source state topic confirmation",
+                },
+            }
         except Exception as e:
             logger.exception("set_input_source 调用失败: %s", e)
             return {"ok": False, "message": str(e),
@@ -433,17 +508,13 @@ class RosAcceptanceAdapter:
                 safety_fsm.to_error()
             return _finish(result)
 
-        # get_pose / get_gripper_state — not needed for acceptance test
-        return _finish({
-            "status": "ok",
-            "error_code": None,
-            "message": "acceptance: skipped",
-            "state": self._minimal_state(),
-            "metrics": {},
-            "request_id": request_id,
-            "goal_id": goal_id,
-            "step_id": step_id,
-        })
+        return _finish(self._error_result(
+            "UNSUPPORTED_CAPABILITY",
+            f"ROS acceptance adapter does not implement a reliable {tool} capability",
+            request_id,
+            goal_id,
+            step_id,
+        ))
 
     def snapshot(self) -> dict[str, Any]:
         return self._minimal_state()
@@ -451,6 +522,11 @@ class RosAcceptanceAdapter:
     def reset(self) -> None:
         self._fp_target_object_id = None
         self._select_target_active = False
+        self._latest_pose_result = None
+        self._latest_pose_received_monotonic = 0.0
+        self._target_selection_started_monotonic = 0.0
+        self._target_selection_started_ros_ns = 0
+        self._target_selection_pending = False
         self._expected_slot_xy = None
         self._box_drop_detected = False
         self._drop_odom_x = 0.0
@@ -921,52 +997,6 @@ class RosAcceptanceAdapter:
     def _call_path_plan(self, args, request_id, goal_id, step_id):
         t0 = time.time()
 
-        # ── 掉箱恢复路径 B：跳过 goal 重发，直接等 nav_reached ──
-        if self.skip_nav_resend:
-            self.skip_nav_resend = False  # 一次性标记，用完即清
-            logger.info(
-                "_call_path_plan: skip_nav_resend=True，"
-                "跳过 goal 发送，直接等待 nav_reached"
-            )
-            nav_timeout = 600.0
-            arrived = self._wait_nav_reached(timeout=nav_timeout)
-            if not arrived:
-                return self._error_result(
-                    "NAV_TIMEOUT",
-                    f"nav_reached not received within {nav_timeout:.0f}s "
-                    f"(skip_nav_resend mode)",
-                    request_id, goal_id, step_id,
-                )
-            # 通知 gateway 到达
-            self._notify_arrival()
-            ready = self._wait_until_ready("move_to")
-            if not ready:
-                return self._error_result(
-                    "PATH_PLAN_NOT_READY",
-                    "robot did not reach ready state after "
-                    "move_to (skip_nav_resend)",
-                    request_id, goal_id, step_id,
-                )
-            target = args.get("target", {})
-            tx = float(target.get("x", 0.0))
-            ty = float(target.get("y", 0.0))
-            theta = float(target.get("theta", math.pi / 2))
-            logger.info(
-                "_call_path_plan: nav_reached (skip_nav_resend), "
-                "elapsed=%.1fs",
-                time.time() - t0,
-            )
-            return {
-                "status": "ok",
-                "error_code": None,
-                "message": "arrived (skip_nav_resend)",
-                "pose": {"x": tx, "y": ty, "z": 0.0, "theta": theta},
-                "metrics": {},
-                "request_id": request_id,
-                "goal_id": goal_id,
-                "step_id": step_id,
-            }
-
         target = args.get("target", {})
         tx = float(target.get("x", 0.0))
         ty = float(target.get("y", 0.0))
@@ -1015,7 +1045,9 @@ class RosAcceptanceAdapter:
 
         # 通知 gateway 到达 — 搬箱走路(carry_walking)需要此调用切到 goal_reached_locked
         # 正常走路(normal_planner)时 gateway 会忽略，无副作用
-        self._notify_arrival()
+        notify = self._call_notify_goal_reached(request_id, goal_id, step_id)
+        if notify["status"] != "ok":
+            return notify
 
         ready = self._wait_until_ready("move_to")
         if not ready:
@@ -1028,6 +1060,11 @@ class RosAcceptanceAdapter:
             "error_code": None,
             "message": "arrived",
             "pose": {"x": tx, "y": ty, "z": 0.0, "theta": theta},
+            "verification": {
+                "status": "passed",
+                "evidence": {"nav_reached": True, "gateway_ready": True},
+                "message": "fresh nav_reached and gateway ready observed",
+            },
             "metrics": {},
             "request_id": request_id,
             "goal_id": goal_id,
@@ -1094,8 +1131,11 @@ class RosAcceptanceAdapter:
     def _cleanup_select_target(self, step_id: str) -> None:
         """若 SelectTarget 单目标模式已激活，退出并恢复多物体模式。"""
         if self._select_target_active:
-            self._call_select_target(select=False, step_id=step_id)
-            self._select_target_active = False
+            result = self._call_select_target(select=False, step_id=step_id)
+            if result and result.get("success"):
+                self._select_target_active = False
+            else:
+                logger.error("SelectTarget cleanup was not confirmed; mode remains active")
 
     # 🆕 SelectTarget service wrapper (v3)
     def _call_select_target(self, select: bool, pick_x: float = 0.0,
@@ -1151,8 +1191,11 @@ class RosAcceptanceAdapter:
             ))
             if select and resp.success:
                 self._fp_target_object_id = resp.matched_object_id
+                self._target_selection_pending = False
                 logger.info("SelectTarget(select=true) → object_id=%s", resp.matched_object_id)
-            elif not select:
+            elif not select and resp.success:
+                self._fp_target_object_id = None
+                self._target_selection_pending = False
                 self._emit_diag(make_drop_detector_state(
                     step_id, True, "SelectTarget(select=false)"))
                 logger.info("SelectTarget(select=false) → 掉箱检测已恢复")
@@ -1175,13 +1218,55 @@ class RosAcceptanceAdapter:
 
         与 _call_select_target 完全相同的逻辑，仅暴露为公开方法。
         """
-        return self._call_select_target(
+        if select:
+            self.reset_pick_observation()
+        result = self._call_select_target(
             select=select,
             pick_x=pick_x,
             pick_y=pick_y,
             material_points_xy=material_points_xy or [],
             point_tolerance=2.0,
             step_id=step_id,
+        )
+        if select and result and result.get("success"):
+            self._select_target_active = True
+        elif not select and result and result.get("success"):
+            self._select_target_active = False
+        return result
+
+    def reset_pick_observation(self) -> None:
+        """Start a new target-observation epoch and discard stale cached poses."""
+        self._latest_pose_result = None
+        self._latest_pose_received_monotonic = 0.0
+        self._target_selection_started_monotonic = time.monotonic()
+        self._target_selection_started_ros_ns = self._node.get_clock().now().nanoseconds
+        self._target_selection_pending = True
+
+    def _foundation_pose_epoch(self) -> FoundationPoseSelectionEpoch:
+        return FoundationPoseSelectionEpoch(
+            object_id=self._fp_target_object_id,
+            required_frame=self._carry_target_frame,
+            started_ros_ns=self._target_selection_started_ros_ns,
+            started_monotonic=self._target_selection_started_monotonic,
+            stale_after_s=self._fp_pose_stale_after_s,
+        )
+
+    def _pose_rejection_reason(self, pose: Any) -> str | None:
+        stamp = getattr(getattr(pose, "header", None), "stamp", None)
+        observation = FoundationPoseObservation(
+            object_id=getattr(pose, "object_id", None),
+            frame_id=str(getattr(getattr(pose, "header", None), "frame_id", "") or ""),
+            stamp_ns=(
+                int(getattr(stamp, "sec", 0)) * 1_000_000_000
+                + int(getattr(stamp, "nanosec", 0))
+            ),
+            received_monotonic=self._latest_pose_received_monotonic,
+        )
+        return reject_foundation_pose_observation(
+            observation,
+            self._foundation_pose_epoch(),
+            now_ros_ns=self._node.get_clock().now().nanoseconds,
+            now_monotonic=time.monotonic(),
         )
 
     def wait_fp_pose_ready(self, min_wait_s: float = 3.0,
@@ -1199,7 +1284,12 @@ class RosAcceptanceAdapter:
         time.sleep(min_wait_s)
         while time.time() < deadline:
             pose = self._latest_pose_result
-            if pose is not None and pose.state >= 1:  # IDLE(1) 或 TRACKING(2)
+            if (
+                pose is not None
+                and pose.state >= 1
+                and not self._target_selection_pending
+                and self._pose_rejection_reason(pose) is None
+            ):
                 logger.info(
                     "wait_fp_pose_ready: 就绪 (state=%d, object_id=%d, "
                     "elapsed=%.1fs)",
@@ -1252,18 +1342,23 @@ class RosAcceptanceAdapter:
     def _pick_sequence(self, request_id, goal_id, step_id):
         try:
             # ★ 新 C++ gateway: 一步完成 motion1（替代 set_lift + request_replay）
-            # /submit_carry_task 接收单物体位姿 (torso_link)，
+            # /submit_carry_task 接收单物体位姿（权威帧默认 pelvis），
             # gateway 自动选择 center/right/left/front 并执行搬起动捕
             result = self._call_submit_carry_task(request_id, goal_id, step_id)
             if result["status"] != "ok":
                 return result
-            ready = self._wait_until_ready("carry")
+            ready = self._wait_until_ready("pick")
             if not ready:
                 result["status"] = "error"
                 result["error_code"] = "PICK_NOT_READY"
                 result["message"] = "robot did not reach ready state after pick"
                 return result
 
+            result["verification"] = {
+                "status": "passed",
+                "evidence": {"gateway_ready": True, "hold_pose_active": True},
+                "message": "gateway holding posture and ready state observed",
+            }
             return result
         finally:
             self._cleanup_select_target(step_id)
@@ -1305,6 +1400,15 @@ class RosAcceptanceAdapter:
             "error_code": None,
             "message": "placed",
             "state": self._minimal_state(),
+            "verification": {
+                "status": "passed",
+                "evidence": {
+                    "box_released": self._box_released,
+                    "posture": "stand",
+                    "gateway_ready": True,
+                },
+                "message": "release, standing posture, and gateway ready observed",
+            },
             "metrics": {},
             "request_id": request_id,
             "goal_id": goal_id,
@@ -1316,13 +1420,13 @@ class RosAcceptanceAdapter:
 
         替代旧的两步调用 (_call_set_lift + _call_request_replay)。
         前提: 用户已通过 SelectTarget 进入单目标模式，
-              FP 正在发布 /foundationpose/pose_result (torso_link 帧)。
+              FP 正在发布与 WAIC_CARRY_TARGET_FRAME 一致的位姿。
 
         返回: {"status": "ok"/"error", ...}
         """
         if not _HAS_SUBMIT_CARRY:
             return self._error_result(
-                "NOT_AVAILABLE",
+                "UNSUPPORTED_CAPABILITY",
                 "gear_sonic_interfaces 未安装，无法调用 /submit_carry_task",
                 request_id, goal_id, step_id)
 
@@ -1336,6 +1440,21 @@ class RosAcceptanceAdapter:
                 "POSE_NOT_READY",
                 f"pose_result 状态不可用 (当前 state={pose_est.state})",
                 request_id, goal_id, step_id)
+        rejection_reason = self._pose_rejection_reason(pose_est)
+        if self._target_selection_pending or rejection_reason is not None:
+            code = (
+                "POSE_FRAME_MISMATCH"
+                if rejection_reason == "POSE_FRAME_MISMATCH"
+                else "POSE_NOT_READY"
+            )
+            return self._error_result(
+                code,
+                f"FoundationPose observation rejected: "
+                f"{rejection_reason or 'TARGET_SELECTION_PENDING'}",
+                request_id,
+                goal_id,
+                step_id,
+            )
 
         # 懒初始化客户端
         if self._submit_carry_client is None:
@@ -1348,10 +1467,12 @@ class RosAcceptanceAdapter:
                 request_id, goal_id, step_id)
 
         req = SubmitCarryTask.Request()
-        req.request_id = f"{request_id}-{step_id}-{int(time.time()*1000)}"
+        # SubmitCarryTask guarantees exactly-once behavior for an accepted
+        # request ID.  The dispatcher supplies a stable idempotency key here;
+        # never append wall-clock time or a retry would become a new action.
+        req.request_id = request_id
         req.command = "carry"
         req.object_pose.header = pose_est.header
-        req.object_pose.header.frame_id = "pelvis"  # gateway CARRY_TARGET_FRAME=pelvis，FP publish_in_pelvis_frame=true
         req.object_pose.pose = pose_est.pose       # position + orientation
 
         print(f"\n  [ros] >>> /submit_carry_task  "
@@ -1550,7 +1671,8 @@ class RosAcceptanceAdapter:
         req.data = True
         print(f"\n  [ros] >>> /notify_goal_reached  data=true", flush=True)
         future = self._notify_goal_reached_client.call_async(req)
-        ok = self._wait_future(future, self._timeout_s)
+        notify_timeout_s = min(self._timeout_s, 5.0)
+        ok = self._wait_future(future, notify_timeout_s)
         elapsed = (time.time() - t0) * 1000
 
         if not ok:

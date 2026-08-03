@@ -11,7 +11,8 @@ import asyncio
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import logging
@@ -26,6 +27,9 @@ from .step_debug import StepDebugController
 from .robot_state import safety_fsm, RobotState
 from .audit import audit_logger
 from .adapters.realsense_camera import RealsenseGrabber
+from .skills import build_skill_dispatcher
+from .autonomy.legacy import LegacyMissionProjector
+from .autonomy.runtime import RobotRuntime
 
 logger = logging.getLogger("phi_robot.api")
 
@@ -109,21 +113,51 @@ class PhiRobotAPIServer:
         port: int = 5000,
         adapter=None,
         service_manager=None,
+        mission_service: Optional[MissionService] = None,
+        skill_dispatcher: Any = None,
+        robot_runtime: Optional[RobotRuntime] = None,
+        supervisor_ledger_path: Optional[str] = None,
+        autonomy_service: Any = None,
+        autonomy_operator_authorizer: Optional[Callable[[Any], Optional[str]]] = None,
     ):
         self.app = Flask(__name__)
         CORS(self.app)  # 启用跨域请求
 
         self.host = host
         self.port = port
-        self.service = MissionService()
+        self.service = mission_service or MissionService()
         self.adapter = adapter if adapter is not None else UnitreeSimBackend()
+        self.skill_dispatcher = skill_dispatcher or build_skill_dispatcher(self.adapter)
+        self.legacy_mission_projector = LegacyMissionProjector(self.service)
+        if robot_runtime is None:
+            store_dir = Path(getattr(self.service.store, "_data_dir"))
+            ledger_path = supervisor_ledger_path or str(store_dir / "supervisor.sqlite3")
+            robot_runtime = RobotRuntime(
+                robot_id="active",
+                adapter=self.adapter,
+                ledger_path=ledger_path,
+                dispatcher=self.skill_dispatcher,
+                observer=self.legacy_mission_projector,
+            )
+        self.robot_runtime = robot_runtime
+        self.execution_supervisor = robot_runtime.supervisor
+        self.autonomy_service = autonomy_service
+        self.autonomy_operator_authorizer = autonomy_operator_authorizer
         self.rs_grabber = RealsenseGrabber()
         self.active_runners: Dict[str, MissionRunner] = {}
         self.mission_hooks: Dict[str, APIHook] = {}
         self._cancel_events: Dict[str, threading.Event] = {}
         self.event_hub = SyncEventHub(self.service.store)
-        self.dev_console = DevConsoleController(self.adapter, mission_service=self.service)
-        self.step_debug = StepDebugController(self.adapter, mission_service=self.service)
+        self.dev_console = DevConsoleController(
+            self.adapter,
+            mission_service=self.service,
+            skill_dispatcher=self.skill_dispatcher,
+        )
+        self.step_debug = StepDebugController(
+            self.adapter,
+            mission_service=self.service,
+            skill_dispatcher=self.skill_dispatcher,
+        )
         self.service_manager = service_manager
 
         self._setup_routes()
@@ -140,6 +174,109 @@ class PhiRobotAPIServer:
                 "status": "ok",
                 "timestamp": datetime.now().isoformat()
             })
+
+        # Phase 5-8 natural-language task and monitoring API.  It is inert
+        # unless an AutonomyService is explicitly injected into this process;
+        # constructing the legacy server never opens a cloud connection.
+        @self.app.route("/api/autonomy/tasks", methods=["POST"])
+        def submit_autonomy_task():
+            if self.autonomy_service is None:
+                return jsonify({
+                    "error_code": "AUTONOMY_NOT_CONFIGURED",
+                    "message": "Gemini autonomy runtime is not configured",
+                }), 503
+            data = request.json or {}
+            instruction = str(data.get("instruction") or "").strip()
+            if not instruction:
+                return jsonify({
+                    "error_code": "INSTRUCTION_REQUIRED",
+                    "message": "instruction is required",
+                }), 400
+            try:
+                result = self.autonomy_service.submit_instruction(
+                    instruction,
+                    request_id=(str(data["request_id"]) if data.get("request_id") else None),
+                    background=bool(data.get("background", True)),
+                )
+                return jsonify(result), 202
+            except Exception as exc:
+                logger.exception("Autonomy task submission failed")
+                return jsonify({
+                    "error_code": getattr(exc, "code", "AUTONOMY_SUBMISSION_FAILED"),
+                    "message": str(exc),
+                    "details": getattr(exc, "details", {}),
+                }), 422
+
+        @self.app.route("/api/autonomy/tasks/<mission_id>", methods=["GET"])
+        def get_autonomy_task(mission_id: str):
+            if self.autonomy_service is None:
+                return jsonify({"error_code": "AUTONOMY_NOT_CONFIGURED"}), 503
+            try:
+                return jsonify(self.autonomy_service.snapshot(mission_id))
+            except KeyError:
+                return jsonify({"error_code": "NOT_FOUND"}), 404
+
+        @self.app.route("/api/autonomy/tasks/<mission_id>/replay", methods=["GET"])
+        def get_autonomy_replay(mission_id: str):
+            if self.autonomy_service is None:
+                return jsonify({"error_code": "AUTONOMY_NOT_CONFIGURED"}), 503
+            try:
+                return jsonify(self.autonomy_service.replay_bundle(mission_id))
+            except KeyError:
+                return jsonify({"error_code": "NOT_FOUND"}), 404
+
+        @self.app.route("/api/autonomy/tasks/<mission_id>/metrics", methods=["GET"])
+        def get_autonomy_metrics(mission_id: str):
+            if self.autonomy_service is None:
+                return jsonify({"error_code": "AUTONOMY_NOT_CONFIGURED"}), 503
+            try:
+                return jsonify(self.autonomy_service.metrics(mission_id))
+            except KeyError:
+                return jsonify({"error_code": "NOT_FOUND"}), 404
+
+        @self.app.route("/api/autonomy/tasks/<mission_id>/pause", methods=["POST"])
+        def pause_autonomy_task(mission_id: str):
+            return _autonomy_operator_action(
+                mission_id,
+                lambda principal, data: self.autonomy_service.pause(
+                    mission_id, principal=principal
+                ),
+            )
+
+        @self.app.route("/api/autonomy/tasks/<mission_id>/stop", methods=["POST"])
+        def stop_autonomy_task(mission_id: str):
+            return _autonomy_operator_action(
+                mission_id,
+                lambda principal, data: self.autonomy_service.stop(
+                    mission_id,
+                    principal=principal,
+                    reason=str(data.get("reason") or "operator requested stop"),
+                ),
+            )
+
+        def _autonomy_operator_action(mission_id: str, action: Any):
+            if self.autonomy_service is None:
+                return jsonify({"error_code": "AUTONOMY_NOT_CONFIGURED"}), 503
+            if self.autonomy_operator_authorizer is None:
+                return jsonify({
+                    "error_code": "TRUSTED_OPERATOR_REQUIRED",
+                    "message": "operator intervention endpoint has no trusted authorizer",
+                }), 403
+            principal = self.autonomy_operator_authorizer(request)
+            if not principal:
+                return jsonify({
+                    "error_code": "TRUSTED_OPERATOR_REQUIRED",
+                    "message": "trusted local operator authentication failed",
+                }), 403
+            try:
+                return jsonify(action(principal, request.json or {}))
+            except KeyError:
+                return jsonify({"error_code": "NOT_FOUND"}), 404
+            except Exception as exc:
+                return jsonify({
+                    "error_code": getattr(exc, "code", "INTERVENTION_FAILED"),
+                    "message": str(exc),
+                }), 409
 
         @self.app.route("/api/missions", methods=["POST"])
         def submit_mission():
@@ -233,31 +370,13 @@ class PhiRobotAPIServer:
                 if record.status == "running":
                     return jsonify({"error": f"Mission is {record.status}, cannot run"}), 409
 
-                # 重置仿真环境到初始状态
-                self.adapter.reset()
-
-                # 启动任务（service.run 可能会抛 ValueError，当状态非法时）
                 try:
-                    self.service.run(mission_id)
-                except ValueError as ve:
+                    # Phase 2: the durable supervisor owns mission execution.
+                    # Starting a mission never resets a local cache as a proxy
+                    # for physical state reconciliation.
+                    self.robot_runtime.start_legacy_mission(record, background=True)
+                except (ValueError, RuntimeError) as ve:
                     return jsonify({"error": str(ve)}), 409
-
-                # 创建 cancel_event、钩子和执行器
-                cancel_event = threading.Event()
-                self._cancel_events[mission_id] = cancel_event
-                hook = APIHook(mission_id, event_hub=self.event_hub)
-                runner = MissionRunner(self.service, self.adapter, hook=hook, cancel_event=cancel_event)
-
-                self.mission_hooks[mission_id] = hook
-                self.active_runners[mission_id] = runner
-
-                # 在后台线程中异步执行
-                thread = threading.Thread(
-                    target=self._run_mission_sync,
-                    args=(mission_id, runner),
-                    daemon=True,
-                )
-                thread.start()
 
                 return jsonify({
                     "mission_id": mission_id,
@@ -277,7 +396,7 @@ class PhiRobotAPIServer:
                 if not record:
                     return jsonify({"error": "Mission not found"}), 404
 
-                self.service.pause(mission_id)
+                self.execution_supervisor.pause(mission_id)
                 return jsonify({
                     "mission_id": mission_id,
                     "status": "pause_requested",
@@ -296,16 +415,18 @@ class PhiRobotAPIServer:
                 if not record:
                     return jsonify({"error": "Mission not found"}), 404
 
-                # 1. 设置 abort 标志（runner 在循环顶部检查）
-                self.service.request_abort(mission_id)
-                # 2. 触发取消事件（中断可能正在执行中的工具调用等待）
-                cancel_event = self._cancel_events.get(mission_id)
-                if cancel_event:
-                    cancel_event.set()
+                receipt = self.execution_supervisor.request_stop(
+                    mission_id,
+                    reason="operator abort",
+                )
 
                 return jsonify({
                     "mission_id": mission_id,
-                    "status": "abort_requested",
+                    "status": (
+                        "paused" if receipt.confirmed else "intervention_required"
+                    ),
+                    "physical_stop_confirmed": receipt.confirmed,
+                    "stop_receipt": receipt.to_dict(),
                     "timestamp": datetime.now().isoformat()
                 })
 
@@ -324,22 +445,7 @@ class PhiRobotAPIServer:
                 if record.status != "paused":
                     return jsonify({"error": f"Mission is {record.status}, not paused"}), 409
 
-                self.service.resume(mission_id)
-
-                # 重新创建 runner 和 cancel_event
-                cancel_event = threading.Event()
-                self._cancel_events[mission_id] = cancel_event
-                hook = APIHook(mission_id, event_hub=self.event_hub)
-                runner = MissionRunner(self.service, self.adapter, hook=hook, cancel_event=cancel_event)
-                self.mission_hooks[mission_id] = hook
-                self.active_runners[mission_id] = runner
-
-                thread = threading.Thread(
-                    target=self._run_mission_sync,
-                    args=(mission_id, runner),
-                    daemon=True,
-                )
-                thread.start()
+                self.execution_supervisor.start(mission_id, background=True)
 
                 return jsonify({
                     "mission_id": mission_id,
@@ -367,6 +473,9 @@ class PhiRobotAPIServer:
                 self.mission_hooks.pop(mission_id, None)
 
                 self.service.reset(mission_id)
+                self.robot_runtime.register_legacy_mission(
+                    self.service.get_mission(mission_id)
+                )
                 return jsonify({
                     "mission_id": mission_id,
                     "status": "ready",
@@ -381,11 +490,12 @@ class PhiRobotAPIServer:
         def get_mission_events(mission_id: str):
             """获取任务事件"""
             try:
+                if self.execution_supervisor.ledger.get_mission(mission_id):
+                    return jsonify({
+                        "events": self.execution_supervisor.ledger.list_events(mission_id)
+                    })
                 hook = self.mission_hooks.get(mission_id)
-                if not hook:
-                    return jsonify({"events": []})
-
-                return jsonify({"events": hook.events})
+                return jsonify({"events": hook.events if hook else []})
 
             except Exception as e:
                 logger.exception("Error querying mission events")
@@ -410,12 +520,31 @@ class PhiRobotAPIServer:
 
             return Response(event_stream(), mimetype="text/event-stream")
 
+        @self.app.route("/api/missions/<mission_id>/timeline", methods=["GET"])
+        def get_mission_timeline(mission_id: str):
+            """Durable Phase 2 mission/plan/action/interrupt/world-state view."""
+            try:
+                return jsonify(self.execution_supervisor.snapshot(mission_id))
+            except KeyError:
+                return jsonify({"error": "Mission not found"}), 404
+
         @self.app.route("/api/snapshot", methods=["GET"])
         def get_snapshot():
             """获取仿真环境快照"""
             try:
-                snapshot = self.adapter.snapshot()
-                return jsonify(snapshot)
+                result = self.skill_dispatcher.execute_legacy(
+                    "get_runtime_snapshot", {},
+                    request_id=f"snapshot-{uuid.uuid4().hex[:12]}",
+                    goal_id="snapshot",
+                    step_id="get-runtime-snapshot",
+                    source="snapshot_api",
+                )
+                if result.get("status") != "ok":
+                    return jsonify({
+                        "error": result.get("message", "snapshot unavailable"),
+                        "error_code": result.get("error_code"),
+                    }), 500
+                return jsonify(result.get("snapshot") or {})
 
             except Exception as e:
                 logger.exception("Error getting snapshot")
@@ -426,16 +555,20 @@ class PhiRobotAPIServer:
         @self.app.route("/api/robot/state", methods=["GET"])
         def get_robot_state():
             """查询安全状态机 + 机器人实时状态"""
+            input_result = self.skill_dispatcher.execute_legacy(
+                "get_input_source", {},
+                request_id=f"robot-state-{uuid.uuid4().hex[:12]}",
+                goal_id="operator-control",
+                step_id="get-input-source",
+                source="operator_api",
+            )
             return jsonify({
                 "state": safety_fsm.state_value,
                 "can_walk": safety_fsm.can_walk(),
                 "can_pick": safety_fsm.can_pick(),
                 "can_place": safety_fsm.can_place(),
                 "bypass": safety_fsm.bypass,
-                "sonic_input_source": (
-                    self.adapter.get_sonic_input_source()
-                    if hasattr(self.adapter, "get_sonic_input_source") else "unknown"
-                ),
+                "sonic_input_source": input_result.get("active_source", "unknown"),
             })
 
         @self.app.route("/api/robot/safety/bypass", methods=["POST"])
@@ -447,14 +580,25 @@ class PhiRobotAPIServer:
             """
             data = request.json or {}
             enabled = bool(data.get("bypass", False))
-            safety_fsm.set_bypass(enabled)
-            logger.warning("API: 安全旁路 %s", "启用" if enabled else "关闭")
+            result = self.skill_dispatcher.execute_legacy(
+                "set_safety_bypass", {"enabled": enabled},
+                request_id=f"safety-bypass-{uuid.uuid4().hex[:12]}",
+                goal_id="operator-control",
+                step_id="set-safety-bypass",
+                source="operator_api",
+            )
+            ok = result.get("status") == "ok"
+            if ok:
+                logger.warning("API: 安全旁路 %s", "启用" if enabled else "关闭")
             return jsonify({
-                "ok": True,
-                "bypass": enabled,
-                "message": "安全旁路已{} — 所有 can_walk/can_pick/can_place 强制返回 true".format(
-                    "启用" if enabled else "关闭"
+                "ok": ok,
+                "bypass": safety_fsm.bypass,
+                "message": (
+                    "安全旁路已{} — 所有 can_walk/can_pick/can_place 强制返回 true".format(
+                        "启用" if enabled else "关闭"
+                    ) if ok else result.get("message", "安全旁路更新失败")
                 ),
+                "error_code": result.get("error_code"),
             })
 
         # ── 多机器人切换 ──────────────────────────────────
@@ -601,10 +745,14 @@ class PhiRobotAPIServer:
         @self.app.route("/api/dev/sonic/input_source", methods=["GET"])
         def get_sonic_input_source():
             """查询当前 SONIC 输入源: "ROS2" | "GAMEPAD" | "unknown" """
-            source = "unknown"
-            if hasattr(self.adapter, "get_sonic_input_source"):
-                source = self.adapter.get_sonic_input_source()
-            return jsonify({"active_source": source})
+            result = self.skill_dispatcher.execute_legacy(
+                "get_input_source", {},
+                request_id=f"input-source-get-{uuid.uuid4().hex[:12]}",
+                goal_id="operator-control",
+                step_id="get-input-source",
+                source="operator_api",
+            )
+            return jsonify({"active_source": result.get("active_source", "unknown")})
 
         @self.app.route("/api/dev/sonic/input_source", methods=["POST"])
         def set_sonic_input_source():
@@ -615,13 +763,23 @@ class PhiRobotAPIServer:
             """
             data = request.json or {}
             gamepad = bool(data.get("gamepad", False))
-            if hasattr(self.adapter, "set_sonic_input_source"):
-                result = self.adapter.set_sonic_input_source(gamepad)
+            result = self.skill_dispatcher.execute_legacy(
+                "set_input_source", {"gamepad": gamepad},
+                request_id=f"input-source-set-{uuid.uuid4().hex[:12]}",
+                goal_id="operator-control",
+                step_id="set-input-source",
+                source="operator_api",
+            )
+            ok = result.get("status") == "ok"
+            if ok:
                 logger.warning("API: SONIC 输入源 → %s (ok=%s)",
-                              "GAMEPAD" if gamepad else "ROS2", result.get("ok"))
-                return jsonify(result)
-            return jsonify({"ok": False, "message": "适配器不支持 SONIC 输入源切换",
-                           "active_source": "unknown"})
+                              "GAMEPAD" if gamepad else "ROS2", ok)
+            return jsonify({
+                "ok": ok,
+                "message": result.get("message", ""),
+                "active_source": result.get("active_source", "unknown"),
+                "error_code": result.get("error_code"),
+            })
 
         # ── 调试控制台 API ────────────────────────────────
 
@@ -806,13 +964,7 @@ class PhiRobotAPIServer:
         def step_debug_reset_fp():
             """FoundationPose 重新标定物体"""
             try:
-                if hasattr(self.adapter, "call_reset_fp"):
-                    result = self.adapter.call_reset_fp()
-                    if result is None:
-                        return jsonify({"ok": False, "message": "Reset 服务不可用或超时"})
-                    return jsonify({"ok": result.get("success", False),
-                                    "message": result.get("message", "")})
-                return jsonify({"ok": False, "message": "适配器不支持"})
+                return jsonify(self.step_debug.reset_foundationpose())
             except Exception as e:
                 logger.exception("reset_fp 失败")
                 return jsonify({"ok": False, "message": str(e)})
@@ -931,28 +1083,25 @@ class PhiRobotAPIServer:
 
         @self.app.route("/api/dev/step_debug/pose_snapshot", methods=["GET"])
         def step_debug_pose_snapshot():
-            """返回缓存的单物体位姿 (torso_link 帧)，供前端确认数据正确后再执行 pick"""
+            """返回缓存的单物体位姿（权威躯干帧默认 pelvis），供执行 pick 前预览。"""
             try:
-                if not hasattr(self.adapter, '_latest_pose_result'):
+                result = self.skill_dispatcher.execute_legacy(
+                    "get_runtime_snapshot", {},
+                    request_id=f"pose-snapshot-{uuid.uuid4().hex[:12]}",
+                    goal_id="step-debug",
+                    step_id="get-target-pose-snapshot",
+                    source="step_debug_query",
+                )
+                if result.get("status") != "ok":
+                    return jsonify({
+                        "ok": False,
+                        "message": result.get("message", "适配器不支持"),
+                        "error_code": result.get("error_code"),
+                    })
+                pose = dict(result.get("target_pose") or {})
+                if not pose.pop("supported", False):
                     return jsonify({"ok": False, "message": "适配器不支持"})
-                pose = self.adapter._latest_pose_result
-                if pose is None or getattr(pose, 'state', 0) != 2:
-                    return jsonify({"ok": True, "has_pose": False})
-                import math
-                x = pose.pose.position.x
-                y = pose.pose.position.y
-                z = pose.pose.position.z
-                yaw_deg = round(math.degrees(math.atan2(y, x)), 1)
-                dist = round(math.sqrt(x * x + y * y), 3)
-                return jsonify({
-                    "ok": True,
-                    "has_pose": True,
-                    "x": x, "y": y, "z": z,
-                    "yaw_deg": yaw_deg,
-                    "distance": dist,
-                    "frame_id": pose.header.frame_id,
-                    "tracking_frames": getattr(pose, 'tracking_frames', 0),
-                })
+                return jsonify({"ok": True, **pose})
             except Exception as e:
                 logger.exception("pose_snapshot 失败")
                 return jsonify({"ok": False, "message": str(e)})
@@ -969,8 +1118,15 @@ class PhiRobotAPIServer:
                 "can_place": safety_fsm.can_place(),
             }
             try:
-                if hasattr(self.adapter, "get_odom"):
-                    odom = self.adapter.get_odom()
+                runtime = self.skill_dispatcher.execute_legacy(
+                    "get_runtime_snapshot", {},
+                    request_id=f"step-state-{uuid.uuid4().hex[:12]}",
+                    goal_id="step-debug",
+                    step_id="get-runtime-snapshot",
+                    source="step_debug_query",
+                )
+                odom = runtime.get("odom")
+                if runtime.get("status") == "ok" and isinstance(odom, dict):
                     state["odom"] = {
                         "x": round(float(odom.get("x", 0)), 3),
                         "y": round(float(odom.get("y", 0)), 3),

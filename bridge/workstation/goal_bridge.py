@@ -29,9 +29,11 @@ class GoalBridge(Node):
             self.pub.publish(msg)
             self.get_logger().info(f'Goal to fastlio_ws: ({x:.2f}, {y:.2f}, yaw={yaw:.3f})')
             response.success = True
+            response.message = f'goal accepted: ({x:.2f}, {y:.2f}, yaw={yaw:.3f})'
         except Exception as e:
             self.get_logger().error(str(e))
             response.success = False
+            response.message = str(e)
         return response
 
 

@@ -7,7 +7,7 @@
 #   ./run_ros_acceptance.sh
 #
 # 环境要求:
-#   - 已安装 ros-jazzy-rmw-cyclonedds-cpp
+#   - Ubuntu 22.04 + ROS2 Humble
 #   - phi_robot_interfaces 已 colcon build
 # ──────────────────────────────────────────────────────────
 set -e
@@ -16,7 +16,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
 # ── ROS2 环境 ────────────────────────────────────────────
-source /opt/ros/jazzy/setup.bash
+source /opt/ros/humble/setup.bash
 source "$PROJECT_DIR/install/setup.bash"
 source /home/hairo/waic/gear_sonic_client_ws/install/setup.bash  # SubmitCarryTask 接口
 
@@ -29,7 +29,7 @@ export ROS_DISCOVERY_SERVER=192.168.50.141:11811
 source "$PROJECT_DIR/.venv/bin/activate"
 
 # ── 启动参数 ─────────────────────────────────────────────
-# 路径规划服务名待同事确认后修改 --path-plan-service 的值
+# Phase 0 契约已冻结导航服务为 /start_navigation。
 exec python3 run_phi_robot_api.py \
   --port 5000 \
   --acceptance ros \

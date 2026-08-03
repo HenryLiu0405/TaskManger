@@ -162,10 +162,9 @@ class MissionPlanner:
                     tool="move_to",
                     args={
                         "target": {"x": app_x, "y": app_y, "z": stock_point.z, "theta": app_yaw},
-                        "action": "start",
                         "timeout_s": 30,
-                        "request_id": request_id,
-                        "goal_id": goal_id,
+                    },
+                    annotations={
                         "slot_nav2_x": nav2_x,    # 物料点在 Nav2 map 系的坐标
                         "slot_nav2_y": nav2_y,    # 供 FP 验证钩子使用
                     },
@@ -182,8 +181,10 @@ class MissionPlanner:
                     args={
                         "object_id": f"box-{task_index:02d}",
                         "timeout_s": 30,
-                        "request_id": request_id,
-                        "goal_id": goal_id,
+                    },
+                    annotations={
+                        "slot_nav2_x": nav2_x,
+                        "slot_nav2_y": nav2_y,
                     },
                     status="pending",
                 )
@@ -199,10 +200,9 @@ class MissionPlanner:
                     tool="move_to",
                     args={
                         "target": {"x": nav2_gx, "y": nav2_gy, "z": goal_cell.z, "theta": goal_cell.theta},
-                        "action": "start",
                         "timeout_s": 30,
-                        "request_id": request_id,
-                        "goal_id": goal_id,
+                    },
+                    annotations={
                         "grid_nav2_x": nav2_gx,
                         "grid_nav2_y": nav2_gy,
                     },
@@ -217,12 +217,17 @@ class MissionPlanner:
                     task_index=task_index,
                     tool="place",
                     args={
-                        "x": goal_cell.x,
-                        "y": goal_cell.y,
-                        "z": goal_cell.z,
+                        "target": {
+                            "x": goal_cell.x,
+                            "y": goal_cell.y,
+                            "z": goal_cell.z,
+                            "theta": goal_cell.theta,
+                        },
                         "timeout_s": 30,
-                        "request_id": request_id,
-                        "goal_id": goal_id,
+                    },
+                    annotations={
+                        "grid_nav2_x": nav2_gx,
+                        "grid_nav2_y": nav2_gy,
                     },
                     status="pending",
                 )

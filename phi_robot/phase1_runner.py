@@ -1,4 +1,4 @@
-"""Phase 1 acceptance runner.
+"""Legacy Phase 1 acceptance runner (not part of the current release gate).
 
 Runs deterministic scenarios against the fake robot service and produces a
 markdown report that can be copied into ``phase1.md``.
@@ -203,7 +203,7 @@ def build_report(results: list[ScenarioResult]) -> str:
     max_calls = max((len(result.tool_trace) for result in results), default=0)
 
     lines = [
-        "# Phase 1 验收结果",
+        "# Legacy Phase 1 验收结果（非正式 Gate）",
         "",
         f"- 场景数: {total}",
         f"- 通过数: {passed}",
@@ -232,11 +232,16 @@ def build_report(results: list[ScenarioResult]) -> str:
             ]
         )
 
+    all_passed = passed == total and total > 0
     lines.extend(
         [
             "## 结论",
             "",
-            "Phase 1 通过：Fake Robot Service、故障注入、回放 runner、验收报告均已完成。",
+            (
+                "Legacy runner 通过；正式 Phase 0/1 Gate 请运行 tests/offline。"
+                if all_passed
+                else "Legacy runner 未通过；不得将本报告视为验收成功。"
+            ),
             "",
         ]
     )
@@ -253,7 +258,9 @@ def main() -> int:
     print(report)
     if args.write_report is not None:
         args.write_report.write_text(report, encoding="utf-8")
-    return 0
+    return 0 if all(
+        result.outcome == result.scenario.expected_outcome for result in results
+    ) else 1
 
 
 if __name__ == "__main__":

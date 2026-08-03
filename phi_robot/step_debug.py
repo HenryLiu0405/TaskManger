@@ -21,6 +21,7 @@ from .models import PlanStep
 from .mission_planner import MissionPlanner, load_scene_coords
 from .recovery_diag import DiagEvent, DiagCollector
 from .robot_state import safety_fsm, RobotState
+from .skills import build_skill_dispatcher
 
 logger = logging.getLogger("phi_robot.step_debug")
 
@@ -87,7 +88,13 @@ class StepDebugController:
         - 诊断事件通过 adapter.set_diag_callback → collector.push 收集
     """
 
-    def __init__(self, adapter: Any, mission_service: Any = None):
+    def __init__(
+        self,
+        adapter: Any,
+        mission_service: Any = None,
+        skill_dispatcher: Any = None,
+        abort_join_timeout_s: float = 5.0,
+    ):
         """
         Args:
             adapter: RobotAdapter 协议实现（如 RosAcceptanceAdapter）。
@@ -95,6 +102,7 @@ class StepDebugController:
         """
         self._adapter = adapter
         self._mission_service = mission_service
+        self._skill_dispatcher = skill_dispatcher or build_skill_dispatcher(adapter)
 
         # ── 状态机 ──
         self._state: str = ST_IDLE
@@ -110,15 +118,15 @@ class StepDebugController:
         self._stop_flag = threading.Event()
         self._exec_thread: Optional[threading.Thread] = None
         self._execution_id: int = 0  # 递增以标记旧线程无效
+        self._plan_epoch: int = 0  # 仅新计划/明确回退时递增，稳定物理幂等键
+        self._abort_join_timeout_s = max(float(abort_join_timeout_s), 0.0)
 
         # ── FP SelectTarget 单目标模式 ──
         self._select_target_active: bool = False
+        self._locked_object_id: Any = None
 
         # ── 日志 ──
         self._step_logs: list[StepLog] = []
-
-        # ── 掉箱恢复：路径 B 跳过 nav goal 重发 ──
-        self._skip_nav_resend: bool = False
 
         # ── 注册诊断回调到 adapter ──
         if hasattr(adapter, "set_diag_callback"):
@@ -127,6 +135,41 @@ class StepDebugController:
             logger.warning("adapter 不支持 set_diag_callback，诊断事件将不可用")
 
         logger.info("StepDebugController 已就绪，状态=%s", self._state)
+
+    def _dispatch_internal(
+        self,
+        skill_name: str,
+        args: Optional[dict[str, Any]] = None,
+        *,
+        suffix: str,
+    ) -> dict[str, Any]:
+        """Run an operator/internal capability through the shared dispatcher."""
+
+        result = self._skill_dispatcher.execute_legacy(
+            skill_name,
+            args or {},
+            request_id="step_debug_operator",
+            goal_id="step_debug_operator",
+            step_id=suffix,
+            source="step_debug_operator",
+            idempotency_key=(
+                f"step-debug-operator:{self._execution_id}:"
+                f"{self._current_index}:{skill_name}:{suffix}"
+            ),
+        )
+        return {**result, "ok": result.get("status") == "ok"}
+
+    def _query_runtime_snapshot(self, *, suffix: str) -> dict[str, Any]:
+        """Read adapter caches through the shared, concurrency-safe query."""
+
+        result = self._skill_dispatcher.execute_legacy(
+            "get_runtime_snapshot", {},
+            request_id=f"step-debug-state-{time.monotonic_ns()}",
+            goal_id="step_debug",
+            step_id=suffix,
+            source="step_debug_query",
+        )
+        return result if result.get("status") == "ok" else {}
 
     # ── 诊断回调 ──────────────────────────────────────────────
 
@@ -145,6 +188,12 @@ class StepDebugController:
             {"ok": True, "plan": [...], "total_steps": N}
         """
         with self._lock:
+            if self._state in (ST_EXECUTING, ST_PAUSED):
+                return {
+                    "ok": False,
+                    "error_code": "RESOURCE_BUSY",
+                    "message": "当前动作尚未结束，不能替换调试计划",
+                }
             # 按固定优先级排序，不依赖用户输入顺序
             destinations = sorted(destinations, key=lambda d: _DEST_PRIORITY.get(d, 99))
             try:
@@ -159,13 +208,16 @@ class StepDebugController:
                 return {"ok": False, "message": f"生成 plan 失败: {e}"}
 
             self._plan = plan
+            self._plan_epoch += 1
             self._current_index = 0
             self._plan_steps = [
                 {
                     "step_id": s.step_id,
                     "task_index": s.task_index,
                     "tool": s.tool,
+                    "skill_version": s.skill_version,
                     "args_summary": _summarize_step_args(s.tool, s.args),
+                    "annotations": dict(s.annotations),
                     "status": "pending",
                 }
                 for s in plan
@@ -188,7 +240,11 @@ class StepDebugController:
                         "step_id": s.step_id,
                         "task_index": s.task_index,
                         "tool": s.tool,
+                        "skill_version": s.skill_version,
                         "args": s.args,
+                        "annotations": s.annotations,
+                        "invocation_id": s.invocation_id,
+                        "attempt": s.attempt,
                         "status": "pending",
                     }
                     for s in plan
@@ -221,7 +277,8 @@ class StepDebugController:
             step = self._plan[self._current_index]
 
             # ★ pick 步必须处于单目标模式（SelectTarget 已激活）
-            if step.tool == "pick" and not self._select_target_active:
+            if (step.tool == "pick" and not self._select_target_active
+                    and not self._skill_dispatcher.composite_pick):
                 return {
                     "ok": False,
                     "message": (
@@ -254,7 +311,7 @@ class StepDebugController:
     def auto_run(self) -> dict[str, Any]:
         """自动顺序执行所有剩余步骤（后台线程）。
 
-        与手动单步不同：线程内顺序调 adapter.execute()（同步阻塞），
+        与手动单步不同：线程内顺序调用 dispatcher（同步阻塞），
         天然保证「上一步真正完成才执行下一步」。
         pick 步前自动进入 FP 单目标模式。
         失败即停，用户可随时通过 abort 终止。
@@ -275,7 +332,8 @@ class StepDebugController:
 
             # pick 步前置条件检查（与手动执行一致）
             step = self._plan[self._current_index]
-            if step.tool == "pick" and not self._select_target_active:
+            if (step.tool == "pick" and not self._select_target_active
+                    and not self._skill_dispatcher.composite_pick):
                 return {
                     "ok": False,
                     "message": (
@@ -291,7 +349,7 @@ class StepDebugController:
 
         self._auto_thread = threading.Thread(
             target=self._run_auto,
-            args=(self._execution_id,),
+            args=(self._execution_id, self._plan_epoch),
             daemon=True,
         )
         self._auto_thread.start()
@@ -303,11 +361,11 @@ class StepDebugController:
             "current_index": self._current_index,
         }
 
-    def _run_auto(self, exec_id: int) -> None:
+    def _run_auto(self, exec_id: int, plan_epoch: int) -> None:
         """自动循环体（后台线程）：顺序执行剩余步骤，失败即停。
 
         不新建子线程 —— 直接在 _run_auto 线程内顺序调
-        adapter.execute()（同步阻塞），一步完成才执行下一步。
+        dispatcher（同步阻塞），一步完成才执行下一步。
         """
         try:
             while self._current_index < len(self._plan):
@@ -328,7 +386,8 @@ class StepDebugController:
                 step = self._plan[self._current_index]
 
                 # ── pick 步自动进入 FP 单目标模式 ─────────
-                if step.tool == "pick" and not self._select_target_active:
+                if (step.tool == "pick" and not self._select_target_active
+                        and not self._skill_dispatcher.composite_pick):
                     pick_x, pick_y = self._extract_slot_nav2_xy()
                     logger.info(
                         "_run_auto: 自动进入 FP 单目标模式 "
@@ -348,24 +407,6 @@ class StepDebugController:
                             ))
 
                     locked = self._auto_toggle_select_target()
-                    if not locked:
-                        # ★ 第一次锁定失败 → 等 1 秒重试
-                        with self._lock:
-                            if exec_id == self._execution_id:
-                                self._step_logs.append(StepLog(
-                                    step_id=step.step_id,
-                                    tool="select_target",
-                                    status="running",
-                                    message=f"首次锁定失败，等待 1 秒后重试...",
-                                    timestamp=StepLog.now(),
-                                ))
-                        if self._stop_flag.is_set() or exec_id != self._execution_id:
-                            return
-                        time.sleep(1.0)
-                        if self._stop_flag.is_set() or exec_id != self._execution_id:
-                            return
-                        locked = self._auto_toggle_select_target()
-
                     if not locked:
                         with self._lock:
                             if exec_id == self._execution_id:
@@ -388,7 +429,7 @@ class StepDebugController:
                     # SSE 反馈：锁定成功
                     with self._lock:
                         if exec_id == self._execution_id:
-                            obj_id = self._adapter._fp_target_object_id
+                            obj_id = self._locked_object_id
                             self._step_logs.append(StepLog(
                                 step_id=step.step_id,
                                 tool="select_target",
@@ -409,15 +450,22 @@ class StepDebugController:
                 # ── 执行（同步阻塞，真正等机器人完成） ────
                 t_start = time.monotonic()
                 try:
-                    result = self._adapter.execute(
+                    result = self._skill_dispatcher.execute_legacy(
                         tool=step.tool,
                         args=step.args,
+                        version=step.skill_version,
                         request_id="step_debug_auto",
                         goal_id="step_debug_auto",
                         step_id=step.step_id,
+                        source="step_debug_auto",
+                        annotations={
+                            **step.annotations,
+                            "target_preselected": self._select_target_active,
+                        },
+                        idempotency_key=f"step-debug-plan:{plan_epoch}:{step.step_id}",
                     )
                 except Exception as e:
-                    logger.exception("_run_auto: adapter.execute 异常: %s", e)
+                    logger.exception("_run_auto: dispatcher 异常: %s", e)
                     result = {
                         "status": "error",
                         "error_code": "ADAPTER_EXCEPTION",
@@ -460,6 +508,10 @@ class StepDebugController:
                         timestamp=StepLog.now(),
                     )
                     self._step_logs.append(log)
+                    current_view = self._plan_steps[self._current_index]
+                    current_view["invocation_id"] = result.get("invocation_id")
+                    current_view["outcome"] = result.get("outcome")
+                    current_view["error_category"] = result.get("error_category")
 
                     if is_ok:
                         self._plan_steps[self._current_index][
@@ -471,15 +523,21 @@ class StepDebugController:
                         # 搬起结束 → 恢复多目标识别，后续 move_to 和 place 不需要
                         if step.tool == "pick" and self._select_target_active:
                             try:
-                                if hasattr(self._adapter, "select_target_public"):
-                                    self._adapter.select_target_public(
-                                        select=False, step_id="auto_after_pick"
+                                if not self._skill_dispatcher.composite_pick:
+                                    self._skill_dispatcher.execute_legacy(
+                                        "clear_target", {},
+                                        request_id="step_debug_auto",
+                                        goal_id="step_debug_auto",
+                                        step_id="auto_after_pick",
+                                        source="step_debug_auto",
+                                        idempotency_key=f"step-debug-plan:{plan_epoch}:clear:{step.step_id}",
                                     )
                             except Exception as e:
                                 logger.error(
                                     "_run_auto pick 后退出 SelectTarget 失败: %s", e
                                 )
                             self._select_target_active = False
+                            self._locked_object_id = None
                             logger.info("_run_auto: pick 完成，已退出单目标模式")
                             # SSE 反馈：已退出
                             self._step_logs.append(StepLog(
@@ -523,15 +581,21 @@ class StepDebugController:
             # ── 全部完成：自动退出 FP 单目标模式 ─────────
             if self._select_target_active:
                 try:
-                    if hasattr(self._adapter, "select_target_public"):
-                        self._adapter.select_target_public(
-                            select=False, step_id="auto_done"
+                    if not self._skill_dispatcher.composite_pick:
+                        self._skill_dispatcher.execute_legacy(
+                            "clear_target", {},
+                            request_id="step_debug_auto",
+                            goal_id="step_debug_auto",
+                            step_id="auto_done",
+                            source="step_debug_auto",
+                            idempotency_key=f"step-debug-plan:{plan_epoch}:clear:done",
                         )
                 except Exception as e:
                     logger.error(
                         "_run_auto 退出 SelectTarget 失败: %s", e
                     )
                 self._select_target_active = False
+                self._locked_object_id = None
 
         except Exception as e:
             logger.exception("_run_auto: 未预期异常")
@@ -550,23 +614,20 @@ class StepDebugController:
             logger.error("_auto_toggle_select_target: 无法提取 slot 坐标")
             return False
 
-        if not hasattr(self._adapter, "select_target_public"):
-            logger.error(
-                "_auto_toggle_select_target: adapter 不支持 SelectTarget"
-            )
-            return False
-
-        result = self._adapter.select_target_public(
-            select=True,
-            pick_x=pick_x,
-            pick_y=pick_y,
-            material_points_xy=[pick_x, pick_y],
-            step_id="auto",
+        result = self._skill_dispatcher.execute_legacy(
+            "select_target",
+            {"pick_x": pick_x, "pick_y": pick_y, "material_points_xy": [pick_x, pick_y]},
+            request_id="step_debug_auto",
+            goal_id="step_debug_auto",
+            step_id="auto-select-target",
+            source="step_debug_auto",
+            idempotency_key=f"step-debug-plan:{self._plan_epoch}:select:{self._current_index}",
         )
 
         matched_id = result.get("matched_object_id", -1) if result else -1
-        if result and result.get("success") and matched_id >= 0:
+        if result and result.get("status") == "ok" and matched_id >= 0:
             self._select_target_active = True
+            self._locked_object_id = matched_id
             logger.info(
                 "_auto_toggle_select_target: 自动锁定成功, object_id=%s",
                 matched_id,
@@ -578,7 +639,7 @@ class StepDebugController:
                 if result
                 else "SelectTarget 服务不可用"
             )
-            if result and result.get("success") and matched_id < 0:
+            if result and result.get("status") == "ok" and matched_id < 0:
                 msg = f"FP 服务返回成功但未匹配到物体 (matched_object_id={matched_id})"
             logger.error(
                 "_auto_toggle_select_target: 自动锁定失败: %s", msg
@@ -588,9 +649,17 @@ class StepDebugController:
     def retry_step(self) -> dict[str, Any]:
         """重试当前步骤（状态机表现同 execute_current_step）。"""
         with self._lock:
-            if self._state not in (ST_STEP_DONE, ST_STEP_FAILED):
+            if self._state != ST_STEP_FAILED:
                 return {"ok": False,
-                        "message": f"当前状态 {self._state} 不可重试，请先执行步骤"}
+                        "message": f"当前状态 {self._state} 不可重试，只允许对已确认失败步骤手动重试"}
+
+            step_view = self._plan_steps[self._current_index]
+            if step_view.get("outcome") == "unknown":
+                return {
+                    "ok": False,
+                    "error_code": "RECONCILIATION_REQUIRED",
+                    "message": "上次动作结果未知，禁止重新下发；请先核对机器人状态",
+                }
 
             # 旧线程未退出时 detach（不影响本次重试）
             if self._exec_thread and self._exec_thread.is_alive():
@@ -599,16 +668,12 @@ class StepDebugController:
                 )
                 self._exec_thread = None
 
-            # STEP_DONE 时 _current_index 已推进到下一步，
-            # 需回退以重试刚完成的步骤
-            if self._state == ST_STEP_DONE:
-                self._current_index -= 1
-
             # 重试不推进 index，回到同一 step
             step = self._plan[self._current_index]
 
             # ★ pick 步必须处于单目标模式
-            if step.tool == "pick" and not self._select_target_active:
+            if (step.tool == "pick" and not self._select_target_active
+                    and not self._skill_dispatcher.composite_pick):
                 return {
                     "ok": False,
                     "message": (
@@ -644,6 +709,8 @@ class StepDebugController:
         然后跳过当前步。
         """
         with self._lock:
+            if self._current_step_outcome_unknown():
+                return self._reconciliation_required_result()
             if self._state in (ST_EXECUTING, ST_PAUSED):
                 # 终止正在执行的旧线程
                 self._stop_flag.set()
@@ -663,12 +730,28 @@ class StepDebugController:
         执行中（EXECUTING/PAUSED）拒绝，避免与 _run_step 竞争 _current_index。
         """
         with self._lock:
+            if self._current_step_outcome_unknown():
+                return self._reconciliation_required_result()
             if self._state in (ST_EXECUTING, ST_PAUSED):
                 return {
                     "ok": False,
                     "message": f"当前状态 {self._state}，步骤正在执行中，请先 pause 或 abort 后再跳过",
                 }
             return self._do_skip("force_skipped")
+
+    def _current_step_outcome_unknown(self) -> bool:
+        return (
+            0 <= self._current_index < len(self._plan_steps)
+            and self._plan_steps[self._current_index].get("outcome") == "unknown"
+        )
+
+    @staticmethod
+    def _reconciliation_required_result() -> dict[str, Any]:
+        return {
+            "ok": False,
+            "error_code": "RECONCILIATION_REQUIRED",
+            "message": "当前动作结果未知，禁止跳过并启动后继步骤；请先人工核对机器人状态",
+        }
 
     def _do_skip(self, skip_type: str) -> dict[str, Any]:
         """内部：标记当前步为 skip，前进 index。调用方需持有 _lock。"""
@@ -694,16 +777,16 @@ class StepDebugController:
         with self._lock:
             if self._state != ST_EXECUTING:
                 return {"ok": False, "message": f"当前状态 {self._state}，无可暂停的步骤"}
-            self._state = ST_PAUSED
-
-        # 锁外调 adapter（可能阻塞）
-        try:
-            if hasattr(self._adapter, "pause_navigation"):
-                self._adapter.pause_navigation()
-        except Exception as e:
-            logger.error("pause_navigation 失败: %s", e)
-
-        return {"ok": True, "message": "已暂停导航"}
+        result = self._dispatch_internal(
+            "pause_navigation", suffix="pause-execution"
+        )
+        if not result["ok"]:
+            return {"ok": False, "message": result.get("message", "暂停请求未确认"),
+                    "error_code": result.get("error_code")}
+        with self._lock:
+            if self._state == ST_EXECUTING:
+                self._state = ST_PAUSED
+        return {"ok": True, "message": "已发送暂停请求", "result": result}
 
     def resume_execution(self) -> dict[str, Any]:
         """恢复暂停的步骤。"""
@@ -711,11 +794,12 @@ class StepDebugController:
             if self._state != ST_PAUSED:
                 return {"ok": False, "message": f"当前状态 {self._state}，非暂停状态"}
 
-        try:
-            if hasattr(self._adapter, "resume_navigation"):
-                self._adapter.resume_navigation()
-        except Exception as e:
-            logger.error("resume_navigation 失败: %s", e)
+        result = self._dispatch_internal(
+            "resume_navigation", suffix="resume-execution"
+        )
+        if not result["ok"]:
+            return {"ok": False, "message": result.get("message", "恢复请求失败"),
+                    "error_code": result.get("error_code")}
 
         with self._lock:
             # 重新检查：resume_navigation 解除阻塞后，
@@ -728,7 +812,7 @@ class StepDebugController:
                     "resume_execution: 恢复期间 _run_step 已完成，"
                     "当前状态=%s，不再覆盖为 EXECUTING", self._state
                 )
-        return {"ok": True, "message": "已恢复执行"}
+        return {"ok": True, "message": "已恢复执行", "result": result}
 
     # ── FP SelectTarget 手动切换 ────────────────────────────
 
@@ -743,8 +827,8 @@ class StepDebugController:
         task_idx = self._plan[self._current_index].task_index
         for step in self._plan:
             if step.task_index == task_idx and step.tool == "move_to":
-                sx = step.args.get("slot_nav2_x")
-                sy = step.args.get("slot_nav2_y")
+                sx = step.annotations.get("slot_nav2_x", step.args.get("slot_nav2_x"))
+                sy = step.annotations.get("slot_nav2_y", step.args.get("slot_nav2_y"))
                 if sx is not None and sy is not None:
                     return (float(sx), float(sy))
         return (None, None)
@@ -758,9 +842,16 @@ class StepDebugController:
         """
         # ── 退出单目标 ──
         if self._select_target_active:
-            if hasattr(self._adapter, "select_target_public"):
-                self._adapter.select_target_public(select=False, step_id="manual")
+            self._skill_dispatcher.execute_legacy(
+                "clear_target", {},
+                request_id="step_debug_manual",
+                goal_id="step_debug_manual",
+                step_id="manual-clear-target",
+                source="step_debug_manual",
+                idempotency_key=f"step-debug-plan:{self._plan_epoch}:clear:manual",
+            )
             self._select_target_active = False
+            self._locked_object_id = None
             logger.info("select_target_toggle: 手动退出单目标模式")
             return {"ok": True, "active": False, "message": "已退出单目标模式"}
 
@@ -772,20 +863,20 @@ class StepDebugController:
                 "message": "未加载 plan 或 plan 中无 slot 坐标，无法确定 pick 点",
             }
 
-        if not hasattr(self._adapter, "select_target_public"):
-            return {"ok": False, "message": "adapter 不支持 SelectTarget"}
-
-        result = self._adapter.select_target_public(
-            select=True,
-            pick_x=pick_x,
-            pick_y=pick_y,
-            material_points_xy=[pick_x, pick_y],
-            step_id="manual",
+        result = self._skill_dispatcher.execute_legacy(
+            "select_target",
+            {"pick_x": pick_x, "pick_y": pick_y, "material_points_xy": [pick_x, pick_y]},
+            request_id="step_debug_manual",
+            goal_id="step_debug_manual",
+            step_id="manual-select-target",
+            source="step_debug_manual",
+            idempotency_key=f"step-debug-plan:{self._plan_epoch}:select:{self._current_index}",
         )
 
         matched_id = result.get("matched_object_id", -1) if result else -1
-        if result and result.get("success") and matched_id >= 0:
+        if result and result.get("status") == "ok" and matched_id >= 0:
             self._select_target_active = True
+            self._locked_object_id = matched_id
             return {
                 "ok": True,
                 "active": True,
@@ -794,15 +885,15 @@ class StepDebugController:
             }
         else:
             msg = result.get("message", "锁定失败") if result else "SelectTarget 服务不可用"
-            if result and result.get("success") and matched_id < 0:
+            if result and result.get("status") == "ok" and matched_id < 0:
                 msg = f"FP 服务返回成功但未匹配到物体 (matched_object_id={matched_id})"
             return {"ok": False, "active": False, "message": msg}
 
     def abort(self) -> dict[str, Any]:
         """终止调试会话，重置所有状态。
 
-        终止后状态回到 idle，可立即加载新 plan 重新开始实验，
-        无需重启 TaskManger。
+        终止后本地状态回到 idle；如物理调用仍在 draining，
+        可加载新 plan，但后续动作会由 dispatcher 以 RESOURCE_BUSY 拒绝。
 
         核心策略：
         1. 置 _stop_flag + 递增 _execution_id 使旧线程失效
@@ -820,35 +911,74 @@ class StepDebugController:
             self._step_logs.clear()
             self._collector.clear()
 
+        backend_draining = False
+
         # 等待后台线程退出
         if self._exec_thread and self._exec_thread.is_alive():
-            self._exec_thread.join(timeout=5.0)
+            self._exec_thread.join(timeout=self._abort_join_timeout_s)
             if self._exec_thread.is_alive():
+                backend_draining = True
                 logger.warning(
-                    "abort: 线程 %s 5s 内未退出（卡在 adapter 调用中），"
+                    "abort: 线程 %s %.2fs 内未退出（卡在 adapter 调用中），"
                     "已 detach。旧线程返回后会因 execution_id 不匹配而静默退出。",
                     self._exec_thread.name,
+                    self._abort_join_timeout_s,
                 )
                 self._exec_thread = None  # detach，不阻塞后续 execute
+
+        auto_thread = getattr(self, "_auto_thread", None)
+        if auto_thread and auto_thread.is_alive():
+            auto_thread.join(timeout=self._abort_join_timeout_s)
+            if auto_thread.is_alive():
+                backend_draining = True
+                logger.warning(
+                    "abort: 自动执行线程 5s 内未退出；物理调用仍由 SkillDispatcher "
+                    "持有写锁并进入 draining，后续动作将收到 RESOURCE_BUSY"
+                )
 
         # 退出 FP 单目标模式（如果已激活）
         if self._select_target_active:
             try:
-                if hasattr(self._adapter, "select_target_public"):
-                    self._adapter.select_target_public(select=False, step_id="abort")
+                self._skill_dispatcher.execute_legacy(
+                    "clear_target", {},
+                    request_id="step_debug_abort",
+                    goal_id="step_debug_abort",
+                    step_id="abort-clear-target",
+                    source="step_debug",
+                    idempotency_key=f"step-debug-abort:{self._execution_id}:clear",
+                )
             except Exception as e:
                 logger.error("abort 退出 SelectTarget 失败: %s", e)
             self._select_target_active = False
+            self._locked_object_id = None
 
         # 清理 adapter 状态
+        reset_result = None
         try:
-            if hasattr(self._adapter, "reset"):
-                self._adapter.reset()
+            reset_result = self._skill_dispatcher.execute_legacy(
+                "adapter_reset", {},
+                request_id="step_debug_abort",
+                goal_id="step_debug_abort",
+                step_id="abort-reset",
+                source="step_debug",
+                idempotency_key=f"step-debug-abort:{self._execution_id}:reset",
+            )
         except Exception as e:
             logger.error("abort 清理 adapter 失败: %s", e)
 
         logger.info("abort: 调试会话已终止，状态已重置为 idle")
-        return {"ok": True, "message": "调试会话已终止，可重新加载任务"}
+        if reset_result and reset_result.get("error_code") == "RESOURCE_BUSY":
+            backend_draining = True
+        return {
+            "ok": True,
+            "message": (
+                "本地调试会话已终止；在途动作仍在排空"
+                if backend_draining
+                else "调试会话已终止，可重新加载任务"
+            ),
+            "backend_draining": backend_draining,
+            "physical_stop_confirmed": False,
+        }
 
     # ═══════════════════════════════════════════════════════════
     # 掉箱处理（手动重规划）
@@ -856,17 +986,15 @@ class StepDebugController:
 
     def enable_drop_detector(self) -> dict[str, Any]:
         """开启掉箱检测节点并返回当前状态"""
-        with self._lock:
-            if hasattr(self._adapter, "enable_drop_detector"):
-                return self._adapter.enable_drop_detector()
-            return {"ok": False, "message": "adapter 不支持掉箱检测"}
+        return self._dispatch_internal(
+            "drop_detector_enable", suffix="drop-detector-enable"
+        )
 
     def disable_drop_detector(self) -> dict[str, Any]:
         """关闭掉箱检测节点"""
-        with self._lock:
-            if hasattr(self._adapter, "disable_drop_detector"):
-                return self._adapter.disable_drop_detector()
-            return {"ok": False, "message": "adapter 不支持掉箱检测"}
+        return self._dispatch_internal(
+            "drop_detector_disable", suffix="drop-detector-disable"
+        )
 
     def pause_robot(self) -> dict[str, Any]:
         """暂停 Nav2 导航。
@@ -874,41 +1002,27 @@ class StepDebugController:
         🆕 改用 /nav_reached 状态模型：发送暂停信号后等待 Nav2 确认到达。
         上游订阅 nav_reached 属性即可判断机器人是否已停。
         """
-        with self._lock:
-            if hasattr(self._adapter, "pause_navigation"):
-                self._adapter.pause_navigation()
-                # 🆕 检查 /nav_reached 状态确认暂停生效
-                nav_reached = None
-                if hasattr(self._adapter, "nav_reached"):
-                    nav_reached = self._adapter.nav_reached
-                return {
-                    "ok": True,
-                    "message": "已发送暂停信号",
-                    "nav_reached": nav_reached,  # 供前端确认
-                }
-            return {"ok": False, "message": "adapter 不支持暂停"}
+        result = self._dispatch_internal(
+            "pause_navigation", suffix="pause-robot"
+        )
+        nav_reached = self._query_runtime_snapshot(
+            suffix="pause-robot-state"
+        ).get("nav_reached")
+        return {**result, "nav_reached": nav_reached}
 
     def resume_robot(self) -> dict[str, Any]:
         """恢复 Nav2 导航（发送 /nav_pause=false）。"""
-        with self._lock:
-            if hasattr(self._adapter, "resume_navigation"):
-                self._adapter.resume_navigation()
-                return {"ok": True, "message": "已发送恢复信号"}
-            return {"ok": False, "message": "adapter 不支持恢复"}
+        return self._dispatch_internal(
+            "resume_navigation", suffix="resume-robot"
+        )
 
     def stand_robot(self) -> dict[str, Any]:
         """切换机器人为站立模式"""
-        with self._lock:
-            if hasattr(self._adapter, "stand_robot"):
-                return self._adapter.stand_robot()
-            return {"ok": False, "message": "adapter 不支持站立"}
+        return self._dispatch_internal("stand", suffix="stand-robot")
 
     def step_back_robot(self) -> dict[str, Any]:
         """让机器人后退两步（调用 /Step_back 服务）。"""
-        with self._lock:
-            if hasattr(self._adapter, "step_back_robot"):
-                return self._adapter.step_back_robot()
-            return {"ok": False, "message": "adapter 不支持后退"}
+        return self._dispatch_internal("step_back", suffix="step-back-robot")
 
     # ═══════════════════════════════════════════════════════════
     # 通信预案（计划卡住 → 回物料点重试）
@@ -953,17 +1067,24 @@ class StepDebugController:
             self._plan_steps[stock_index]["status"] = "current"
 
             self._current_index = stock_index
+            # This operator action explicitly starts a new logical execution
+            # of the rewound steps after reconciliation.
+            self._plan_epoch += 1
             self._state = ST_STEP_READY
 
-            # ── 5. 可选：取消当前导航 ──
-            if hasattr(self._adapter, 'pause_navigation'):
-                try:
-                    self._adapter.pause_navigation()
-                except Exception:
-                    pass
+            # ── 5. 可选：请求暂停当前导航 ──
+            pause_result = self._dispatch_internal(
+                "pause_navigation", suffix="reset-to-stock-pause"
+            )
+            if not pause_result.get("ok"):
+                logger.warning(
+                    "reset_to_stock: pause request not confirmed: %s",
+                    pause_result.get("error_code"),
+                )
 
             # ── 6. 退出 FP 单目标模式 ──
             self._select_target_active = False
+            self._locked_object_id = None
 
             logger.info(
                 "reset_to_stock: 已回退到物料点步骤 step %d, 状态 step_ready",
@@ -985,11 +1106,15 @@ class StepDebugController:
             if i >= len(self._plan):
                 continue
             step = self._plan[i]
-            if step.tool == "move_to" and "slot_nav2_x" in step.args:
+            if step.tool == "move_to" and (
+                "slot_nav2_x" in step.annotations or "slot_nav2_x" in step.args
+            ):
                 return i
         # fallback: 从计划开头找第一个物料点步骤
         for i, step in enumerate(self._plan):
-            if step.tool == "move_to" and "slot_nav2_x" in step.args:
+            if step.tool == "move_to" and (
+                "slot_nav2_x" in step.annotations or "slot_nav2_x" in step.args
+            ):
                 return i
         return -1
 
@@ -1051,15 +1176,18 @@ class StepDebugController:
         """后台线程：导航到机器人原点。"""
         t_start = time.monotonic()
         try:
-            result = self._adapter.execute(
+            result = self._skill_dispatcher.execute_legacy(
                 tool=move_step.tool,
                 args=move_step.args,
                 request_id="go_origin",
                 goal_id="go_origin",
                 step_id=move_step.step_id,
+                source="step_debug_go_origin",
+                annotations=move_step.annotations,
+                idempotency_key=f"go-origin:{my_exec_id}:{move_step.step_id}",
             )
         except Exception as e:
-            logger.exception("go_origin adapter.execute 异常: %s", e)
+            logger.exception("go_origin dispatcher 异常: %s", e)
             result = {
                 "status": "error",
                 "error_code": "ADAPTER_EXCEPTION",
@@ -1092,20 +1220,18 @@ class StepDebugController:
     def identify_dropped_box(self) -> dict[str, Any]:
         """调用 FP 识别掉落箱子（MODE_DROPPED）"""
         with self._lock:
-            if not hasattr(self._adapter, "identify_dropped_box"):
-                return {"ok": False, "message": "adapter 不支持掉箱识别"}
             # 从当前 plan 中提取所有物料点和目标点坐标
             material_xy = []
             target_xy = []
             if self._plan:
                 for s in self._plan:
                     if s.tool == "move_to":
-                        sx = float(s.args.get("slot_nav2_x", 0))
-                        sy = float(s.args.get("slot_nav2_y", 0))
+                        sx = float(s.annotations.get("slot_nav2_x", s.args.get("slot_nav2_x", 0)))
+                        sy = float(s.annotations.get("slot_nav2_y", s.args.get("slot_nav2_y", 0)))
                         if sx or sy:
                             material_xy.extend([sx, sy])
-                        gx = float(s.args.get("grid_nav2_x", 0))
-                        gy = float(s.args.get("grid_nav2_y", 0))
+                        gx = float(s.annotations.get("grid_nav2_x", s.args.get("grid_nav2_x", 0)))
+                        gy = float(s.annotations.get("grid_nav2_y", s.args.get("grid_nav2_y", 0)))
                         if gx or gy:
                             target_xy.extend([gx, gy])
             # 去重：取每对的唯一值
@@ -1116,20 +1242,23 @@ class StepDebugController:
                 if key not in seen:
                     seen.add(key)
                     material_xy_dedup.extend([material_xy[i], material_xy[i+1]])
-            return self._adapter.identify_dropped_box(
-                material_points_xy=material_xy_dedup,
-                target_points_xy=target_xy,
-            )
+        return self._dispatch_internal(
+            "identify_dropped",
+            {
+                "material_points_xy": material_xy_dedup,
+                "target_points_xy": target_xy,
+            },
+            suffix="identify-dropped",
+        )
 
     def replan_pick(self) -> dict[str, Any]:
         """用掉落箱子位姿执行重规划搬起"""
-        with self._lock:
-            if hasattr(self._adapter, "replan_pick"):
-                result = self._adapter.replan_pick()
-                return {"ok": result.get("status") == "ok",
-                        "message": result.get("message", ""),
-                        "result": result}
-            return {"ok": False, "message": "adapter 不支持重规划搬起"}
+        result = self._dispatch_internal("replan_pick", suffix="replan-pick")
+        return {**result, "result": result}
+
+    def reset_foundationpose(self) -> dict[str, Any]:
+        """Reset FoundationPose through the operator-only skill capability."""
+        return self._dispatch_internal("reset_fp", suffix="reset-fp")
 
     # ═══════════════════════════════════════════════════════════
     # 自动化掉箱处理（auto mode 专用）
@@ -1141,47 +1270,13 @@ class StepDebugController:
         仅自动执行期间可用，当前步骤不可为 pick/place。
         spawn 后台线程执行恢复序列，立即返回。
         """
-        with self._lock:
-            # 校验：自动执行必须正在运行
-            if not self._auto_thread or not self._auto_thread.is_alive():
-                return {"ok": False,
-                        "message": "自动执行未在运行，无需掉箱恢复"}
-
-            # 校验：当前步骤不可为 pick / place（搬起/放下动作不可打断）
-            if self._current_index < len(self._plan):
-                cur_tool = self._plan[self._current_index].tool
-                if cur_tool in ("pick", "place"):
-                    return {"ok": False,
-                            "message": f"当前步骤为 {cur_tool}，不可在搬起/放下期间触发掉箱恢复"}
-
-            saved_index = self._current_index
-
-            # 中止当前自动执行线程
-            self._stop_flag.set()
-            self._execution_id += 1
-            recovery_epoch = self._execution_id
-
-            # 清空旧诊断事件，避免残留的 DiagEvent 污染恢复周期
-            self._collector.clear()
-
-            # 暂停机器人
-            try:
-                if hasattr(self._adapter, "pause_navigation"):
-                    self._adapter.pause_navigation()
-            except Exception as e:
-                logger.error("auto_drop_recovery: pause_navigation 失败: %s", e)
-
-            # 启动恢复线程
-            t = threading.Thread(
-                target=self._run_drop_recovery,
-                args=(recovery_epoch, saved_index),
-                daemon=True,
-            )
-            self._auto_thread = t
-            t.start()
-
-        return {"ok": True, "status": "recovery_started",
-                "saved_index": saved_index}
+        # Autonomous recovery is intentionally outside Phase 0/1.  Keep the
+        # existing HTTP endpoint but make the boundary explicit and fail-safe.
+        return {
+            "ok": False,
+            "error_code": "UNSUPPORTED_CAPABILITY",
+            "message": "Phase 1 禁止自主掉箱恢复；请切换人工接管并按 HIL 流程处理",
+        }
 
     def _run_drop_recovery(self, exec_id: int, saved_index: int) -> None:
         """自动化掉箱恢复序列（后台线程）。
@@ -1205,8 +1300,11 @@ class StepDebugController:
                 return
             log("running", "正在切换站立模式...")
             try:
-                if hasattr(self._adapter, "stand_robot"):
-                    self._adapter.stand_robot()
+                stand_result = self._dispatch_internal(
+                    "stand", suffix=f"recovery-{exec_id}-stand"
+                )
+                if not stand_result.get("ok"):
+                    raise RuntimeError(stand_result.get("message", "stand failed"))
                 # ★ 同步 Python safety_fsm，否则 can_walk() 仍返回 False
                 safety_fsm.force_state(RobotState.STANDING)
                 log("ok", "站立模式完成")
@@ -1225,14 +1323,13 @@ class StepDebugController:
                 return
             log("running", "正在后退一步 (/Step_back)...")
             try:
-                if hasattr(self._adapter, "step_back_robot"):
-                    sb_result = self._adapter.step_back_robot()
-                    if sb_result.get("ok"):
-                        log("ok", "后退完成")
-                    else:
-                        log("error", f"后退失败（非致命，继续流程）: {sb_result.get('message', '')}")
+                sb_result = self._dispatch_internal(
+                    "step_back", suffix=f"recovery-{exec_id}-step-back"
+                )
+                if sb_result.get("ok"):
+                    log("ok", "后退完成")
                 else:
-                    log("error", "adapter 不支持后退，跳过")
+                    log("error", f"后退失败（非致命，继续流程）: {sb_result.get('message', '')}")
             except Exception as e:
                 log("error", f"后退异常（非致命，继续流程）: {e}")
 
@@ -1250,8 +1347,7 @@ class StepDebugController:
                 if _aborted():
                     return
                 try:
-                    if hasattr(self, "identify_dropped_box"):
-                        ident_result = self.identify_dropped_box()
+                    ident_result = self.identify_dropped_box()
                 except Exception as e:
                     log("error", f"识别掉落箱异常: {e}")
                     self._fail_recovery(exec_id)
@@ -1305,14 +1401,14 @@ class StepDebugController:
             if _aborted():
                 return
             try:
-                if (hasattr(self._adapter, "select_target_public")
-                        and self._select_target_active):
-                    self._adapter.select_target_public(
-                        select=False, step_id="recovery_exit"
+                if self._select_target_active:
+                    self._dispatch_internal(
+                        "clear_target", suffix=f"recovery-{exec_id}-clear"
                     )
             except Exception as e:
                 logger.error("recovery: 退出 SelectTarget 失败: %s", e)
             self._select_target_active = False
+            self._locked_object_id = None
 
             # ── 步骤 10: 判断恢复路径 ──
             if _aborted():
@@ -1322,26 +1418,23 @@ class StepDebugController:
             saved_tool = saved_step.tool if saved_step else ""
 
             if saved_tool == "move_to":
-                # 路径 B：已在 move_to 中 → 恢复行走，不重发导航目标
-                resume_index = saved_index
-                self._skip_nav_resend = True
-                log("ok", "路径B: 恢复行走 → 继续等待 nav_reached")
+                # Phase 1 explicitly forbids resuming an in-flight navigation
+                # without reconciling its physical outcome first.
+                log("error", "路径B已禁用：在途导航结果必须先人工核对")
+                self._fail_recovery(exec_id)
+                return
             else:
                 # 路径 A（saved 为 pick 或其它）：发新导航目标
                 resume_index = self._find_resume_index(saved_index)
-                self._skip_nav_resend = False
                 log("ok", f"路径A: 发送导航目标 → resume_index={resume_index}")
 
             # ── 恢复导航 ──
             try:
-                if hasattr(self._adapter, "resume_navigation"):
-                    self._adapter.resume_navigation()
+                self._dispatch_internal(
+                    "resume_navigation", suffix=f"recovery-{exec_id}-resume"
+                )
             except Exception as e:
                 logger.error("recovery: resume_navigation 失败: %s", e)
-
-            # ── 在 adapter 上设置 skip_nav_resend 标记 ──
-            if hasattr(self._adapter, "skip_nav_resend"):
-                self._adapter.skip_nav_resend = self._skip_nav_resend
 
             # ── 重启自动执行 ──
             with self._lock:
@@ -1353,7 +1446,7 @@ class StepDebugController:
                 self._stop_flag.clear()
 
             # 内联重启 _run_auto（同一线程，不额外 spawn）
-            self._run_auto(exec_id)
+            self._run_auto(exec_id, self._plan_epoch)
 
         except Exception as e:
             logger.exception("_run_drop_recovery: 未预期异常")
@@ -1392,13 +1485,14 @@ class StepDebugController:
 
     def get_state(self) -> dict[str, Any]:
         """同步快照，返回完整状态供前端渲染。"""
+        runtime = self._query_runtime_snapshot(suffix="get-step-debug-state")
         with self._lock:
-            nav_reached = None
-            if hasattr(self._adapter, "nav_reached"):
-                nav_reached = self._adapter.nav_reached
-            locked_object_id = None
-            if self._select_target_active and hasattr(self._adapter, "_fp_target_object_id"):
-                locked_object_id = self._adapter._fp_target_object_id
+            nav_reached = runtime.get("nav_reached")
+            locked_object_id = (
+                runtime.get("locked_object_id", self._locked_object_id)
+                if self._select_target_active
+                else None
+            )
             return {
                 "mode": "step_debug",
                 "state": self._state,
@@ -1430,22 +1524,30 @@ class StepDebugController:
     def _run_step(self, step: PlanStep) -> None:
         """后台线程：执行单个 PlanStep，完成后更新状态机。
 
-        不持有 _lock 执行 adapter.execute()（可能耗时 30s+）。
+        不持有 _lock 执行 dispatcher（可能耗时 30s+）。
         通过 execution_id 防止旧线程污染新执行的状态。
         """
         my_exec_id = self._execution_id  # 拍快照 — 线程启动时的 epoch
+        plan_epoch = self._plan_epoch
 
         t_start = time.monotonic()
         try:
-            result = self._adapter.execute(
+            result = self._skill_dispatcher.execute_legacy(
                 tool=step.tool,
                 args=step.args,
+                version=step.skill_version,
                 request_id="step_debug",
                 goal_id="step_debug",
                 step_id=step.step_id,
+                source="step_debug_manual",
+                annotations={
+                    **step.annotations,
+                    "target_preselected": self._select_target_active,
+                },
+                idempotency_key=f"step-debug-plan:{plan_epoch}:{step.step_id}",
             )
         except Exception as e:
-            logger.exception("adapter.execute 异常: %s", e)
+            logger.exception("dispatcher 异常: %s", e)
             result = {
                 "status": "error",
                 "error_code": "ADAPTER_EXCEPTION",
@@ -1488,6 +1590,10 @@ class StepDebugController:
                 timestamp=StepLog.now(),
             )
             self._step_logs.append(log)
+            current_view = self._plan_steps[self._current_index]
+            current_view["invocation_id"] = result.get("invocation_id")
+            current_view["outcome"] = result.get("outcome")
+            current_view["error_category"] = result.get("error_category")
 
             if is_ok:
                 self._plan_steps[self._current_index]["status"] = "completed"
@@ -1526,5 +1632,6 @@ def _summarize_step_args(tool: str, args: dict[str, Any]) -> str:
     if tool == "pick":
         return f"object={args.get('object_id', '?')}"
     if tool == "place":
-        return f"({args.get('x', '?')}, {args.get('y', '?')})"
+        target = args.get("target", args)
+        return f"({target.get('x', '?')}, {target.get('y', '?')})"
     return tool

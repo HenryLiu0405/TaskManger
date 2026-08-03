@@ -1,9 +1,9 @@
 """
 Move-to passthrough adapter for acceptance testing.
 
-Only move_to targeting the 9-grid positions is forwarded to the real device;
-all other tools (including move_to to stock slots at y=3.5) return a trivial
-ok response so the mission loop can advance without touching any simulator.
+Only move_to targeting the 9-grid positions is forwarded to the real device.
+Every other capability is rejected explicitly so an acceptance run cannot
+report success for an action that never happened.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ REAL_MOVE_TO_TARGETS = {
 
 
 class MoveToPassthroughAdapter:
-    """Acceptance-test adapter: forward 9-grid move_to to a real endpoint, skip everything else."""
+    """Acceptance adapter: forward one scoped capability and reject the rest."""
 
     def __init__(self, move_to_url: str, timeout_s: float = 60.0):
         self.move_to_url = move_to_url.rstrip("/")
@@ -51,14 +51,15 @@ class MoveToPassthroughAdapter:
     ) -> dict[str, Any]:
         if tool == "move_to" and self._is_grid_target(args):
             return self._forward_move_to(args)
-        # pick / place / get_pose / get_gripper_state / stock-slot move_to — skip
+        # pick / place / queries / stock-slot navigation are outside the
+        # explicitly authorized acceptance surface.
         return {
             "request_id": request_id,
             "goal_id": goal_id,
             "step_id": step_id,
-            "status": "ok",
-            "error_code": None,
-            "message": "acceptance: skipped",
+            "status": "error",
+            "error_code": "UNSUPPORTED_CAPABILITY",
+            "message": f"acceptance adapter does not implement {tool} for this target",
             "state": self._minimal_state(),
             "metrics": {},
         }

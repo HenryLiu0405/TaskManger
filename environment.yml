@@ -1,0 +1,10 @@
+name: AgenticRobot
+channels:
+  - conda-forge
+dependencies:
+  - "python=3.10.*"
+  - "pip>=24,<26"
+  - "flask>=3.0,<4.0"
+  - "flask-cors>=4.0,<5.0"
+  - "jsonschema>=4.23,<5.0"
+  - "pytest>=8.3,<9.0"

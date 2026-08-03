@@ -1,0 +1,272 @@
+{
+  "catalog_version": "1.0.0",
+  "frozen_at": "2026-07-31",
+  "target_runtime": {
+    "os": "Ubuntu 22.04",
+    "ros_distribution": "Humble",
+    "python": "3.10"
+  },
+  "release_policy": {
+    "offline_default": true,
+    "ros_phase1_default": "legacy-direct",
+    "hil_requires_separate_approval": true
+  },
+  "interface_record_model": {
+    "required_effective_fields": [
+      "owner", "ros_distribution", "qos", "frame", "units", "timeout_s",
+      "idempotency", "success_terminal"
+    ],
+    "inheritance": "An omitted field inherits the value below; null means the owner must confirm it before ROS-backed rollout.",
+    "defaults": {
+      "ros_distribution": "Humble",
+      "qos": "not applicable for service; owner confirmation required for an omitted topic QoS",
+      "frame": "not applicable",
+      "units": "not applicable",
+      "timeout_s": null,
+      "idempotency": "read-only/not applicable unless overridden",
+      "success_terminal": "owner-defined state described by the interface-specific semantics"
+    }
+  },
+  "resolved_conflicts": [
+    {
+      "topic": "navigation service name",
+      "decision": "/start_navigation is authoritative; /path_plan and phi_robot_interfaces/PathPlan are deprecated"
+    },
+    {
+      "topic": "ROS distribution",
+      "decision": "Humble is authoritative; run_ros_acceptance.sh no longer sources Jazzy"
+    },
+    {
+      "topic": "odometry",
+      "decision": "application consumes /odom; the ZMQ boundary maps hardware /Odometry to /odom"
+    },
+    {
+      "topic": "SubmitCarryTask identity and frame",
+      "decision": "request_id equals the dispatcher idempotency key; authoritative configured body frame is pelvis"
+    },
+    {
+      "topic": "ExecuteTrajectory response",
+      "decision": "robot_interfaces/ExecuteTrajectory response contains bool success and string message"
+    }
+  ],
+  "interfaces": [
+    {
+      "id": "navigation.start",
+      "owner": "navigation/goal-bridge owner",
+      "kind": "ros_service",
+      "name": "/start_navigation",
+      "type": "robot_interfaces/srv/ExecuteTrajectory",
+      "request": {"trajectory_json": "JSON string with target_x[m], target_y[m], yaw[rad], walk[bool]"},
+      "response": {"success": "bool", "message": "string"},
+      "qos": "service default reliable",
+      "frame": "map",
+      "timeout_s": 60,
+      "idempotency": "not guaranteed by service; protected by dispatcher invocation",
+      "success_terminal": "service accepted/completed its bridge contract; not robot arrival",
+      "ros_distribution": "Humble"
+    },
+    {
+      "id": "navigation.reached",
+      "owner": "Nav2 monitor owner",
+      "kind": "ros_topic",
+      "name": "/nav_reached",
+      "type": "std_msgs/msg/Bool",
+      "direction": "subscribe",
+      "qos": "depth 10, ROS default reliable",
+      "units": "boolean",
+      "stale_after_s": 600,
+      "success_terminal": "fresh true after the current navigation goal; position <0.35m, yaw <10deg, stable 1.5s"
+    },
+    {
+      "id": "navigation.pause",
+      "owner": "Nav2 control owner",
+      "kind": "ros_topic",
+      "name": "/nav_pause",
+      "type": "std_msgs/msg/Bool",
+      "direction": "publish",
+      "qos": "depth 10, ROS default reliable",
+      "semantics": "true requests pause; false requests resume",
+      "success_terminal": "no acknowledgement exists in Phase 1; publish is not confirmed stop"
+    },
+    {
+      "id": "odometry.application",
+      "owner": "ZMQ bridge owner",
+      "kind": "ros_topic",
+      "name": "/odom",
+      "hardware_source": "/Odometry",
+      "type": "nav_msgs/msg/Odometry",
+      "direction": "subscribe",
+      "qos": "depth 10, ROS default reliable",
+      "frame": "message header/child frame from hardware bridge",
+      "units": "m, rad",
+      "success_terminal": "latest cache only; not an action completion signal"
+    },
+    {
+      "id": "foundationpose.select_target",
+      "owner": "FoundationPose repository owner",
+      "kind": "ros_service_external_snapshot",
+      "name": "/foundationpose/select_target",
+      "type": "foundationpose_ros2/srv/SelectTarget",
+      "request": {
+        "mode": "int (0 target, 1 dropped)",
+        "select": "bool",
+        "pick_x": "float m in map",
+        "pick_y": "float m in map",
+        "material_points_xy": "float[] m",
+        "target_points_xy": "float[] m",
+        "point_tolerance": "float m"
+      },
+      "response": {
+        "success": "bool",
+        "message": "string",
+        "matched_object_id": "int32 required",
+        "box_world_xy": "float[]",
+        "box_object_ids": "int32[] required"
+      },
+      "timeout_s": 3,
+      "idempotency": "select=false is cleanup-idempotent; select=true starts a new observation epoch",
+      "success_terminal": "success=true and matched_object_id>=0 for target selection",
+      "snapshot_status": "owner version/hash must be confirmed before ROS skills/HIL"
+    },
+    {
+      "id": "foundationpose.pose_results",
+      "owner": "FoundationPose repository owner",
+      "kind": "ros_topic_external_snapshot",
+      "name": "/foundationpose/pose_results",
+      "type": "foundationpose_ros2/msg/PoseEstimateArray",
+      "direction": "subscribe",
+      "qos": "depth 10, ROS default reliable",
+      "required_object_fields": ["object_id", "state", "header", "pose"],
+      "frame": "pelvis",
+      "stale_after_s": 1.5,
+      "match_rule": "sample received after current selection epoch, object_id matches selected target, state>=1",
+      "success_terminal": "fresh matching pose exists",
+      "snapshot_status": "owner version/hash must be confirmed before ROS skills/HIL"
+    },
+    {
+      "id": "foundationpose.activate",
+      "owner": "FoundationPose repository owner",
+      "kind": "ros_service_external_snapshot",
+      "name": "/foundationpose/activate",
+      "type": "foundationpose_ros2/srv/Activate",
+      "request": {"activate": "bool"},
+      "response": {"success": "bool", "message": "string"},
+      "timeout_s": 3,
+      "planner_visible": false
+    },
+    {
+      "id": "foundationpose.reset",
+      "owner": "FoundationPose repository owner",
+      "kind": "ros_service_external_snapshot",
+      "name": "/foundationpose/reset",
+      "type": "foundationpose_ros2/srv/Reset",
+      "response": {"success": "bool", "message": "string"},
+      "timeout_s": 3,
+      "operator_only": true
+    },
+    {
+      "id": "gateway.submit_carry",
+      "owner": "Gateway owner",
+      "kind": "ros_service",
+      "name": "/submit_carry_task",
+      "type": "gear_sonic_interfaces/srv/SubmitCarryTask",
+      "request": {
+        "request_id": "stable dispatcher idempotency key",
+        "command": "carry",
+        "object_pose": "geometry_msgs/PoseStamped"
+      },
+      "response": {
+        "accepted": "bool",
+        "selected_action": "string",
+        "target_x_y_z": "float64 m",
+        "distance": "float64 m",
+        "yaw_deg": "float64 deg",
+        "message": "string"
+      },
+      "frame": "pelvis (WAIC_CARRY_TARGET_FRAME)",
+      "timeout_s": 10,
+      "idempotency": "reusing an accepted request_id must not start a second motion",
+      "success_terminal": "accepted=true only means accepted; HOLDING/ready verification is still required"
+    },
+    {
+      "id": "gateway.notify_goal_reached",
+      "owner": "Gateway owner",
+      "kind": "ros_service",
+      "name": "/notify_goal_reached",
+      "type": "std_srvs/srv/SetBool",
+      "request": {"data": true},
+      "timeout_s": 5,
+      "idempotency": "repeated notification in terminal carry state must be safe",
+      "success_terminal": "gateway reports success or already goal_reached_locked"
+    },
+    {
+      "id": "gateway.lay_down",
+      "owner": "Gateway owner",
+      "kind": "ros_service",
+      "name": "/set_lay_down",
+      "type": "std_srvs/srv/SetBool",
+      "request": {"data": true},
+      "timeout_s": 60,
+      "idempotency": "no implicit retry",
+      "success_terminal": "service success, followed by replay/release verification"
+    },
+    {
+      "id": "gateway.stand",
+      "owner": "Gateway owner",
+      "kind": "ros_service",
+      "name": "/set_stand",
+      "type": "std_srvs/srv/Trigger",
+      "timeout_s": 60,
+      "idempotency": "standing terminal state may be treated as already complete",
+      "success_terminal": "posture_state is stand and gateway ready"
+    },
+    {
+      "id": "gateway.replay",
+      "owner": "Gateway owner",
+      "kind": "ros_service",
+      "name": "/request_replay",
+      "type": "std_srvs/srv/Trigger",
+      "timeout_s": 60,
+      "idempotency": "already active/finished is a successful terminal response",
+      "success_terminal": "replay_active=false"
+    },
+    {
+      "id": "gateway.input_source",
+      "owner": "Gateway owner",
+      "kind": "ros_service_and_topic",
+      "service": "/control/set_input_source",
+      "state_topic": "/control/input_source_state",
+      "type": "std_srvs/srv/SetBool + std_msgs/msg/String(JSON)",
+      "semantics": "true GAMEPAD; false ROS2",
+      "qos": "service default reliable; state topic depth 10 reliable",
+      "timeout_s": 5,
+      "idempotency": "setting the same boolean source is idempotent; no implicit retry",
+      "operator_only": true,
+      "success_terminal": "state topic reports requested active_source"
+    },
+    {
+      "id": "gateway.locomotion_mode",
+      "owner": "Gateway owner",
+      "kind": "ros_topic_and_service",
+      "publish_topic": "/locomotion_mode",
+      "query_service": "/get_locomotion_mode",
+      "types": "std_msgs/msg/Int32 + std_srvs/srv/Trigger(JSON message)",
+      "operator_only": true
+    },
+    {
+      "id": "drop.status",
+      "owner": "drop detector owner",
+      "kind": "ros_topics",
+      "enable": "/vision/drop_detector_enable std_msgs/msg/Bool",
+      "status": "/vision/box_drop_status std_msgs/msg/Bool",
+      "semantics": "status true means object present; false means dropped",
+      "planner_visible": false
+    }
+  ],
+  "hil_blockers": [
+    "Confirm the external FoundationPose service/message repository commit and int32 object ID fields",
+    "Confirm Gateway CARRY_TARGET_FRAME=pelvis and FP publishes actual transformed pelvis poses",
+    "Confirm /start_navigation bridge deployment uses the updated ExecuteTrajectory response",
+    "Run target-host Ubuntu/Humble/Python 3.10 preflight"
+  ]
+}

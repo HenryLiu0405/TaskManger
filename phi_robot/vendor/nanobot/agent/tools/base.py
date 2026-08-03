@@ -83,6 +83,8 @@ class Schema(ABC):
             for k, v in val.items():
                 if k in props:
                     errors.extend(Schema.validate_json_schema_value(v, props[k], Schema.subpath(path, k)))
+                elif schema.get("additionalProperties") is False:
+                    errors.append(f"unknown parameter {Schema.subpath(path, k)}")
         if t == "array":
             if "minItems" in schema and len(val) < schema["minItems"]:
                 errors.append(f"{label} must have at least {schema['minItems']} items")

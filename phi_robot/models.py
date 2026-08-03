@@ -56,6 +56,10 @@ class ToolResult:
     request_id: Optional[str] = None
     goal_id: Optional[str] = None
     step_id: Optional[str] = None
+    invocation_id: Optional[str] = None
+    outcome: str = ""
+    error_category: Optional[str] = None
+    verification: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -100,6 +104,10 @@ class PlanStep:
     args: Dict[str, Any]
     status: str = "pending"
     result: Optional[ToolResult] = None
+    skill_version: str = "1.0"
+    annotations: Dict[str, Any] = field(default_factory=dict)
+    invocation_id: Optional[str] = None
+    attempt: int = 0
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -165,6 +173,7 @@ class MissionRecord:
     scene_version: str
     stock_layout_version: str
     status: str
+    execution_epoch: int = 1
     plan: List[PlanStep] = field(default_factory=list)
     current_step_index: int = -1
     current_task_index: int = 0
@@ -186,6 +195,7 @@ class MissionRecord:
             "scene_version": self.scene_version,
             "stock_layout_version": self.stock_layout_version,
             "status": self.status,
+            "execution_epoch": self.execution_epoch,
             "plan": [step.to_dict() for step in self.plan],
             "current_step_index": self.current_step_index,
             "current_task_index": self.current_task_index,
