@@ -35,7 +35,8 @@ PYTHONPYCACHEPREFIX="${COMPILE_CACHE}" "${TASKMANAGER_PYTHON}" -m compileall -q 
   "${TASKMANAGER_ROOT}/phi_robot" \
   "${TASKMANAGER_ROOT}/tests" \
   "${TASKMANAGER_ROOT}/bridge" \
-  "${TASKMANAGER_ROOT}/run_phi_robot_api.py"
+  "${TASKMANAGER_ROOT}/run_phi_robot_api.py" \
+  "${TASKMANAGER_ROOT}/run_autonomy_api.py"
 PYTHONDONTWRITEBYTECODE=1 "${TASKMANAGER_PYTHON}" \
   "${TASKMANAGER_ROOT}/tests/offline/run_suite.py"
 npm --prefix "${TASKMANAGER_ROOT}/phi_robot_fronted" test

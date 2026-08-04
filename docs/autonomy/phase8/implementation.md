@@ -21,6 +21,15 @@ were not run.
   recovery, ID switches, stale rejection, confirmed-stop latency, and duplicate
   physical action count. Accuracy/false-recovery fields explicitly remain null
   until a labeled evaluation set exists.
+- `run_autonomy_api.py` is the guarded production composition. It reads the
+  ignored root `.env`, active robot profile, and scene coordinates, serves the
+  built React console on the API port, and has a non-ROS `--check-config` mode.
+  The existing systemd script selects it only when
+  `PHI_AUTONOMY_ENABLED=1`; otherwise the approved legacy entry remains active.
+- Every mutating production API (task submission, intervention, developer,
+  service, robot switch, and safety controls) accepts only a configured token
+  or a same-origin client in configured trusted CIDRs. No credential is placed
+  in the frontend build.
 
 ## Offline evidence and remaining gates
 
@@ -30,7 +39,7 @@ shapes, and trusted-authorizer denial/allow behavior. Frontend unit tests and a
 production Vite build are part of the offline gate.
 
 Raw keyframe retention/serving, labeled evaluation datasets, simulation,
-production authentication/TLS/retention, real provider cost tables, static
+production TLS/retention, real provider cost tables, static
 hardware checks, motion/manipulation HIL, natural-language HIL, injected-drop
 HIL, repeated operation, and long-duration operation remain. Phase 8 and the
 overall roadmap are therefore not complete.

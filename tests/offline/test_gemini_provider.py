@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from phi_robot.autonomy.gemini_provider import (
     DEFAULT_MODEL,
@@ -76,14 +78,15 @@ class FakeTransport:
 
 
 class GeminiProviderTests(unittest.TestCase):
-    def test_config_uses_official_er2_model_and_never_repr_displays_key(self):
+    def test_config_uses_official_robotics_model_and_never_repr_displays_key(self):
         with self.assertRaisesRegex(ValueError, "model ID must be non-empty"):
             GeminiRoboticsER2Config(api_key="test-only-secret", model="")
         default = GeminiRoboticsER2Config.from_env({
             "GEMINI_API_KEY": "test-only-secret",
         })
         self.assertEqual(default.model, DEFAULT_MODEL)
-        self.assertEqual(default.endpoint, INTERACTIONS_URL)
+        self.assertEqual(default.api_mode, "generate_content")
+        self.assertIn(DEFAULT_MODEL, default.endpoint)
         config = GeminiRoboticsER2Config.from_env({
             "GEMINI_API_KEY": "test-only-secret",
             "GEMINI_ROBOTICS_MODEL": DEFAULT_MODEL,
@@ -91,6 +94,24 @@ class GeminiProviderTests(unittest.TestCase):
         })
         self.assertNotIn("test-only-secret", repr(config))
         self.assertIn(DEFAULT_MODEL, config.endpoint)
+
+    def test_config_reads_root_style_dotenv_with_environment_override(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dotenv_path = Path(temp_dir) / ".env"
+            dotenv_path.write_text(
+                "GEMINI_API_KEY='file-only-secret'\n"
+                "GEMINI_ROBOTICS_MODEL=gemini-robotics-er-1.6-preview\n"
+                "GEMINI_API_MODE=generate_content\n",
+                encoding="utf-8",
+            )
+            config = GeminiRoboticsER2Config.from_env(
+                {"GEMINI_API_KEY": "process-secret"},
+                dotenv_path=dotenv_path,
+            )
+        self.assertEqual(config.api_key, "process-secret")
+        self.assertEqual(config.model, DEFAULT_MODEL)
+        self.assertEqual(config.api_mode, "generate_content")
+        self.assertNotIn("process-secret", repr(config))
 
     def test_interactions_request_sends_inline_bytes_and_structured_schema(self):
         transport = FakeTransport({

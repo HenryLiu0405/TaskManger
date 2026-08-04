@@ -23,6 +23,11 @@ camera, or hardware action was performed.
 - Recovery is a separate `RevisionKind.RECOVERY` graph with its own event/state
   timeline and bounded evidence-based re-pick attempts. One mission has at most
   one active recovery event.
+- The real adapter forwards the falling edge of `/vision/box_drop_status` to
+  the active recovery coordinator. Its interrupt publishes `/nav_pause`, breaks
+  the outstanding navigation wait, and confirms stop only after multiple fresh
+  `/odom` samples show stable low pose-delta and reported twist. Missing evidence
+  remains unconfirmed/intervention.
 
 ## Offline evidence and remaining gates
 

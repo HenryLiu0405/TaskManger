@@ -60,6 +60,7 @@ class SkillDispatcher:
         self.max_invocations = max(100, int(max_invocations))
         self.audit_enabled = audit_enabled
         self.composite_pick = composite_pick and mode == "skills"
+        self.default_robot_id = "active"
 
         self._guard = threading.RLock()
         self._robot_locks: dict[str, threading.Lock] = {}
@@ -289,7 +290,7 @@ class SkillDispatcher:
         goal_id: str,
         step_id: str,
         mission_id: str = "",
-        robot_id: str = "active",
+        robot_id: Optional[str] = None,
         source: str = "legacy",
         annotations: Optional[Mapping[str, Any]] = None,
         idempotency_key: str = "",
@@ -302,12 +303,15 @@ class SkillDispatcher:
         canonical_args, extracted_annotations = normalize_legacy_call(tool, args)
         merged_annotations = dict(extracted_annotations)
         merged_annotations.update(dict(annotations or {}))
+        resolved_robot_id = robot_id or str(
+            getattr(self, "default_robot_id", "active")
+        )
         request = SkillRequest(
             skill_name=tool,
             version=version,
             args=canonical_args,
             context=SkillContext(
-                robot_id=robot_id,
+                robot_id=resolved_robot_id,
                 source=source,
                 request_id=request_id,
                 mission_id=mission_id,

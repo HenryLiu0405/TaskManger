@@ -19,6 +19,9 @@ not HIL approval or completion of the entire phase.
 - The supervisor continuously executes a fixed plan in a background thread.
   The REST mission path and `MissionApiService` use this boundary; Web refresh
   or disconnect is not the execution clock.
+- The deployed composition root gives legacy developer actions and autonomous
+  semantic actions the same dispatcher and robot ID, so they share one normal
+  physical-writer lock instead of creating parallel execution paths.
 - The interrupt lane freezes normal execution before requesting stop and does
   not acquire the dispatcher writer lock. Unconfirmed stop enters
   `intervention_required`. A result arriving after the freeze is recorded but
@@ -38,14 +41,15 @@ runtime per robot, required verification, immutable dispatched nodes, a blocked
 normal writer plus independent confirmed stop, unconfirmed stop, and the
 post-interrupt late-result race.
 
-The complete offline suite passed 107/107 and the frontend state suite passed
+The complete offline suite passed 127/127 and the frontend state suite passed
 6/6 in the project Python 3.10 environment on 2026-08-03.
 
 ## Remaining Phase 2 gates
 
-- A real navigation start/status/cancel implementation with timestamped stop
-  acknowledgement must be implemented and approved in HIL. Existing adapters
-  that return no structured stop receipt remain deliberately unconfirmed.
+- The ROS adapter now maps the existing `/nav_pause` and `/odom` interfaces to
+  timestamped stop evidence and deliberately reports an unconfirmed stop when
+  that evidence is unavailable. Its thresholds and physical behavior still
+  require approval in HIL before the autonomous path is enabled.
 - The Web timeline API exists, but the production UI still needs the full
   timeline/intervention presentation.
 - Cross-process single-writer deployment ownership and service restart behavior

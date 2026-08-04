@@ -22,6 +22,13 @@ was performed.
   side effect and opens no network/robot connection when constructed.
 - Natural-language task/status endpoints are available only when an
   `AutonomyService` is explicitly injected into the Flask process.
+- `RosSemanticBackend` is a thin production bridge over the existing
+  `RosAcceptanceAdapter`: it resolves `LocationRef`, filters the published
+  `PoseEstimateArray` by the model-selected object ID, requires a post-selection
+  fresh pose, and then reuses the current navigation/carry/place methods.
+- The deployment composition shares one dispatcher and Supervisor between the
+  autonomous API and legacy developer tools; legacy primitives remain hidden
+  from the cloud planner.
 
 ## Offline evidence and remaining gates
 
@@ -30,7 +37,7 @@ FoundationPose object ID `12`, preserve `grid/ne`, and run five semantic nodes
 without a stage click. A model-selected ID absent from the observation is
 rejected before a mission or physical invocation is created.
 
-The existing real adapter does not yet claim the new semantic object-ID and
-fresh-selection-epoch capability. A real Robotics-ER 2 cloud call, real
-observation source, production semantic backend, Web authentication, simulation
-run, and HIL remain required. This is not a Phase 5 exit declaration.
+The production bridge and observation source are now present and covered by
+offline fakes. A real Robotics-ER 2 cloud call, recorded-scene replay,
+simulation run, and all ROS/HIL evidence remain required. This is not a Phase 5
+exit declaration.

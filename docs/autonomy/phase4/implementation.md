@@ -20,16 +20,21 @@ Status date: 2026-08-03. No cloud request or camera upload was performed.
 - Concurrency limiting and a per-provider circuit breaker are present.
   Provider errors are not retried by the gateway. `ReplayProvider` supports
   deterministic offline decisions.
-- `GeminiRoboticsER2Provider` now supports both the current Interactions API and
+- `GeminiRoboticsER2Provider` supports both the Interactions API and
   the `generateContent` request shape used by the supplied quick start. It sends
   inline image bytes, requests structured JSON, converts native function calls
   into the local decision envelope, and keeps the API key only in the transport
   header. Google's documented standard endpoint,
-  `gemini-robotics-er-2-preview`, is the default; the general
-  `gemini-flash-latest` alias is not a Robotics-ER 2 identity. Interactions is
-  the default API mode, while `generateContent` remains a compatibility mode.
+  `gemini-robotics-er-1.6-preview`, is the current default; the general
+  `gemini-flash-latest` alias is not a Robotics-ER identity. `generateContent`
+  is the default API mode used by the official Robotics quickstart, while the
+  Interactions transport remains configurable.
 - The HTTP transport is injected for tests. Importing or composing the provider
   performs no network call, and provider exceptions omit headers and bodies.
+- The deployed adapter now exposes timestamped RGB-overlay, mask, depth, and
+  drop samples. `AdapterObservationSource` rejects stopped/stale streams,
+  preserves frame hashes and sequences, includes the complete fresh tracker
+  candidate set, and passes bytes directly to the existing gateway.
 
 ## Offline evidence and remaining gates
 

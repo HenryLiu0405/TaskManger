@@ -290,6 +290,11 @@ class ExecutionSupervisor:
                 raise TimeoutError(f"mission {mission_id} did not reach a boundary before timeout")
         return self.snapshot(mission_id)
 
+    def active_mission_id(self) -> Optional[str]:
+        """Return the process-local mission currently owning this robot."""
+        with self._guard:
+            return self._active_mission_id
+
     def pause(self, mission_id: str) -> dict[str, Any]:
         mission = self._require_mission(mission_id)
         if mission["status"] != MissionLifecycle.RUNNING.value:

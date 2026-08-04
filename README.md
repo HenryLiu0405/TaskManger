@@ -4,9 +4,10 @@
 
 > 自主化开发状态（2026-08-03）：仓库已加入 Phase 2–8 的离线实现切片。
 > 默认主页现为自然语言任务提交与监控台，旧九宫格/分步工具保留在
-> `?developer=1`。Gemini Robotics-ER 2 标准预览端点已配置，但真实云调用、
-> 真实语义适配器、仿真和 HIL 尚未批准或验证；现有真实 ROS 路径不会因这些
-> 离线代码自动切换。详见 `docs/autonomy/phase*/implementation.md`。
+> `?developer=1`。现有 Navigation、FoundationPose、Gateway 已由薄语义桥接入
+> 同一个 Supervisor，并提供配置驱动的真实启动入口；Mac 上只完成了离线验证，
+> 未执行云调用、ROS、机器人动作或 HIL。除非 `.env` 显式设置
+> `PHI_AUTONOMY_ENABLED=1`，原真实 ROS 启动路径不会自动切换。
 
 ## 系统架构
 
@@ -156,19 +157,23 @@ React 18 + Vite 5 + Ant Design 5
 
 ### Gemini Robotics-ER 2（自主运行时，显式启用）
 
-复制 `config/autonomy.env.example` 中的变量名到部署密钥管理器或进程环境：
+直接编辑项目根目录的 `.env`；它已被 Git 忽略，运行时会自动读取：
 
-```bash
-export GEMINI_API_KEY='使用轮换后的新密钥'
-export GEMINI_ROBOTICS_MODEL='gemini-robotics-er-2-preview'
-export GEMINI_API_MODE='interactions'
+```dotenv
+GEMINI_API_KEY=使用轮换后的新密钥
+GEMINI_ROBOTICS_MODEL=gemini-robotics-er-1.6-preview
+GEMINI_API_MODE=generate_content
+PHI_AUTONOMY_ENABLED=1
+TASKMANAGER_PYTHON=/home/hairo/miniconda3/envs/AgenticRobot/bin/python
+PHI_OPERATOR_CIDRS=127.0.0.0/8,192.168.50.0/24
 ```
 
-普通 `gemini-flash-latest` 是通用 Gemini alias，不能当作 Robotics-ER 2
-身份；`gemini-robotics-er-2-streaming-preview` 属于 Live API 流式端点，
-不由当前非流式 Planner 适配器调用。API key 不得提交到 Git、普通日志或模型审计记录。创建
-`GeminiAutonomyRuntime` 本身不会发起网络/机器人调用；实际提交任务前仍需
-通过 replay、simulation 和相应 HIL gate。
+模型和 API 模式已有默认值；当前公开 Robotics-ER 模型以 Google 官方模型页为准，
+若账号提供了其他专用模型 ID，只需覆盖这一行。在目标主机上额外打开
+`PHI_AUTONOMY_ENABLED=1` 即可让现有 systemd 启动脚本选择自主入口。普通
+`gemini-flash-latest` 不是 Robotics-ER。创建 `GeminiAutonomyRuntime`
+本身不会发起网络或机器人调用。若从另一台电脑打开控制台，把该电脑所在的可信
+管理网段加入 `PHI_OPERATOR_CIDRS`，否则监控可用但暂停/急停按钮会被拒绝。
 
 ### 1. 机器人配置 (`phi_robot/robots.json`)
 
@@ -246,6 +251,31 @@ WAIC_ORIN_HOST=unitree@192.168.3.168
 ```
 
 所有 systemd 服务通过 `EnvironmentFile` 读取此文件来获取 domain 和目标机器人。
+
+### 迁移到 WAIC 主机（只改配置）
+
+主机侧只维护以下三处，不需要修改 Python/前端代码：
+
+1. 根目录 `.env`：API key、`PHI_AUTONOMY_ENABLED=1` 和 TaskManger Python 路径。
+2. `phi_robot/robots.json`：机器人 IP、ROS domain、相机和 Orin 地址。
+3. `phi_robot/scene_coords.json`：当前地图的九宫格坐标。
+
+代码同步和前端构建完成后，先执行不接触 ROS/云/机器人的配置检查：
+
+```bash
+cd /home/hairo/waic/TaskManger
+${TASKMANAGER_PYTHON} run_autonomy_api.py --check-config
+```
+
+输出 `"ok": true` 后，现有 `waic-taskmanger.service` 仍调用
+`scripts/start_taskmanger.sh`；脚本会读取同一个 `.env` 和
+`active_robot.env`，并在自主模式下由 Flask 同端口提供构建好的前端，因此无需
+再长期运行 Vite 开发服务器。若主机路径、ROS 服务名与 WAIC 当前约定一致，部署
+时不需要添加其他配置；不同路径或服务名可用 `.env` 中的 `PHI_*` 覆盖。
+
+真实启用前仍需按顺序完成静态接口、单动作、整任务和注入掉箱 HIL。停止确认使用
+现有 `/nav_pause` 加连续新鲜 `/odom` 低速证据；证据不足时会停在人工介入状态，
+不会把发布成功当成机器人已经停稳。
 
 ## 快速开始
 

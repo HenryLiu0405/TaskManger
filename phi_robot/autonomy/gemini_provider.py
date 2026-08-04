@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping, MutableMapping, Optional, Protocol
 
 from .model_gateway import ModelGatewayError
@@ -23,7 +24,8 @@ from .model_gateway import ModelGatewayError
 INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 GENERATE_CONTENT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 SUPPORTED_API_MODES = ("interactions", "generate_content")
-DEFAULT_MODEL = "gemini-robotics-er-2-preview"
+DEFAULT_MODEL = "gemini-robotics-er-1.6-preview"
+PROJECT_DOTENV = Path(__file__).resolve().parents[2] / ".env"
 
 
 class GeminiJSONTransport(Protocol):
@@ -98,7 +100,7 @@ class GeminiRoboticsER2Config:
 
     api_key: str = field(repr=False)
     model: str = DEFAULT_MODEL
-    api_mode: str = "interactions"
+    api_mode: str = "generate_content"
     api_url: Optional[str] = None
     max_inline_bytes: int = 19 * 1024 * 1024
     store_responses: bool = False
@@ -121,12 +123,27 @@ class GeminiRoboticsER2Config:
     def from_env(
         cls,
         environ: Optional[Mapping[str, str]] = None,
+        *,
+        dotenv_path: str | Path | None = None,
     ) -> "GeminiRoboticsER2Config":
-        values = os.environ if environ is None else environ
+        # Keep the common local workflow simple: read <repo>/.env automatically.
+        # Explicit process variables take precedence, matching normal dotenv
+        # behavior. Tests can pass a mapping and remain isolated from local
+        # developer credentials.
+        process_values = dict(os.environ if environ is None else environ)
+        selected_path: Path | None
+        if dotenv_path is not None:
+            selected_path = Path(dotenv_path)
+        elif environ is None:
+            selected_path = PROJECT_DOTENV
+        else:
+            selected_path = None
+        file_values = _read_dotenv(selected_path) if selected_path else {}
+        values = {**file_values, **process_values}
         return cls(
             api_key=str(values.get("GEMINI_API_KEY", "")).strip(),
             model=str(values.get("GEMINI_ROBOTICS_MODEL", DEFAULT_MODEL)).strip(),
-            api_mode=str(values.get("GEMINI_API_MODE", "interactions")).strip(),
+            api_mode=str(values.get("GEMINI_API_MODE", "generate_content")).strip(),
             api_url=(str(values["GEMINI_API_URL"]).strip() if values.get("GEMINI_API_URL") else None),
             store_responses=str(values.get("GEMINI_STORE_RESPONSES", "false")).lower()
             in {"1", "true", "yes"},
@@ -140,6 +157,42 @@ class GeminiRoboticsER2Config:
             return INTERACTIONS_URL
         model = urllib.parse.quote(self.model.removeprefix("models/"), safe="._-")
         return f"{GENERATE_CONTENT_BASE_URL}/models/{model}:generateContent"
+
+
+_ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _read_dotenv(path: Path) -> dict[str, str]:
+    """Read the small dotenv subset needed by this service.
+
+    The parser supports blank lines, comments, optional ``export``, and quoted
+    values. It never logs values or mutates the process environment.
+    """
+
+    if not path.is_file():
+        return {}
+    values: dict[str, str] = {}
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").lstrip()
+        if "=" not in line:
+            raise ValueError(f"invalid .env assignment at line {line_number}")
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if _ENV_KEY.fullmatch(key) is None:
+            raise ValueError(f"invalid .env key at line {line_number}")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        elif " #" in value:
+            value = value.split(" #", 1)[0].rstrip()
+        values[key] = value
+    return values
 
 
 class GeminiRoboticsER2Provider:

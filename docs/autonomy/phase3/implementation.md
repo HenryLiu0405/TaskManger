@@ -25,6 +25,10 @@ Status date: 2026-08-03. This is an offline contract slice, not Phase 3 exit.
 - A stopped camera naturally expires because validity derives from capture
   timestamps. `DropEvent` records detector sequence/health, mission/object
   context, evidence frames, and explicit unknown odometry.
+- The production adapter now filters the full FoundationPose pose array by the
+  requested object ID and starts a fresh local selection epoch. Tracker state
+  stream gaps and explicit FoundationPose reset start a new tracker-session
+  namespace; picks require a matching post-selection pose.
 
 ## Offline evidence and remaining gates
 
@@ -32,9 +36,8 @@ Nine contract tests cover resolution, extensible-but-not-executable kinds,
 identity/epoch/session failures, lineage, synchronized bundles, stale camera
 frames, old sequences, world-version invalidation, and structured drop events.
 
-Remaining work includes live FoundationPose select-by-object-ID service wiring,
-persisting selection tokens and lineage in the durable ledger, connecting real
-camera channels to the ring buffer, and migrating every newly-created mission
-and skill boundary to `LocationRef`/`ObjectRef`. These require external interface
-confirmation and later HIL; the current coordinate-based legacy plan remains a
+Remaining work includes persisting selection tokens and lineage in the durable
+ledger and validating provider-restart/session behavior with live
+FoundationPose. Real camera caches and the local ID filter are wired but have
+not run on ROS/HIL. The current coordinate-based legacy plan remains a
 compatibility input only.

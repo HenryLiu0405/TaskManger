@@ -17,6 +17,7 @@ import os
 import subprocess
 import threading
 import time
+import uuid
 from typing import Any, Callable
 
 import rclpy
@@ -153,6 +154,10 @@ class RosAcceptanceAdapter:
 
         # 🆕 掉箱检测订阅（v3: drop_detector_node → /vision/box_drop_status）
         self._box_drop_detected: bool = False
+        self._drop_event_sequence: int = 0
+        self._drop_callback: Callable[[dict[str, Any]], None] | None = None
+        self._diag_callback: Callable[[DiagEvent], None] | None = None
+        self._current_step_id: str = ""
         self._drop_odom_x: float = 0.0   # 掉落瞬间里程计 x（用于 replan_target）
         self._drop_odom_y: float = 0.0   # 掉落瞬间里程计 y
         self._drop_enable_pub = self._node.create_publisher(
@@ -163,19 +168,42 @@ class RosAcceptanceAdapter:
             prev = self._box_drop_detected
             self._box_drop_detected = not msg.data  # data:true=在, data:false=掉落
             if not msg.data and not prev:
-                self._drop_odom_x = self._odom_x
-                self._drop_odom_y = self._odom_y
+                self._drop_event_sequence += 1
+                detected_at = time.time()
+                self._drop_odom_x = getattr(self, "_odom_x", 0.0)
+                self._drop_odom_y = getattr(self, "_odom_y", 0.0)
                 logger.error("⚠ 掉箱检测：箱子掉落！/vision/box_drop_status → false "
-                             "odom=(%.2f, %.2f)，记录位置，继续当前导航",
+                             "odom=(%.2f, %.2f)，交由 Supervisor 请求停止",
                              self._drop_odom_x, self._drop_odom_y)
                 self._emit_diag(make_drop_status(
-                    self._current_step_id, False,
+                    getattr(self, "_current_step_id", ""), False,
                     self._drop_odom_x, self._drop_odom_y))
+                if self._drop_callback is not None:
+                    try:
+                        self._drop_callback({
+                            "event_id": f"drop-{uuid.uuid4().hex}",
+                            "sequence": self._drop_event_sequence,
+                            "detected_at": detected_at,
+                            "detector_health": "healthy",
+                            "box_present": False,
+                            "odometry": (
+                                {
+                                    "x": self._drop_odom_x,
+                                    "y": self._drop_odom_y,
+                                    "yaw": getattr(self, "_odom_yaw", 0.0),
+                                    "received_at": getattr(self, "_odom_received_at", 0.0),
+                                }
+                                if getattr(self, "_odom_received_at", 0.0) > 0.0
+                                else None
+                            ),
+                        })
+                    except Exception:
+                        logger.exception("drop callback failed")
             elif msg.data and prev:
                 logger.info("掉箱检测恢复: 箱子重新出现在画面中")
                 self._emit_diag(make_drop_status(
-                    self._current_step_id, True,
-                    self._odom_x, self._odom_y))
+                    getattr(self, "_current_step_id", ""), True,
+                    getattr(self, "_odom_x", 0.0), getattr(self, "_odom_y", 0.0)))
 
         self._node.create_subscription(
             Bool, '/vision/box_drop_status', _on_box_drop_status, 10)
@@ -186,6 +214,7 @@ class RosAcceptanceAdapter:
         self._spin_thread.start()
 
         # ── 导航控制 ──
+        self._navigation_stop_event = threading.Event()
         # /nav_pause: 暂停/恢复命令（上游 → Nav2）
         #   True  = 暂停（速度归零，状态保持，恢复后断点继续）
         #   False = 恢复（从断点继续导航）
@@ -216,16 +245,31 @@ class RosAcceptanceAdapter:
 
         # FoundationPose 状态 + 视频帧
         self._fp_state: dict[str, Any] = {}
+        self._fp_state_received_at: float = 0.0
+        self._fp_state_sequence: int = 0
+        self._fp_tracker_session_id = f"fp-session-{uuid.uuid4().hex}"
+        try:
+            self._fp_session_gap_s = max(
+                float(os.getenv("WAIC_FP_SESSION_GAP_S", "3.0")), 0.5
+            )
+        except ValueError:
+            self._fp_session_gap_s = 3.0
         self._fp_rgb_jpeg: Optional[bytes] = None
         self._fp_depth_jpeg: Optional[bytes] = None
         self._fp_mask_jpeg: Optional[bytes] = None
         self._drop_vis_jpeg: Optional[bytes] = None  # drop_detector 可视化画面
+        self._fp_frame_samples: dict[str, dict[str, Any]] = {}
+        self._fp_frame_sequences: dict[str, int] = {}
         # GIL 下 bytes 引用赋值是原子的，无需锁
 
         # 里程计 — 订阅 /odom (nav_msgs/Odometry)，缓存最新位姿
         self._odom_x: float = 0.0
         self._odom_y: float = 0.0
         self._odom_yaw: float = 0.0
+        self._odom_linear_speed: float = 0.0
+        self._odom_angular_speed: float = 0.0
+        self._odom_received_at: float = 0.0
+        self._odom_sequence: int = 0
 
         def _on_odom(msg: Odometry) -> None:
             self._odom_x = msg.pose.pose.position.x
@@ -235,6 +279,13 @@ class RosAcceptanceAdapter:
             siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
             cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
             self._odom_yaw = math.atan2(siny_cosp, cosy_cosp)
+            twist = msg.twist.twist
+            self._odom_linear_speed = math.hypot(
+                float(twist.linear.x), float(twist.linear.y)
+            )
+            self._odom_angular_speed = abs(float(twist.angular.z))
+            self._odom_received_at = time.time()
+            self._odom_sequence += 1
         self._node.create_subscription(Odometry, "/odom", _on_odom, 10)
 
 
@@ -243,20 +294,54 @@ class RosAcceptanceAdapter:
 
         def _on_fp_state(msg):
             try:
+                received_at = time.time()
+                if (
+                    self._fp_state_received_at > 0.0
+                    and received_at - self._fp_state_received_at > self._fp_session_gap_s
+                ):
+                    # A provider outage/restart may reuse numeric tracker IDs.
+                    # Treat any material state-stream gap as a new ID namespace.
+                    self._fp_tracker_session_id = f"fp-session-{uuid.uuid4().hex}"
+                    if hasattr(self, "_fp_target_object_id"):
+                        self._fp_target_object_id = None
+                        self._latest_pose_result = None
+                        self._target_selection_pending = False
                 self._fp_state = json.loads(msg.data)
+                self._fp_state_received_at = received_at
+                self._fp_state_sequence += 1
             except Exception:
                 pass
         self._node.create_subscription(String, "/fp_state", _on_fp_state, 10)
 
         # /fp_frame/compressed (旧单帧 topic) 已废弃，改为三个独立 CompressedImage topic
+        def _store_frame(channel: str, msg: CompressedImage) -> bytes:
+            data = bytes(msg.data)
+            sequence = self._fp_frame_sequences.get(channel, 0) + 1
+            self._fp_frame_sequences[channel] = sequence
+            stamp = getattr(getattr(msg, "header", None), "stamp", None)
+            stamp_ns = (
+                int(getattr(stamp, "sec", 0)) * 1_000_000_000
+                + int(getattr(stamp, "nanosec", 0))
+            )
+            self._fp_frame_samples[channel] = {
+                "data": data,
+                # Receive time is used for freshness because deployments may
+                # use ROS simulated time or clocks that are not synchronized.
+                "captured_at": time.time(),
+                "sequence": sequence,
+                "content_type": "image/jpeg",
+                "source_stamp_ns": stamp_ns,
+            }
+            return data
+
         def _on_fp_rgb(msg):
-            self._fp_rgb_jpeg = msg.data
+            self._fp_rgb_jpeg = _store_frame("rgb", msg)
 
         def _on_fp_depth(msg):
-            self._fp_depth_jpeg = msg.data
+            self._fp_depth_jpeg = _store_frame("depth", msg)
 
         def _on_fp_mask(msg):
-            self._fp_mask_jpeg = msg.data
+            self._fp_mask_jpeg = _store_frame("mask", msg)
 
         self._node.create_subscription(
             CompressedImage, '/fp/rgb_overlay/compressed', _on_fp_rgb, _fp_qos)
@@ -266,7 +351,7 @@ class RosAcceptanceAdapter:
             CompressedImage, '/fp/mask/compressed', _on_fp_mask, _fp_qos)
 
         def _on_drop_vis(msg):
-            self._drop_vis_jpeg = msg.data
+            self._drop_vis_jpeg = _store_frame("drop", msg)
         self._node.create_subscription(
             CompressedImage, '/vision/drop_detector_vis/compressed', _on_drop_vis, _fp_qos)
 
@@ -282,6 +367,7 @@ class RosAcceptanceAdapter:
         self._fp_target_object_id: int | None = None
         # SelectTarget(select=true) 是否已激活单目标模式（需在搬起后/重规划前清理）
         self._select_target_active: bool = False
+        self._local_id_selection_active: bool = False
 
         # ── 单物体位姿缓存（/foundationpose/pose_result → /submit_carry_task）──
         # ── 物体位姿缓存（→ /submit_carry_task）──
@@ -329,8 +415,7 @@ class RosAcceptanceAdapter:
         self._submit_carry_client = None
 
         # ── 分步调试诊断 ──
-        self._current_step_id: str = ""
-        self._diag_callback: Callable[[DiagEvent], None] | None = None
+        self._current_step_id = ""
 
         logger.info(
             "ROS2 node ready — path_plan=%s, lift=%s, lay_down=%s, stand=%s, replay=%s, notify_goal=%s",
@@ -423,6 +508,12 @@ class RosAcceptanceAdapter:
         传入 None 可取消回调（恢复正常模式，不产生诊断开销）。
         """
         self._diag_callback = cb
+
+    def set_drop_callback(
+        self, cb: Callable[[dict[str, Any]], None] | None
+    ) -> None:
+        """Register the autonomous local drop-event consumer."""
+        self._drop_callback = cb
 
     def _emit_diag(self, event: DiagEvent) -> None:
         """向已注册的诊断回调推送事件（无回调时是空操作）"""
@@ -522,6 +613,7 @@ class RosAcceptanceAdapter:
     def reset(self) -> None:
         self._fp_target_object_id = None
         self._select_target_active = False
+        self._local_id_selection_active = False
         self._latest_pose_result = None
         self._latest_pose_received_monotonic = 0.0
         self._target_selection_started_monotonic = 0.0
@@ -572,6 +664,113 @@ class RosAcceptanceAdapter:
         msg.data = True
         self._pause_nav_pub.publish(msg)
         logger.info("pause_navigation: published data=true → /nav_pause")
+
+    def stop_motion(
+        self,
+        *,
+        robot_id: str = "",
+        mission_id: str = "",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Request Nav pause and confirm a stable stop from fresh odometry.
+
+        Publishing ``/nav_pause`` alone is only request acknowledgement.  This
+        method waits for multiple new odometry samples whose pose delta and
+        reported twist both remain below conservative thresholds.  If that
+        evidence is unavailable, the caller receives ``confirmed=false``.
+        """
+        requested_at = time.time()
+        self._navigation_stop_event.set()
+        self.pause_navigation()
+        try:
+            timeout_s = max(float(os.getenv("WAIC_STOP_CONFIRM_TIMEOUT_S", "4.0")), 0.2)
+            stable_for_s = max(float(os.getenv("WAIC_STOP_STABLE_FOR_S", "0.6")), 0.2)
+            linear_limit = max(float(os.getenv("WAIC_STOP_LINEAR_MPS", "0.03")), 0.0)
+            angular_limit = max(float(os.getenv("WAIC_STOP_ANGULAR_RPS", "0.05")), 0.0)
+        except ValueError:
+            timeout_s, stable_for_s, linear_limit, angular_limit = 4.0, 0.6, 0.03, 0.05
+
+        deadline = time.monotonic() + timeout_s
+        last_sequence = -1
+        previous: tuple[float, float, float, float] | None = None
+        stable_since: float | None = None
+        last_evidence: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            sequence = getattr(self, "_odom_sequence", 0)
+            if sequence == last_sequence:
+                time.sleep(0.02)
+                continue
+            last_sequence = sequence
+            received_at = getattr(self, "_odom_received_at", 0.0)
+            if sequence <= 0 or received_at < requested_at:
+                time.sleep(0.02)
+                continue
+            current = (
+                received_at,
+                getattr(self, "_odom_x", 0.0),
+                getattr(self, "_odom_y", 0.0),
+                getattr(self, "_odom_yaw", 0.0),
+            )
+            if previous is None:
+                previous = current
+                continue
+            dt = max(current[0] - previous[0], 1e-6)
+            pose_linear_speed = math.hypot(
+                current[1] - previous[1], current[2] - previous[2]
+            ) / dt
+            yaw_delta = math.atan2(
+                math.sin(current[3] - previous[3]),
+                math.cos(current[3] - previous[3]),
+            )
+            pose_angular_speed = abs(yaw_delta) / dt
+            reported_linear = getattr(self, "_odom_linear_speed", float("inf"))
+            reported_angular = getattr(self, "_odom_angular_speed", float("inf"))
+            stopped = (
+                pose_linear_speed <= linear_limit
+                and pose_angular_speed <= angular_limit
+                and reported_linear <= linear_limit
+                and reported_angular <= angular_limit
+            )
+            last_evidence = {
+                "odom_sequence": sequence,
+                "odom_received_at": received_at,
+                "pose_linear_speed_mps": pose_linear_speed,
+                "pose_angular_speed_rps": pose_angular_speed,
+                "reported_linear_speed_mps": reported_linear,
+                "reported_angular_speed_rps": reported_angular,
+                "stable_for_required_s": stable_for_s,
+            }
+            now_monotonic = time.monotonic()
+            if stopped:
+                stable_since = stable_since or now_monotonic
+                if now_monotonic - stable_since >= stable_for_s:
+                    return {
+                        "accepted": True,
+                        "confirmed": True,
+                        "motion_state": "stopped",
+                        "message": "navigation pause and stable odometry stop confirmed",
+                        "evidence": {
+                            **last_evidence,
+                            "robot_id": robot_id,
+                            "mission_id": mission_id,
+                            "reason": reason,
+                        },
+                    }
+            else:
+                stable_since = None
+            previous = current
+        return {
+            "accepted": True,
+            "confirmed": False,
+            "motion_state": "unknown",
+            "message": "navigation pause requested but stable stop was not confirmed",
+            "evidence": {
+                **last_evidence,
+                "robot_id": robot_id,
+                "mission_id": mission_id,
+                "reason": reason,
+            },
+        }
 
     def resume_navigation(self):
         """Publish Bool(data=False) to /nav_pause — 从断点恢复导航。
@@ -772,6 +971,19 @@ class RosAcceptanceAdapter:
         """获取 FoundationPose 最新状态."""
         return dict(self._fp_state)
 
+    def get_fp_state_sample(self) -> dict[str, Any]:
+        """Return the cached tracker set with receive-time freshness metadata."""
+        return {
+            "state": dict(self._fp_state),
+            "received_at": self._fp_state_received_at,
+            "sequence": self._fp_state_sequence,
+            "tracker_session_id": self._fp_tracker_session_id,
+        }
+
+    def get_tracker_session_id(self) -> str:
+        """Process/reset scoped FoundationPose identity used by ObjectRef."""
+        return self._fp_tracker_session_id
+
     def get_odom(self) -> dict[str, Any]:
         """获取最新里程计 (x, y, yaw_deg)."""
         return {
@@ -780,6 +992,21 @@ class RosAcceptanceAdapter:
             "yaw_deg": round(
                 math.degrees(getattr(self, "_odom_yaw", 0.0)), 1
             ),
+        }
+
+    def get_odom_sample(self) -> dict[str, Any] | None:
+        """Return odometry only after a real message has been observed."""
+        if self._odom_received_at <= 0.0:
+            return None
+        return {
+            "x": self._odom_x,
+            "y": self._odom_y,
+            "yaw": self._odom_yaw,
+            "linear_speed_mps": self._odom_linear_speed,
+            "angular_speed_rps": self._odom_angular_speed,
+            "received_at": self._odom_received_at,
+            "sequence": self._odom_sequence,
+            "frame_id": "odom",
         }
 
     def get_fp_video_frame(self, channel: str) -> Optional[bytes]:
@@ -796,6 +1023,19 @@ class RosAcceptanceAdapter:
         elif channel == 'drop':
             return self._drop_vis_jpeg
         return None
+
+    def get_fp_video_sample(self, channel: str) -> dict[str, Any] | None:
+        """Return frame bytes plus receive timestamp and monotonic sequence.
+
+        ``rgb`` is the existing FoundationPose RGB-overlay topic.  The
+        autonomy observation source may expose the same sample as ``overlay``
+        so deployments do not need another camera node merely for naming.
+        """
+        source_channel = "rgb" if channel == "overlay" else channel
+        sample = self._fp_frame_samples.get(source_channel)
+        if sample is None:
+            return None
+        return dict(sample)
 
     def get_robot_state(self) -> dict[str, Any]:
         """单次查询机器人状态（不阻塞等待），供调试控制台轮询"""
@@ -997,6 +1237,11 @@ class RosAcceptanceAdapter:
     def _call_path_plan(self, args, request_id, goal_id, step_id):
         t0 = time.time()
 
+        # A prior confirmed stop leaves Nav paused.  A new semantic navigation
+        # invocation is the explicit authority to resume with a fresh goal.
+        self._navigation_stop_event.clear()
+        self.resume_navigation()
+
         target = args.get("target", {})
         tx = float(target.get("x", 0.0))
         ty = float(target.get("y", 0.0))
@@ -1039,6 +1284,14 @@ class RosAcceptanceAdapter:
         nav_timeout = 600.0  # 最长等 10 分钟
         arrived = self._wait_nav_reached(timeout=nav_timeout)
         if not arrived:
+            if self._navigation_stop_event.is_set():
+                return self._error_result(
+                    "CANCELLED",
+                    f"navigation stopped before reaching ({tx:.1f}, {ty:.1f})",
+                    request_id,
+                    goal_id,
+                    step_id,
+                )
             return self._error_result("NAV_TIMEOUT",
                                      f"nav_reached not received within {nav_timeout:.0f}s for ({tx:.1f}, {ty:.1f})",
                                      request_id, goal_id, step_id)
@@ -1078,6 +1331,9 @@ class RosAcceptanceAdapter:
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if self._navigation_stop_event.is_set():
+                logger.info("navigation wait interrupted by local stop request")
+                return False
             if self._nav_reached:
                 logger.info("nav_reached=True received, navigation complete")
                 return True
@@ -1234,6 +1490,89 @@ class RosAcceptanceAdapter:
             self._select_target_active = False
         return result
 
+    def select_object_id_public(
+        self,
+        object_id: int,
+        *,
+        step_id: str = "",
+    ) -> dict[str, Any]:
+        """Bind the next pick pose to one explicit PoseEstimate object ID.
+
+        The deployed SelectTarget service chooses by map coordinate and does
+        not accept an object ID.  FoundationPose already publishes the full
+        ``PoseEstimateArray``, so the TaskManger adapter can enforce the ID
+        locally without changing or restarting the perception node.
+        """
+        if isinstance(object_id, bool):
+            return {
+                "success": False,
+                "message": "FoundationPose object_id must be an integer",
+                "matched_object_id": -1,
+            }
+        try:
+            selected_id = int(object_id)
+        except (TypeError, ValueError):
+            return {
+                "success": False,
+                "message": "FoundationPose object_id must be an integer",
+                "matched_object_id": -1,
+            }
+        if selected_id < 0:
+            return {
+                "success": False,
+                "message": "FoundationPose object_id must be non-negative",
+                "matched_object_id": -1,
+            }
+        self.reset_pick_observation()
+        self._fp_target_object_id = selected_id
+        self._target_selection_pending = False
+        self._local_id_selection_active = True
+        logger.info(
+            "local FoundationPose object-ID selection → object_id=%s step=%s",
+            selected_id,
+            step_id,
+        )
+        return {
+            "success": True,
+            "message": "local object-ID selection epoch started",
+            "matched_object_id": selected_id,
+            "tracker_session_id": self._fp_tracker_session_id,
+        }
+
+    def clear_object_id_selection(self) -> dict[str, Any]:
+        """Clear only the local multi-object PoseEstimate ID filter."""
+        self._fp_target_object_id = None
+        self._latest_pose_result = None
+        self._latest_pose_received_monotonic = 0.0
+        self._target_selection_pending = False
+        self._local_id_selection_active = False
+        return {"success": True, "message": "local object-ID selection cleared"}
+
+    def get_selected_pose_identity(self) -> dict[str, Any] | None:
+        """Describe the fresh pose that would be submitted to the gateway."""
+        pose = self._latest_pose_result
+        if pose is None or self._pose_rejection_reason(pose) is not None:
+            return None
+        stamp = getattr(getattr(pose, "header", None), "stamp", None)
+        stamp_ns = (
+            int(getattr(stamp, "sec", 0)) * 1_000_000_000
+            + int(getattr(stamp, "nanosec", 0))
+        )
+        return {
+            "provider": "foundationpose",
+            "object_id": int(getattr(pose, "object_id")),
+            "tracker_session_id": self._fp_tracker_session_id,
+            "observation_id": (
+                f"fp-pose-{stamp_ns}"
+                if stamp_ns > 0
+                else f"fp-pose-received-{self._latest_pose_received_monotonic:.9f}"
+            ),
+            "frame_id": str(
+                getattr(getattr(pose, "header", None), "frame_id", "") or ""
+            ),
+            "received_monotonic": self._latest_pose_received_monotonic,
+        }
+
     def reset_pick_observation(self) -> None:
         """Start a new target-observation epoch and discard stale cached poses."""
         self._latest_pose_result = None
@@ -1325,6 +1664,11 @@ class RosAcceptanceAdapter:
                 return None
             resp = future.result()
             logger.info("Reset → success=%s message=%s", resp.success, resp.message)
+            if resp.success:
+                # Provider IDs may be reused after reset; start a new identity
+                # namespace so an old ObjectRef cannot silently select one.
+                self._fp_tracker_session_id = f"fp-session-{uuid.uuid4().hex}"
+                self.clear_object_id_selection()
             return {"success": resp.success, "message": resp.message}
         except Exception as e:
             logger.exception("Reset call failed: %s", e)

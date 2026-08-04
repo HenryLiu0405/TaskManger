@@ -40,10 +40,12 @@ class GeminiAutonomyRuntime:
     closed_loop: ClosedLoopAgentController
     recovery: DropRecoveryCoordinator
     service: AutonomyService
+    owns_supervisor_ledger: bool = True
 
     def close(self) -> None:
         self.model_ledger.close()
-        self.supervisor_ledger.close()
+        if self.owns_supervisor_ledger:
+            self.supervisor_ledger.close()
 
 
 def build_gemini_autonomy_runtime(
@@ -53,27 +55,41 @@ def build_gemini_autonomy_runtime(
     observation_source: ObservationSource,
     location_resolver: NineGridLocationResolver,
     interrupt_lane: Any,
-    supervisor_ledger_path: str | Path,
+    supervisor_ledger_path: str | Path | None,
     model_ledger_path: str | Path,
     config: Optional[GeminiRoboticsER2Config] = None,
     transport: Optional[GeminiJSONTransport] = None,
     audit_enabled: bool = True,
+    dispatcher: Any = None,
+    supervisor: Optional[ExecutionSupervisor] = None,
 ) -> GeminiAutonomyRuntime:
     """Build but do not start or invoke the cloud/robot runtime."""
 
     resolved_config = config or GeminiRoboticsER2Config.from_env()
     provider = GeminiRoboticsER2Provider(resolved_config, transport=transport)
-    dispatcher = build_agent_skill_dispatcher(
-        semantic_backend, audit_enabled=audit_enabled
-    )
-    supervisor_ledger = SupervisorLedger(supervisor_ledger_path)
+    owns_supervisor_ledger = supervisor is None
+    if supervisor is not None:
+        if dispatcher is not None and dispatcher is not supervisor.dispatcher:
+            raise ValueError("dispatcher must be the existing Supervisor dispatcher")
+        dispatcher = supervisor.dispatcher
+        supervisor_ledger = supervisor.ledger
+    else:
+        dispatcher = dispatcher or build_agent_skill_dispatcher(
+            semantic_backend, audit_enabled=audit_enabled
+        )
+        if supervisor_ledger_path is None:
+            raise ValueError("supervisor_ledger_path is required without an existing Supervisor")
+        supervisor_ledger = SupervisorLedger(supervisor_ledger_path)
     model_ledger = ModelCallLedger(model_ledger_path)
-    supervisor = ExecutionSupervisor(
-        robot_id=robot_id,
-        dispatcher=dispatcher,
-        ledger=supervisor_ledger,
-        interrupt_lane=interrupt_lane,
-    )
+    if supervisor is None:
+        supervisor = ExecutionSupervisor(
+            robot_id=robot_id,
+            dispatcher=dispatcher,
+            ledger=supervisor_ledger,
+            interrupt_lane=interrupt_lane,
+        )
+    elif supervisor.robot_id != robot_id:
+        raise ValueError("existing Supervisor belongs to a different robot")
     gateway = ModelGateway(
         providers={provider.name: provider},
         ledger=model_ledger,
@@ -117,5 +133,5 @@ def build_gemini_autonomy_runtime(
         closed_loop=closed_loop,
         recovery=recovery,
         service=service,
+        owns_supervisor_ledger=owns_supervisor_ledger,
     )
-
