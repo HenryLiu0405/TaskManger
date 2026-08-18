@@ -12,7 +12,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import logging
@@ -32,6 +32,40 @@ from .autonomy.legacy import LegacyMissionProjector
 from .autonomy.runtime import RobotRuntime
 
 logger = logging.getLogger("phi_robot.api")
+
+_READINESS_FRESHNESS_S = 3.0
+
+
+def _readiness_component(
+    status: str,
+    detail: str,
+    source: str,
+    *,
+    now: float,
+    observed_at: Optional[float] = None,
+    **metadata: Any,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "status": status,
+        "detail": detail,
+        "source": source,
+        "observed_at": observed_at,
+    }
+    if observed_at is not None:
+        result["age_s"] = round(max(0.0, now - observed_at), 3)
+    result.update(metadata)
+    return result
+
+
+def _optional_call(target: Any, name: str, *args: Any) -> tuple[Any, Optional[str]]:
+    method = getattr(target, name, None)
+    if not callable(method):
+        return None, f"{name} is not exposed"
+    try:
+        return method(*args), None
+    except Exception as exc:
+        logger.debug("readiness source %s failed: %s", name, exc)
+        return None, f"{name} failed: {type(exc).__name__}"
 
 
 class APIHook(MissionExecutionHook):
@@ -164,6 +198,254 @@ class PhiRobotAPIServer:
         if self.service_manager is not None:
             self._setup_service_routes()
 
+    def _runtime_readiness(self) -> dict[str, Any]:
+        now = time.time()
+        services_raw, services_error = _optional_call(
+            self.adapter, "get_services_status"
+        )
+        services = (
+            {str(name): bool(ready) for name, ready in services_raw.items()}
+            if isinstance(services_raw, Mapping)
+            else {}
+        )
+
+        frame, frame_error = _optional_call(
+            self.adapter, "get_fp_video_sample", "rgb"
+        )
+        frame = frame if isinstance(frame, Mapping) else None
+        frame_at = float(frame.get("captured_at") or 0.0) if frame else 0.0
+        if frame_at > 0.0 and now - frame_at <= _READINESS_FRESHNESS_S:
+            camera = _readiness_component(
+                "ready",
+                "fresh RGB frame received",
+                "/fp/rgb_overlay/compressed",
+                now=now,
+                observed_at=frame_at,
+                sequence=int(frame.get("sequence") or 0),
+            )
+        elif frame_at > 0.0:
+            camera = _readiness_component(
+                "stale",
+                "latest RGB frame is stale",
+                "/fp/rgb_overlay/compressed",
+                now=now,
+                observed_at=frame_at,
+                sequence=int(frame.get("sequence") or 0),
+            )
+        else:
+            camera = _readiness_component(
+                "unavailable",
+                frame_error or "no RGB frame received",
+                "/fp/rgb_overlay/compressed",
+                now=now,
+            )
+
+        fp_sample, fp_error = _optional_call(
+            self.adapter, "get_fp_state_sample"
+        )
+        fp_sample = fp_sample if isinstance(fp_sample, Mapping) else None
+        fp_at = float(fp_sample.get("received_at") or 0.0) if fp_sample else 0.0
+        fp_state = fp_sample.get("state") if fp_sample else None
+        trackers = fp_state.get("trackers") if isinstance(fp_state, Mapping) else None
+        tracker_count = len(trackers) if isinstance(trackers, list) else None
+        if fp_at > 0.0 and now - fp_at <= _READINESS_FRESHNESS_S:
+            foundationpose = _readiness_component(
+                "ready",
+                (
+                    f"fresh state; {tracker_count} tracked object(s)"
+                    if tracker_count is not None
+                    else "fresh state received"
+                ),
+                "/fp_state",
+                now=now,
+                observed_at=fp_at,
+                sequence=int(fp_sample.get("sequence") or 0),
+            )
+        elif fp_at > 0.0:
+            foundationpose = _readiness_component(
+                "stale",
+                "latest FoundationPose state is stale",
+                "/fp_state",
+                now=now,
+                observed_at=fp_at,
+                sequence=int(fp_sample.get("sequence") or 0),
+            )
+        else:
+            foundationpose = _readiness_component(
+                "unavailable",
+                fp_error or "no FoundationPose state received",
+                "/fp_state",
+                now=now,
+            )
+
+        service_checks = {
+            name: ready
+            for name, ready in services.items()
+            if name != "/pause_navigation"
+        }
+        online_services = sum(1 for ready in service_checks.values() if ready)
+        total_services = len(service_checks)
+        if total_services and online_services == total_services:
+            ros_status = "ready"
+        elif online_services:
+            ros_status = "degraded"
+        else:
+            ros_status = "unavailable"
+        ros = _readiness_component(
+            ros_status,
+            (
+                f"{online_services}/{total_services} required services discovered"
+                if total_services
+                else services_error or "ROS service graph is unavailable"
+            ),
+            "rclpy service graph",
+            now=now,
+            services=service_checks,
+        )
+
+        odom, odom_error = _optional_call(self.adapter, "get_odom_sample")
+        odom = odom if isinstance(odom, Mapping) else None
+        odom_at = float(odom.get("received_at") or 0.0) if odom else 0.0
+        odom_fresh = odom_at > 0.0 and now - odom_at <= _READINESS_FRESHNESS_S
+        control_ready = bool(services.get("/get_locomotion_mode", False))
+        if odom_fresh and control_ready:
+            robot_status = "ready"
+            robot_detail = "fresh odometry and locomotion control discovered"
+        elif odom_fresh or control_ready:
+            robot_status = "degraded"
+            robot_detail = "robot has only partial live evidence"
+        else:
+            robot_status = "unavailable"
+            robot_detail = odom_error or "no fresh odometry or locomotion control"
+        robot = _readiness_component(
+            robot_status,
+            robot_detail,
+            "/odom + /get_locomotion_mode",
+            now=now,
+            observed_at=odom_at or None,
+            odom_sequence=int(odom.get("sequence") or 0) if odom else 0,
+            control_service_ready=control_ready,
+        )
+
+        vlm = self._vlm_readiness(now)
+        supervisor = self._supervisor_readiness(now)
+        components = {
+            "vlm": vlm,
+            "camera": camera,
+            "foundationpose": foundationpose,
+            "ros": ros,
+            "robot": robot,
+            "supervisor": supervisor,
+        }
+        acceptable = {
+            "vlm": {"ready"},
+            "camera": {"ready"},
+            "foundationpose": {"ready"},
+            "ros": {"ready"},
+            "robot": {"ready"},
+            "supervisor": {"ready"},
+        }
+        return {
+            "schema_version": "1.0",
+            "observed_at": now,
+            "ready_for_task": all(
+                components[name]["status"] in acceptable[name]
+                for name in components
+            ),
+            "components": components,
+        }
+
+    def _vlm_readiness(self, now: float) -> dict[str, Any]:
+        if self.autonomy_service is None:
+            return _readiness_component(
+                "unavailable",
+                "autonomy runtime is not configured",
+                "AutonomyService",
+                now=now,
+            )
+        planner = getattr(self.autonomy_service, "planner", None)
+        gateway = getattr(planner, "gateway", None)
+        provider_name = str(getattr(planner, "provider_name", ""))
+        providers = getattr(gateway, "providers", {})
+        provider = providers.get(provider_name) if isinstance(providers, Mapping) else None
+        model = str(getattr(provider, "model", ""))
+        ledger = getattr(self.autonomy_service, "model_ledger", None)
+        try:
+            calls = ledger.list_calls() if ledger is not None else []
+        except Exception:
+            calls = []
+        matching = [
+            item for item in calls
+            if not provider_name or str(item.get("provider") or "") == provider_name
+        ]
+        last = matching[-1] if matching else None
+        if last is not None:
+            last_status = str(last.get("status") or "")
+            observed_at = last.get("finished_at") or last.get("started_at")
+            error = last.get("error") if isinstance(last.get("error"), Mapping) else {}
+            if last_status == "succeeded":
+                status = "ready"
+                detail = f"last model call succeeded · {model or provider_name}"
+            elif last_status == "running":
+                status = "busy"
+                detail = f"model call in progress · {model or provider_name}"
+            else:
+                status = "error"
+                code = str(error.get("code") or last_status or "unknown error")
+                detail = f"last model call failed · {code}"
+            return _readiness_component(
+                status,
+                detail,
+                "model call ledger",
+                now=now,
+                observed_at=float(observed_at) if observed_at is not None else None,
+                model=model or None,
+                provider=provider_name or None,
+            )
+        return _readiness_component(
+            "configured",
+            (
+                f"configured; no model call observed yet · {model or provider_name}"
+                if model or provider_name
+                else "autonomy runtime configured; no model call observed yet"
+            ),
+            "AutonomyService",
+            now=now,
+            model=model or None,
+            provider=provider_name or None,
+        )
+
+    def _supervisor_readiness(self, now: float) -> dict[str, Any]:
+        supervisor = self.execution_supervisor
+        if supervisor is None:
+            return _readiness_component(
+                "unavailable", "Supervisor is not configured", "ExecutionSupervisor", now=now
+            )
+        active_mission_id = supervisor.active_mission_id()
+        try:
+            execution = supervisor.ledger.load_world_state(
+                supervisor.robot_id
+            ).fact("execution").value
+        except Exception:
+            execution = None
+        if execution == "reconciliation_required":
+            status = "blocked"
+            detail = "physical action reconciliation is required"
+        elif active_mission_id:
+            status = "busy"
+            detail = f"mission {active_mission_id} owns the robot"
+        else:
+            status = "ready"
+            detail = "idle and accepting a mission"
+        return _readiness_component(
+            status,
+            detail,
+            "ExecutionSupervisor",
+            now=now,
+            active_mission_id=active_mission_id,
+            execution_state=execution,
+        )
+
     def _setup_routes(self) -> None:
         """注册 API 路由"""
 
@@ -174,6 +456,11 @@ class PhiRobotAPIServer:
                 "status": "ok",
                 "timestamp": datetime.now().isoformat()
             })
+
+        @self.app.route("/api/autonomy/readiness", methods=["GET"])
+        def autonomy_readiness():
+            """Read-only live evidence for deployment readiness."""
+            return jsonify(self._runtime_readiness())
 
         # Phase 5-8 natural-language task and monitoring API.  It is inert
         # unless an AutonomyService is explicitly injected into this process;

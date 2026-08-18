@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 
 from phi_robot.autonomy.agent_tools import build_agent_skill_dispatcher
@@ -186,6 +187,52 @@ class Phase8HttpConsoleTests(unittest.TestCase):
         self.assertEqual(paused.status_code, 200)
         self.assertTrue(stopped.get_json()["receipt"]["confirmed"])
         self.assertIn(("pause", "autonomy-1", "local-test-operator"), self.autonomy.calls)
+
+    def test_readiness_uses_live_adapter_evidence_without_cloud_probe(self):
+        now = time.time()
+        self.adapter.get_services_status = lambda: {
+            "/start_navigation": True,
+            "/get_locomotion_mode": True,
+        }
+        self.adapter.get_fp_video_sample = lambda channel: {
+            "captured_at": now,
+            "sequence": 12,
+            "data": b"not-returned-to-browser",
+        }
+        self.adapter.get_fp_state_sample = lambda: {
+            "received_at": now,
+            "sequence": 8,
+            "state": {"trackers": [{"object_id": 3}]},
+        }
+        self.adapter.get_odom_sample = lambda: {
+            "received_at": now,
+            "sequence": 21,
+        }
+
+        response = self.client.get("/api/autonomy/readiness")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertFalse(payload["ready_for_task"])
+        self.assertEqual(
+            set(payload["components"]),
+            {"vlm", "camera", "foundationpose", "ros", "robot", "supervisor"},
+        )
+        self.assertEqual(payload["components"]["camera"]["status"], "ready")
+        self.assertEqual(payload["components"]["foundationpose"]["status"], "ready")
+        self.assertEqual(payload["components"]["ros"]["status"], "ready")
+        self.assertEqual(payload["components"]["robot"]["status"], "ready")
+        self.assertEqual(payload["components"]["supervisor"]["status"], "ready")
+        self.assertEqual(payload["components"]["vlm"]["status"], "configured")
+        self.assertNotIn("not-returned-to-browser", json.dumps(payload))
+
+        self.adapter.get_fp_video_sample = lambda channel: {
+            "captured_at": now - 10,
+            "sequence": 12,
+            "data": b"stale-frame",
+        }
+        stale = self.client.get("/api/autonomy/readiness").get_json()
+        self.assertEqual(stale["components"]["camera"]["status"], "stale")
+        self.assertFalse(stale["ready_for_task"])
 
 
 if __name__ == "__main__":

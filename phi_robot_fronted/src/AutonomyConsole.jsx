@@ -4,6 +4,15 @@ const TERMINAL = new Set([
   'completed', 'failed', 'reconciliation_required', 'intervention_required',
 ]);
 
+const READINESS_ITEMS = [
+  ['vlm', 'VLM'],
+  ['camera', 'Camera'],
+  ['foundationpose', 'FoundationPose'],
+  ['ros', 'ROS'],
+  ['robot', 'Robot'],
+  ['supervisor', 'Supervisor'],
+];
+
 function AutonomyConsole({ api }) {
   const [instruction, setInstruction] = useState('把左边的红色箱子放到东北格');
   const [missionId, setMissionId] = useState(null);
@@ -11,6 +20,8 @@ function AutonomyConsole({ api }) {
   const [metrics, setMetrics] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
+  const [readiness, setReadiness] = useState(null);
+  const [readinessError, setReadinessError] = useState(null);
 
   const mission = snapshot?.mission;
   const goal = mission?.metadata?.goal_spec
@@ -20,6 +31,33 @@ function AutonomyConsole({ api }) {
     () => (snapshot?.events || []).slice(-18).reverse(),
     [snapshot?.events],
   );
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer = null;
+
+    async function refreshReadiness() {
+      try {
+        const next = await api.getAutonomyReadiness();
+        if (!cancelled) {
+          setReadiness(next);
+          setReadinessError(null);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setReadinessError(err.message || 'Readiness endpoint unavailable');
+        }
+      } finally {
+        if (!cancelled) timer = window.setTimeout(refreshReadiness, 2000);
+      }
+    }
+
+    refreshReadiness();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [api]);
 
   useEffect(() => {
     if (!missionId) return undefined;
@@ -103,6 +141,39 @@ function AutonomyConsole({ api }) {
           {mission?.status || 'idle'}
         </div>
       </header>
+
+      <section className="autonomy-readiness" aria-live="polite">
+        <div className="autonomy-readiness__header">
+          <span>运行准备状态</span>
+          <strong className={readiness?.ready_for_task ? 'is-ready' : ''}>
+            {readinessError
+              ? 'STATUS API ERROR'
+              : readiness == null
+                ? 'CHECKING…'
+                : readiness.ready_for_task
+                  ? 'READY FOR TASK'
+                  : 'NOT READY'}
+          </strong>
+        </div>
+        <div className="autonomy-readiness__grid">
+          {READINESS_ITEMS.map(([key, label]) => {
+            const component = readiness?.components?.[key];
+            const status = component?.status || 'checking';
+            return (
+              <div className={`readiness-item readiness-item--${status}`} key={key}>
+                <div className="readiness-item__name">
+                  <span aria-hidden="true" />
+                  <strong>{label}</strong>
+                </div>
+                <em>{status}</em>
+                <small title={component?.source || ''}>
+                  {component?.detail || readinessError || 'waiting for status…'}
+                </small>
+              </div>
+            );
+          })}
+        </div>
+      </section>
 
       <form className="autonomy-command" onSubmit={submit}>
         <label htmlFor="autonomy-instruction">自然语言指令</label>

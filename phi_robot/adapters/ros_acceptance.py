@@ -632,7 +632,7 @@ class RosAcceptanceAdapter:
         return True
 
     def get_services_status(self) -> dict[str, bool]:
-        """检查各 ROS2 服务在线状态（短超时，供控制台轮询）"""
+        """非阻塞读取 ROS2 服务发现状态，供控制台轮询。"""
         checks = [
             ("/start_navigation", self._path_plan_client),
             ("/set_lift", self._lift_client),
@@ -646,7 +646,12 @@ class RosAcceptanceAdapter:
         status = {}
         for name, client in checks:
             try:
-                status[name] = client.wait_for_service(timeout_sec=0.1)
+                is_ready = getattr(client, "service_is_ready", None)
+                status[name] = bool(
+                    is_ready()
+                    if callable(is_ready)
+                    else client.wait_for_service(timeout_sec=0.0)
+                )
             except Exception:
                 status[name] = False
         # /pause_navigation is a Topic publisher, always available

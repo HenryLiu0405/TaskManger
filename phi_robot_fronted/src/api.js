@@ -19,6 +19,11 @@ class PhiRobotAPIClient {
     return response.json();
   }
 
+  async getAutonomyReadiness() {
+    const response = await fetch(`${this.baseURL}/autonomy/readiness`);
+    return this._json(response, 'Unable to read runtime readiness');
+  }
+
   async _json(response, fallback) {
     let body = null;
     try {

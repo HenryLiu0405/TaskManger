@@ -1,6 +1,6 @@
 # Phase 8 console, replay, evaluation, and deployment status
 
-Status date: 2026-08-03. Offline console/replay slice; HIL and deployment gates
+Status date: 2026-08-18. Offline console/replay slice; HIL and deployment gates
 were not run.
 
 ## Implemented
@@ -11,6 +11,10 @@ were not run.
   Legacy grid/stage tooling remains reachable only with `?developer=1`.
 - Page refresh/closure affects only polling; mission execution lives in the
   Supervisor process.
+- The instruction area polls `/api/autonomy/readiness` and displays VLM,
+  camera-frame, FoundationPose-state, ROS-service, robot-odometry/control, and
+  Supervisor evidence. Missing or stale evidence is never rendered as ready;
+  VLM remains `configured` until a real model call succeeds.
 - `/api/autonomy/tasks` exposes submission and monitoring. Replay and metrics
   endpoints are read-only. Pause/stop endpoints fail closed unless the host
   application injects a trusted operator authorizer.
